@@ -22,7 +22,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = parseArgs(process.argv.slice(2));
 const BASE = (args.base ?? 'http://127.0.0.1:8799').replace(/\/$/, '');
 const OUT = path.resolve(ROOT, args.out ?? 'docs/screenshots');
-const VIEWS = (args.views ?? 'remote,apps,settings,keys,touch,cast,scenes,ask').split(',').map((v) => v.trim()).filter(Boolean);
+const VIEWS = (args.views ?? 'remote,apps,settings,keys,touch,cast,browser,scenes,ask').split(',').map((v) => v.trim()).filter(Boolean);
 const SIZES = (args.sizes ?? '390x844,1440x900').split(',').map((s) => s.split('x').map(Number));
 const THEMES = args.theme === 'both' ? ['nocturne', 'gallery'] : [args.theme ?? 'nocturne'];
 const PAGES = Number(args.pages ?? 3);

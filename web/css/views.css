@@ -845,3 +845,210 @@
 .mouse-gain input { flex: 1; accent-color: var(--accent); }
 .mouse-lock.is-active { box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 50%, transparent); }
 @media (prefers-reduced-motion: reduce) { .mouse-cursor { transition: none; } }
+
+/* ---------- Browser ---------- */
+
+.view.browser-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 14px;
+  overflow: hidden;
+}
+.browser-head { flex: none; margin-bottom: 4px; }
+.browser-bar { display: flex; align-items: center; gap: 10px; flex: none; }
+.browser-navgroup { display: flex; gap: 2px; flex: none; }
+.browser-nav { width: 40px; height: 40px; }
+.browser-nav:disabled { opacity: 0.3; }
+.browser-address-box {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 46px;
+  padding: 0 4px 0 14px;
+  border-radius: var(--r-pill);
+  background: color-mix(in oklab, var(--void) 50%, var(--panel));
+  border: 1px solid var(--hair-strong);
+  transition: border-color var(--dur-state), box-shadow var(--dur-state);
+}
+.browser-address-box:focus-within {
+  border-color: color-mix(in oklab, var(--accent) 60%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 12%, transparent);
+}
+.browser-address-icon { display: grid; place-items: center; color: var(--ink-3); flex: none; transition: color var(--dur-state); }
+.browser-view[data-session="ready"] .browser-address-icon { color: var(--accent); }
+.browser-view[data-session="starting"] .browser-address-icon { animation: blink 1s var(--ease-io) infinite; }
+.browser-address {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  font-size: 15px;
+  text-overflow: ellipsis;
+}
+.browser-address::placeholder { color: var(--ink-3); }
+.browser-go { width: 38px; height: 38px; color: var(--accent); }
+.browser-bar .browser-tv { flex: none; }
+
+.browser-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  padding: 0 8px;
+  flex: none;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+.browser-status .status-dot { margin-right: 0; }
+.browser-status-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-2); }
+.browser-status-text b { font-weight: 600; color: var(--ink); }
+.browser-meta { font-family: var(--font-mono); font-size: 11.5px; white-space: nowrap; }
+.browser-meta:empty { display: none; }
+
+.browser-stage {
+  position: relative;
+  flex: 1;
+  min-height: 160px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: var(--r-card);
+  border: 1px solid var(--hair);
+  background:
+    radial-gradient(90% 60% at 50% 0%, color-mix(in oklab, var(--tint) 10%, transparent), transparent 70%),
+    #0a0b0e;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), var(--shadow-deep);
+  touch-action: none;
+}
+[data-theme="gallery"] .browser-stage {
+  background:
+    radial-gradient(90% 60% at 50% 0%, color-mix(in oklab, var(--tint) 16%, transparent), transparent 70%),
+    #1c1f25;
+}
+.browser-canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  background: #fff;
+  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.9);
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+}
+.browser-view:not([data-session="ready"]) .browser-canvas { visibility: hidden; }
+.browser-canvas:focus-visible { outline: none; }
+.browser-typer {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  pointer-events: none;
+}
+.browser-overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; pointer-events: none; }
+.browser-overlay:empty { display: none; }
+.browser-overlay > * { pointer-events: auto; }
+.browser-welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 460px;
+  padding: 28px 26px 24px;
+  text-align: center;
+  border-radius: var(--r-card);
+  background: var(--panel-glass);
+  border: 1px solid var(--hair);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  backdrop-filter: blur(20px) saturate(140%);
+  box-shadow: var(--shadow-deep);
+  animation: rise var(--dur-panel) var(--ease-out);
+}
+.browser-orb {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  margin-bottom: 16px;
+  border-radius: 50%;
+  color: var(--accent);
+  background: radial-gradient(circle at 50% 35%, color-mix(in oklab, var(--accent) 30%, transparent), transparent 70%);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 30%, transparent), 0 0 60px -10px var(--accent);
+  animation: breathe 5s var(--ease-io) infinite;
+}
+.browser-lead { margin: 0 0 8px; font-family: var(--font-display); font-weight: 400; font-size: 24px; font-variation-settings: "opsz" 72; }
+.browser-copy { margin: 0 0 18px; color: var(--ink-2); font-size: 13.5px; line-height: 1.5; }
+.browser-suggest { justify-content: center; }
+.browser-error .browser-orb { color: var(--danger); background: radial-gradient(circle at 50% 35%, color-mix(in oklab, var(--danger) 26%, transparent), transparent 70%); box-shadow: 0 0 0 1px color-mix(in oklab, var(--danger) 35%, transparent); animation: none; }
+.browser-error .browser-copy { color: var(--danger); }
+.browser-wait { display: flex; flex-direction: column; align-items: center; gap: 14px; color: var(--ink-2); font-size: 14px; }
+.browser-wait .spinner { width: 24px; height: 24px; border-width: 2px; }
+
+.browser-tools { display: none; }
+.browser-tools .btn {
+  flex-direction: column;
+  gap: 3px;
+  height: 52px;
+  padding: 0 4px;
+  border-radius: 14px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--ink-2);
+}
+.browser-tools .btn .icon { width: 22px; height: 22px; }
+.browser-tools .btn[aria-pressed="true"] { color: var(--accent); background: color-mix(in oklab, var(--accent) 12%, transparent); }
+.browser-tools .btn:disabled { opacity: 0.3; }
+
+@media (max-width: 979px) {
+  .browser-head,
+  .browser-bar .browser-navgroup,
+  .browser-bar .browser-tv,
+  .browser-bar .browser-close { display: none; }
+  .browser-address-box { height: 44px; }
+  .browser-status { min-height: 24px; padding: 0 4px; }
+  .browser-meta { display: none; }
+  .browser-stage { border-radius: 16px; }
+  .browser-tools { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; flex: none; }
+  /* The page gets the room: no ask bar under it, and the tab bar makes space for a seventh tab. */
+  .app[data-view="browser"] .askbar { display: none; }
+  .nav-item { min-width: 0; flex: 1 1 0; padding-left: 2px; padding-right: 2px; }
+}
+@media (min-width: 980px) {
+  .browser-status .browser-close { display: none; }
+}
+
+/* Browser fixes: captions sit on the always-dark stage in both themes; long error tokens wrap;
+   a visible cue while keys go to the page (Esc leaves). */
+.browser-wait { color: rgba(236, 232, 224, 0.82); }
+.browser-error, .browser-error * { overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
+.browser-stage.is-typing { outline: 2px solid color-mix(in oklab, var(--accent) 70%, transparent); outline-offset: -2px; }
+.browser-stage.is-typing::after {
+  content: 'Typing into the page \00B7  Esc to leave';
+  position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+  padding: 4px 10px; border-radius: 999px; font-size: 12px; pointer-events: none;
+  color: #f3efe7; background: rgba(10, 10, 12, 0.72);
+}
+
+/* Browser VPN (follow-up 3): the switch, its status row, "Use a config file". */
+.browser-vpn[aria-pressed="true"] { color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 55%, transparent); }
+.browser-vpn[aria-pressed="true"][data-tone="bad"] { color: var(--danger); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--danger) 55%, transparent); }
+.browser-vpn[aria-pressed="true"][data-tone="warn"] { color: var(--warn, var(--accent)); }
+.browser-vpn-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: -4px 0 12px; font-size: 12.5px; color: var(--ink-3);
+}
+.browser-vpn-text { flex: 1 1 220px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browser-vpn-row .btn.sm { height: 28px; }
+@media (max-width: 700px) {
+  .browser-vpn-text { white-space: normal; overflow-wrap: anywhere; }
+}

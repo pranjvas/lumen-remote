@@ -214,7 +214,8 @@ async function retryTransient(fn, { everyMs, totalMs = Infinity, attempts = Infi
   }
 }
 
-export function createCast({ config, data, log, store, lan, avtransport, dial, rest }) {
+// `browser` (optional) returns the Browser-view feature (spec §11.3); it is created after Cast, hence lazy.
+export function createCast({ config, data, log, store, lan, avtransport, dial, rest, browser = () => null }) {
   const logger = log.child('cast');
   const castDir = path.join(config.dataDir, 'cast');
   // rest.baseUrl is the adapter's "http://<tv>:8001/api/v2/" (not part of the shared contract, hence the fallback).
@@ -385,6 +386,15 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
     throw new LumenError('FAILED', `The TV browser refused the link (HTTP ${last.status})`);
   }
 
+  // A web page opens in Lumen's own Browser view (spec §11.3); the TV browser stays behind Open on TV.
+  // Without the browser feature (older wiring, tools) the page still goes to the TV.
+  async function openInLumen(url) {
+    const lumen = browser();
+    if (typeof lumen?.open !== 'function') return openPage(url);
+    await lumen.open(url.href);
+    return { value: { kind: 'browser', url: url.href } };
+  }
+
   // --- local files ---------------------------------------------------------
 
   // GET/HEAD /cast/<secret>/<fileId>/<name> from the TV's DLNA reader: HEAD must succeed with the full
@@ -499,6 +509,10 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
       const target = await classify(input);
       const url = new URL(target.url);
       logger.info('cast link', { kind: target.kind, host: url.hostname, ...(target.experimental && { experimental: true }) });
+      // Everything but a page shown in Lumen's own browser plays on the TV, which must be on.
+      const tv = store.get('conn.tv')?.v;
+      const toLumen = target.kind === 'page' && typeof browser()?.open === 'function';
+      if (!toLumen && (tv === 'standby' || tv === 'off')) throw new LumenError('TV_OFF', 'The TV is off');
       switch (target.kind) {
         case 'youtube':
         case 'netflix':
@@ -507,9 +521,12 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
         case 'media':
           return playDlna({ uri: target.url, title: titleFromUrl(url), mime: target.mime, shownUri: target.url, experimental: target.experimental });
         default:
-          return openPage(url);
+          return openInLumen(url);
       }
     },
+
+    // Open on TV (spec §11.3): the TV browser launch for a page shown in Lumen's Browser view.
+    openOnTv: (url) => openPage(parseCastUrl(url)),
 
     async castFile(fileId, name) {
       if (typeof fileId !== 'string' || !FILE_ID.test(fileId)) throw new LumenError('INVALID', 'Unknown file');
@@ -536,7 +553,7 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
       if (!session) throw new LumenError('INVALID', 'Nothing is casting');
       if (session.kind === 'dial' && action === 'stop') {
         // The TV advertises allowStop for its DIAL apps; DELETE on the run location closes the app.
-        await dial.stop(DIAL_APPS[session.app]);
+        await dial.stopApp(DIAL_APPS[session.app]);
         return publish({ ...session, state: 'STOPPED' });
       }
       if (session.kind !== 'dlna') throw new LumenError('INVALID', `${session.title} is controlled with the TV remote`);

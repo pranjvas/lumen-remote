@@ -18,6 +18,7 @@ import { mountKeys } from './views/keys.js';
 import { mountTouch } from './views/touch.js';
 import { mountMouse } from './views/mouse.js';
 import { mountCast } from './views/cast.js';
+import { mountBrowser } from './views/browser.js';
 import { mountScenes } from './views/scenes.js';
 import { createAsk } from './views/ask.js';
 import { watchIme } from './views/text.js';
@@ -67,6 +68,7 @@ const panels = {
   touch: mountInto('touch', mountTouch),
   mouse: mountInto('mouse', mountMouse),
   cast: mountInto('cast', mountCast),
+  browser: mountInto('browser', mountBrowser),
   scenes: mountInto('scenes', mountScenes),
   ask: mountInto('ask', (root) => ask.mountView(root)),
 };

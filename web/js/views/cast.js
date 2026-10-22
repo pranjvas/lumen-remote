@@ -42,7 +42,7 @@ function classifyLink(raw) {
     const sort = AUDIO_EXT.test(path) ? 'Audio file' : IMAGE_EXT.test(path) ? 'Image' : /\.m3u8/i.test(path) ? 'Live stream (HLS)' : 'Video file';
     return { kind: 'media', url: url.href, icon: AUDIO_EXT.test(path) ? 'music' : IMAGE_EXT.test(path) ? 'photo' : 'film', title: sort, detail: `${name} · plays on the TV's media player (DLNA)` };
   }
-  return { kind: 'page', url: url.href, icon: 'globe', title: 'Web page', detail: `${host} · opens in the TV browser` };
+  return { kind: 'page', url: url.href, icon: 'globe', title: 'Web page', detail: `${host} · Opens in Lumen's browser · Open on TV available there` };
 }
 
 function yt(id, url) {
@@ -52,7 +52,7 @@ function yt(id, url) {
 const ROUTES = [
   ['apps', 'In its own app', 'YouTube, Netflix and Prime Video links'],
   ['film', 'On the media player', 'Video, music and photo files, HLS streams'],
-  ['globe', 'In the TV browser', 'Any other web page'],
+  ['globe', 'In Lumen’s browser', 'Any other web page · Open on TV from there'],
 ];
 
 const STATE_LABEL = {
@@ -65,7 +65,7 @@ const STATE_LABEL = {
 
 export function mountCast(root, ctx) {
   // ---- link ----
-  const field = h('input', { class: 'field cast-field', type: 'url', inputmode: 'url', placeholder: 'Paste a YouTube, Netflix, Prime or media link', 'aria-label': 'Link to cast', autocomplete: 'off', spellcheck: 'false' });
+  const field = h('input', { class: 'field cast-field', type: 'url', inputmode: 'url', placeholder: 'Paste or type a link', 'aria-label': 'Link to cast', autocomplete: 'off', spellcheck: 'false' });
   const paste = navigator.clipboard?.readText
     ? h('button', { class: 'btn ghost sm', type: 'button', 'aria-label': 'Paste from clipboard' }, icon('clipboard'), 'Paste')
     : null;
@@ -91,7 +91,12 @@ export function mountCast(root, ctx) {
     go.classList.add('is-busy');
     const ack = await ctx.cmd('cast.url', { url: c.url }, { el: go, timeoutMs: 30000 });
     go.classList.remove('is-busy');
-    if (ack.ok) toast(`Casting ${c.title.toLowerCase()} to the TV`, { level: 'ok' });
+    if (!ack.ok) return;
+    if (ack.value?.kind === 'browser') {
+      // A web page renders in Lumen's own Browser view (spec §11.3); Open on TV lives there.
+      toast('Opened in Lumen’s browser', { level: 'ok' });
+      ctx.navigate('browser');
+    } else toast(`Casting ${c.title.toLowerCase()} to the TV`, { level: 'ok' });
   }
 
   field.addEventListener('input', paintPreview);

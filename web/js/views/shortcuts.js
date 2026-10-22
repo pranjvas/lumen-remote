@@ -12,14 +12,15 @@ const KEY_MAP = {
   h: 'KEY_HOME', ',': 'KEY_MENU', i: 'KEY_INFO', g: 'KEY_GUIDE', s: 'KEY_SOURCE', '[': 'KEY_REWIND', ']': 'KEY_FF',
 };
 
-const VIEW_KEYS = { r: 'remote', a: 'apps', '.': 'settings', k: 'keys', c: 'cast', e: 'scenes' };
+const VIEW_KEYS = { r: 'remote', a: 'apps', '.': 'settings', k: 'keys', c: 'cast', b: 'browser', e: 'scenes' };
 
 const HELP = [
   ['Navigate', [['← ↑ → ↓', 'D-pad (hold to repeat)'], ['Enter', 'OK'], ['Backspace', 'Back'], ['Shift + Backspace', 'Exit'], ['H', 'Home'], [',', 'TV Menu']]],
   ['Sound & channels', [['+ / −', 'Volume ±1 (Shift ±5)'], ['M', 'Mute'], ['Page Up / Down', 'Channel ±'], ['0 – 9', 'Digits']]],
   ['Mouse', [['U', 'Use this PC’s mouse on the TV (Esc releases)']]],
   ['Playback', [['Space', 'Play / Pause'], ['[ / ]', 'Rewind / Fast forward'], ['I / G / S', 'Info / Guide / Source'], ['Alt + 1–4', 'Red, Green, Yellow, Blue']]],
-  ['Lumen', [['/ or Ctrl + K', 'Ask Lumen'], ['T', 'Type on the TV'], ['R A . K C E', 'Remote, Apps, Settings, Keys, Cast, Scenes'], ['P (hold)', 'Power'], ['?', 'This overlay']]],
+  ['Lumen', [['/ or Ctrl + K', 'Ask Lumen'], ['T', 'Type on the TV'], ['R A . K C B E', 'Remote, Apps, Settings, Keys, Cast, Browser, Scenes'], ['P (hold)', 'Power'], ['?', 'This overlay']]],
+  ['Browser', [['B', 'Open the Browser view'], ['Click the page', 'Keys and text go to the page until you click elsewhere']]],
 ];
 
 const shortcutsEnabled = () => localStorage.getItem('lumen.shortcuts') !== 'off';

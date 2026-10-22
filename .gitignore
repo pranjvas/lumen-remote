@@ -9,3 +9,5 @@ companion/build/
 docs/screenshots/*.png
 docs/screenshots/stack/
 docs/screenshots/mouse/
+# Go WireGuard test peer (14 MB build output; source in test/fixtures/vpn/testpeer-src)
+test/fixtures/vpn/bin/

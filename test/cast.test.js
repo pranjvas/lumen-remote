@@ -398,27 +398,54 @@ describe('cast: through the server and the mock TV', { skip }, () => {
     }
   });
 
-  test('browser: REST POST /api/v2/applications/org.tizen.browser with { id: url }, never /webapplication/; -4009 when already in front', async () => {
-    const web = await webServer();
-    try {
-      const n = mock.state.launches.length;
-      let ack = await b.send('cast.url', { url: web.url('/page') }, { timeout: 15000 });
-      assert.equal(ack.ok, true, JSON.stringify(ack.error));
-      assert.equal(ack.value.kind, 'browser');
-      const launch = mock.state.launches[n];
-      assert.deepEqual([launch.id, launch.appId, launch.payload], ['org.tizen.browser', BROWSER_APP, web.url('/page')]);
-      const posted = mock.state.requests.rest.filter((r) => r.method === 'POST' && r.path.includes('org.tizen.browser'));
-      assert.equal(posted[0].path, '/api/v2/applications/org.tizen.browser/');
-      assert.equal(JSON.parse(posted[0].body).id, web.url('/page'));
-      assert.equal(mock.state.webapps.length, 0, 'the App Launcher container is never used');
-      assert.equal(mock.state.apps.get(BROWSER_APP).visible, true);
+  // Spec §11.3: a page link now opens in Lumen's own browser (test/browser.test.js); the TV browser
+  // launch sits behind Open on TV, which uses REST while the agent is offline (none is connected here).
+  describe('Open on TV', { skip: skipUnless('server/features/browser.js') }, () => {
+    test('REST POST /api/v2/applications/org.tizen.browser with { id: url }, never /webapplication/; -4009 when already in front', async () => {
+      const web = await webServer();
+      try {
+        const n = mock.state.launches.length;
+        let ack = await b.send('browser.openOnTv', { url: web.url('/page') }, { timeout: 15000 });
+        assert.equal(ack.ok, true, JSON.stringify(ack.error));
+        const launch = mock.state.launches[n];
+        assert.deepEqual([launch.id, launch.appId, launch.payload], ['org.tizen.browser', BROWSER_APP, web.url('/page')]);
+        const posted = mock.state.requests.rest.filter((r) => r.method === 'POST' && r.path.includes('org.tizen.browser'));
+        assert.equal(posted[0].path, '/api/v2/applications/org.tizen.browser/');
+        assert.equal(JSON.parse(posted[0].body).id, web.url('/page'));
+        assert.equal(mock.state.webapps.length, 0, 'the App Launcher container is never used');
+        assert.equal(mock.state.apps.get(BROWSER_APP).visible, true);
 
-      ack = await b.send('cast.url', { url: web.url('/page') }, { timeout: 15000 });
-      assert.equal(ack.ok, false);
-      assert.match(ack.error.message, /already open/);
-      assert.equal(mock.state.launches.length, n + 1, 'the refused launch string was dropped');
+        ack = await b.send('browser.openOnTv', { url: web.url('/page') }, { timeout: 15000 });
+        assert.equal(ack.ok, false);
+        assert.match(ack.error.message, /already open/);
+        assert.equal(mock.state.launches.length, n + 1, 'the refused launch string was dropped');
+      } finally {
+        await web.stop();
+      }
+    });
+  });
+
+  test('cast.control stop on a DIAL session sends DELETE on the run location; the adapter lifecycle never does', async () => {
+    let ack = await b.send('cast.url', { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }, { timeout: 15000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    const before = mock.state.requests.dial.length;
+    ack = await b.send('cast.control', { action: 'stop' }, { timeout: 15000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    assert.equal(ack.value.state, 'STOPPED');
+    // The run location is the app resource plus its <link rel="run" href="run"/> (DIAL §6.4), on the
+    // singular /ws/app/ path the TV accepts writes on, with the app's Origin like the launch.
+    const deleted = mock.state.requests.dial.slice(before).filter((r) => r.method === 'DELETE');
+    assert.deepEqual(deleted.map((r) => [r.path, r.origin]), [['/ws/app/YouTube/run', 'https://www.youtube.com']]);
+    assert.match((await request({ port: mock.ports.dial, path: '/ws/app/YouTube' })).body, /<state>stopped<\/state>/);
+
+    // Stopping the server itself must not turn into a DIAL request for an app called "undefined".
+    const other = await startStack();
+    try {
+      await other.server.stop();
+      assert.deepEqual(other.mock.state.requests.dial.filter((r) => r.method === 'DELETE'), []);
     } finally {
-      await web.stop();
+      await other.mock.stop();
+      other.data.cleanup();
     }
   });
 

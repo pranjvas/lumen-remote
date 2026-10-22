@@ -6,6 +6,7 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import crypto from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 import { startMockTv } from './mock-tv.js';
@@ -102,6 +103,7 @@ export function testConfig(mock, dataDir, overrides = {}) {
     timing: FAST_TIMING,
     safety: FAST_SAFETY,
     ai: { backend: 'off' }, // never spend the user's API credit or Claude Code usage in tests
+    browser: { allowLoopback: true }, // the browser tests serve their pages on 127.0.0.1
     log: { level: 'warn', console: false },
   }, overrides);
 }
@@ -210,6 +212,11 @@ export function connectBrowser(port, { origin = `http://127.0.0.1:${port}`, host
     of: (t) => messages.filter((m) => m.t === t),
     patchesFor: (key) => messages.filter((m) => m.t === 'patch' && Object.hasOwn(m.patch ?? {}, key)).map((m) => m.patch[key]),
     waitForMessage,
+    /** Calls `fn(msg)` for every message from now on; returns the unsubscribe function. */
+    onMessage(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
     /** Waits until state[key] satisfies `predicate(record)`; returns the record. */
     waitForState(key, predicate = (rec) => rec != null, { timeout = 5000 } = {}) {
       return waitFor(() => (predicate(state[key]) ? state[key] : null), { timeout, message: `state ${key} (now ${JSON.stringify(state[key]?.v)})` });
@@ -296,7 +303,7 @@ export const TINY_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABC
 
 /**
  * A fake Lumen Agent (spec §5.5): connects to the TV-facing listener, says hello with a snapshot
- * and answers `apps` / `icon` / `exit` requests.
+ * and answers `apps` / `icon` / `exit` / `open-url` requests.
  */
 export function connectAgent({
   port, key, host = '127.0.0.1', snapshot = AGENT_SNAPSHOT, apps = AGENT_APPS, icons = { '3201907018807': TINY_PNG },
@@ -327,6 +334,9 @@ export function connectAgent({
     } else if (msg.type === 'exit') {
       send({ t: 'reply', rid: msg.rid, ok: true, data: null });
       ws.close();
+    } else if (msg.type === 'open-url') {
+      // Agent 0.3.0 (spec §11.3): the view app control opened the URL on the TV.
+      send({ t: 'reply', rid: msg.rid, ok: true, data: { method: 'view' } });
     } else send({ t: 'reply', rid: msg.rid, ok: false, error: `unknown request ${msg.type}` });
   });
   return {
@@ -390,4 +400,148 @@ export function createTestLog() {
 }
 function safeJson(v) {
   try { return JSON.stringify(v, (k, val) => (val instanceof Error ? { message: val.message, code: val.code } : val)); } catch { return String(v); }
+}
+
+// ---------------------------------------------------------------------------------------------
+// VPN (follow-up 3): the Go user-space WireGuard test peer on 127.0.0.1 and synthetic confs.
+// Every key below is generated per call and thrown away; helpers never print or persist one.
+// ---------------------------------------------------------------------------------------------
+
+/** Fallback location of the CineHD build of the peer (read-only worktree). */
+const WORKTREE_TESTPEER = 'C:/Users/pranj/Documents/Codex/2026-09-16/how-x20/.worktrees/proton-wg-tunnel/work/wg-tunnel/bin/testpeer.exe';
+/** Addresses inside the test tunnel: the peer serves HTTP :80 and DNS :53 on TUNNEL_PEER_IP. */
+export const TUNNEL_PEER_IP = '10.66.0.1';
+export const TUNNEL_CLIENT_IP = '10.66.0.2';
+
+/** Absolute path of `testpeer.exe` (env `LUMEN_TESTPEER`, the fixture copy, the worktree) or `null`. */
+export function testpeerPath() {
+  const candidates = [process.env.LUMEN_TESTPEER, path.join(ROOT, 'test', 'fixtures', 'vpn', 'bin', 'testpeer.exe'), WORKTREE_TESTPEER];
+  return candidates.find((p) => p && fs.existsSync(p)) ?? null;
+}
+/** `false`, or the reason to skip suites that need the peer binary. */
+export function skipWithoutTestpeer() {
+  return testpeerPath() ? false : 'testpeer.exe not found (test/fixtures/vpn/bin, LUMEN_TESTPEER or the CineHD worktree)';
+}
+
+const KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+
+/** A fresh X25519 key pair from `testpeer genkey`: `{ privateKey, publicKey }` (44-char base64 each). */
+export function genTestpeerKeys(bin = testpeerPath()) {
+  if (!bin) throw new Error('testpeer.exe not found');
+  const r = spawnSync(bin, ['genkey'], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+  const m = /private=(\S+) public=(\S+)/.exec(r.stdout ?? '');
+  if (r.status !== 0 || !m || !KEY_RE.test(m[1]) || !KEY_RE.test(m[2])) {
+    throw new Error(`testpeer genkey failed (exit ${r.status}): ${(r.stderr ?? '').trim() || 'no key pair on stdout'}`);
+  }
+  return { privateKey: m[1], publicKey: m[2] };
+}
+
+/**
+ * wg-quick client text for the test peer (port plan §10.5). `keepalive: null` omits the
+ * PersistentKeepalive line; `eol` lets a test produce CRLF files.
+ */
+export function clientConf(keys, peerPublicKey, port, { address = TUNNEL_CLIENT_IP, dns = TUNNEL_PEER_IP, keepalive = 25, eol = '\n' } = {}) {
+  const lines = [
+    '[Interface]', `PrivateKey = ${keys.privateKey}`, `Address = ${address}/32`, `DNS = ${dns}`, '',
+    '[Peer]', `PublicKey = ${peerPublicKey}`, 'AllowedIPs = 0.0.0.0/0', `Endpoint = 127.0.0.1:${port}`,
+  ];
+  if (keepalive !== null) lines.push(`PersistentKeepalive = ${keepalive}`);
+  return lines.join(eol) + eol;
+}
+
+/**
+ * Spawns `testpeer serve` on 127.0.0.1:<random UDP port> with throwaway keys and resolves once it
+ * prints its listening line. Inside the tunnel it serves `http://10.66.0.1/hello`,
+ * `/blob?bytes=N` and a DNS responder (every A question → 10.66.0.1). Never pass `exit` mode.
+ *   → { port, conf, wrongPeerConf, log(), waitForLog(re, ms), containsKey(text), exited, close() }
+ * `conf` / `wrongPeerConf` take the `clientConf` options (`keepalive`, `address`, `dns`, `eol`).
+ */
+export function startTestPeer({ bin = testpeerPath(), startTimeoutMs = 10000, ...confOptions } = {}) {
+  if (!bin) return Promise.reject(new Error('testpeer.exe not found'));
+  const peer = genTestpeerKeys(bin);
+  const client = genTestpeerKeys(bin);
+  const stranger = genTestpeerKeys(bin);
+  const secrets = [peer.privateKey, peer.publicKey, client.privateKey, client.publicKey, stranger.publicKey];
+  const child = spawn(bin, [
+    'serve', '-listen', '127.0.0.1:0', '-private', peer.privateKey, '-peer', client.publicKey,
+    '-ip', TUNNEL_PEER_IP, '-client', TUNNEL_CLIENT_IP,
+  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const lines = [];
+  const feed = (prefix) => {
+    let rest = '';
+    return (chunk) => {
+      rest += chunk.toString();
+      const parts = rest.split(/\r?\n/);
+      rest = parts.pop();
+      for (const line of parts) if (line.trim()) lines.push(prefix + line.trim());
+    };
+  };
+  child.stdout.on('data', feed(''));
+  child.stderr.on('data', feed('stderr: '));
+  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const text = () => lines.join('\n');
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`testpeer did not start within ${startTimeoutMs} ms:\n${text()}`)); }, startTimeoutMs);
+    exited.then(({ code }) => { clearTimeout(timer); reject(new Error(`testpeer exited with ${code} before listening:\n${text()}`)); });
+    const onLine = () => {
+      const m = /listening on udp :(\d+)/.exec(text());
+      if (!m) return;
+      child.stdout.off('data', onLine);
+      clearTimeout(timer);
+      const port = Number(m[1]);
+      let closing = null;
+      resolve({
+        port,
+        conf: clientConf(client, peer.publicKey, port, confOptions),
+        wrongPeerConf: clientConf(client, stranger.publicKey, port, confOptions),
+        log: text,
+        waitForLog: (re, ms = 3000) => waitFor(() => re.test(text()), { timeout: ms, message: `peer log to match ${re}` }),
+        /** True when `value` carries any full key of this run (status, logs and summaries must never). */
+        containsKey: (value) => secrets.some((k) => String(value).includes(k)),
+        exited,
+        close() {
+          if (!closing) {
+            closing = child.exitCode === null && child.signalCode === null
+              ? new Promise((done) => { exited.then(() => done()); child.kill(); })
+              : Promise.resolve();
+          }
+          return closing;
+        },
+      });
+    };
+    child.stdout.on('data', onLine);
+  });
+}
+
+/** 44-char base64 of 32 random bytes: key-shaped, never a usable key (parse tests only). */
+export const randomKeyString = () => crypto.randomBytes(32).toString('base64');
+
+/**
+ * A Proton-shaped WireGuard conf with random key strings: CRLF by default, comments, a trailing
+ * comment on Endpoint and an IPv6 AllowedIPs entry. `omit` drops keys (e.g. ['DNS']); `extraLines`
+ * are appended verbatim. → { text, privateKey, publicKey, presharedKey }
+ */
+export function syntheticConf({
+  privateKey = randomKeyString(), publicKey = randomKeyString(), presharedKey = null,
+  address = '10.2.0.2/32', dns = '10.2.0.1', endpoint = '185.107.56.1:51820', keepalive = 25,
+  eol = '\r\n', omit = [], extraLines = [],
+} = {}) {
+  const skip = new Set(omit);
+  const lines = [
+    '[Interface]', '# Key for Lumen Remote', '# Bouncing = 0', '# NetShield = 1',
+    ['PrivateKey', `PrivateKey = ${privateKey}`], ['Address', `Address = ${address}`], ['DNS', `DNS = ${dns}`], '',
+    '[Peer]', '# NL-FREE#123',
+    ['PublicKey', `PublicKey = ${publicKey}`],
+    ...(presharedKey ? [['PresharedKey', `PresharedKey = ${presharedKey}`]] : []),
+    'AllowedIPs = 0.0.0.0/0, ::/0',
+    ['Endpoint', `Endpoint = ${endpoint}  # trailing comment`],
+    ...(keepalive === null ? [] : [['PersistentKeepalive', `PersistentKeepalive = ${keepalive}`]]),
+    ...extraLines,
+  ];
+  const text = lines
+    .filter((l) => !(Array.isArray(l) && skip.has(l[0])))
+    .map((l) => (Array.isArray(l) ? l[1] : l))
+    .join(eol) + eol;
+  return { text, privateKey, publicKey, presharedKey };
 }

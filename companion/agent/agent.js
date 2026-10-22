@@ -1,5 +1,6 @@
-// Lumen Agent 0.2: reads TV state in the page context and reports it to the Lumen server on the PC.
-// Read-only by design: it calls TV getters and listeners only, never a setter.
+// Lumen Agent 0.3: reads TV state in the page context and reports it to the Lumen server on the PC.
+// Hands-off by design: it calls TV getters and listeners and never changes a setting. Its one action
+// is opening a web page in the TV browser when the PC asks (request "open-url").
 // Runs on Chromium M69, so the syntax stays within ES2017.
 (function () {
   'use strict';
@@ -13,6 +14,11 @@
   const PROPERTY_TIMEOUT_MS = 3000;
   const ICON_TIMEOUT_MS = 5000;
   const ICON_MAX_PX = 256;
+  // Two launch attempts (generic view, then the browser by id) must answer inside the PC's 8 s request timeout.
+  const LAUNCH_TIMEOUT_MS = 3500;
+  const URL_MAX_LENGTH = 4096;
+  const VIEW_OPERATION = 'http://tizen.org/appcontrol/operation/view';
+  const BROWSER_APP_ID = 'org.tizen.browser';
 
   const statusEl = document.getElementById('status');
   const app = read(function () { return tizen.application.getCurrentApplication(); }, null);
@@ -279,11 +285,66 @@
   async function handleRequest(msg) {
     if (msg.type === 'apps') return listApps();
     if (msg.type === 'icon') return iconFor(msg.appId);
+    if (msg.type === 'open-url') return openUrl(msg.url);
     if (msg.type === 'exit') {
       setTimeout(quit, 200);
       return null;
     }
     throw new Error('unknown request: ' + msg.type);
+  }
+
+  // ---- open-url: show a web page in the TV browser ----
+
+  function isWebUrl(url) {
+    if (typeof url !== 'string' || !url || url.length > URL_MAX_LENGTH) return false;
+    try {
+      const protocol = new URL(url).protocol;
+      return protocol === 'http:' || protocol === 'https:';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // The generic "view" app control lets the TV pick its handler; if that is refused, ask the
+  // Samsung browser by id. Resolves with the method that worked.
+  async function openUrl(url) {
+    if (!isWebUrl(url)) throw new Error('open-url needs an http(s) URL');
+    let viewError;
+    try {
+      await launchView(url, null);
+      return { method: 'view' };
+    } catch (e) {
+      viewError = e;
+    }
+    try {
+      await launchView(url, BROWSER_APP_ID);
+      return { method: 'browser' };
+    } catch (e) {
+      throw new Error('view: ' + viewError.message + '; ' + BROWSER_APP_ID + ': ' + e.message);
+    }
+  }
+
+  function launchView(url, appId) {
+    return new Promise(function (resolve, reject) {
+      let settled = false;
+      const timer = setTimeout(function () { done(new Error('launch timed out')); }, LAUNCH_TIMEOUT_MS);
+      function done(err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve();
+      }
+      try {
+        const control = new tizen.ApplicationControl(VIEW_OPERATION, url, null, null, []);
+        tizen.application.launchAppControl(control, appId, function () { done(null); }, function (e) {
+          done(new Error((e && (e.message || e.name)) || 'launchAppControl failed'));
+        });
+      } catch (e) {
+        // A WebAPIException is not an Error instance; read its message or name.
+        done(new Error((e && (e.message || e.name)) || String(e)));
+      }
+    });
   }
 
   function listApps() {

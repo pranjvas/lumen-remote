@@ -100,7 +100,8 @@ export async function startDevStack({ port = 8798, power = 'on', agent: withAgen
   let agentTimer = null;
   if (withAgent) {
     // No icons: the test PNG is a single pixel, so the tiles show their brand monograms instead.
-    agent = connectAgent({ port: server.lanPort, key: server.agentKey, snapshot: agentSnapshot(), apps: AGENT_APPS, icons: {} });
+    // Version 0.3.0 like the bundled agent (companion/agent/config.xml), so no "Rebuild the TV agent" note.
+    agent = connectAgent({ port: server.lanPort, key: server.agentKey, snapshot: agentSnapshot(), apps: AGENT_APPS, icons: {}, version: '0.3.0' });
     agentTimer = setInterval(() => {
       if (agent.ws.readyState === agent.ws.OPEN && mock.state.power === 'on') agent.sendState(agentSnapshot());
     }, AGENT_STATE_MS);

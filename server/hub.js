@@ -1,6 +1,7 @@
 // Command router between browsers (and internal callers: scenes, the AI) and the adapters.
 // It validates every command, applies safety, routes with fallbacks (spec §5.3, §8.5, §10, §11),
 // answers with acks, owns presence → setDemand, and emits changedOnTv (§9.4).
+import { isLoopbackHost } from './features/browser.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { LumenError, toErrorPayload } from './errors.js';
@@ -20,12 +21,19 @@ const CHANGE_DEBOUNCE_MS = 1000;
 const HOLD_CHECK_MS = 250;
 const MAX_VOLUME_KEY_STEPS = 25;
 const AI_STATUS_TIMEOUT_MS = 1500;
+const OPEN_ON_TV_TIMEOUT_MS = 10_000;
+const MAX_URL_LENGTH = 2048;
 
 const APP_ID = /^[\w.-]{1,64}$/;
 const SOURCE = /^[A-Z][A-Z0-9]{0,15}$/;
 const VIEW_NAME = /^[a-z][a-z-]{0,23}$/;
 const ITEM_ID = /^[\w-]{1,64}$/;
 const READ_SOURCES = new Set(['live', 'agent']);
+// Commands that stream while the user moves a pointer: they share the roomier pointer rate bucket.
+const STREAMED = new Set(['pointer.move', 'browser.input', 'browser.ack']);
+const BROWSER_INPUT_KINDS = ['move', 'down', 'up', 'click', 'wheel', 'key', 'text'];
+const MOUSE_BUTTONS = ['left', 'right', 'middle'];
+const KEY_MODIFIERS = ['alt', 'ctrl', 'meta', 'shift'];
 
 // State keys a key click can change, so its echo is not reported as "changed on the TV".
 const KEY_TOUCHES = {
@@ -40,7 +48,7 @@ const KEY_TOUCHES = {
 const NAMES = {
   rest: 'The TV', remote: 'The remote channel', upnp: 'UPnP', ipc: 'IP Control', agent: 'The TV agent',
   wol: 'Wake-on-LAN', avtransport: 'Media casting', dial: 'App casting', sleep: 'The sleep timer', scenes: 'Scenes',
-  tracked: 'Tracked settings', macros: 'Macros', cast: 'Cast', ai: 'Ask Lumen',
+  tracked: 'Tracked settings', macros: 'Macros', cast: 'Cast', ai: 'Ask Lumen', browser: 'The browser', vpn: 'The VPN',
 };
 
 // The caller used when hub.handle is given no client (internal use, tests).
@@ -84,6 +92,53 @@ function oneOf(value, name, options) {
   return value;
 }
 
+function webUrl(value, name = 'url', allowLoopback = false) {
+  text(value, name, { max: MAX_URL_LENGTH });
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw invalid('That is not a link');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw invalid('Only http and https links can be opened');
+  if (!allowLoopback && isLoopbackHost(parsed.hostname)) throw invalid('Pages on this PC itself cannot be opened');
+  return parsed.href;
+}
+
+// Rejects with FAILED when `work` takes longer than `ms`.
+function timed(work, ms, message) {
+  let timer;
+  return Promise.race([
+    work,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new LumenError('FAILED', message)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// The validated `browser.input` event (spec §11.3): coordinates in frame pixels, keys as DOM names.
+function browserInput(cmd) {
+  const kind = oneOf(cmd.kind, 'kind', BROWSER_INPUT_KINDS);
+  const event = { kind };
+  if (kind !== 'key' && kind !== 'text') {
+    event.x = number(cmd.x, 'x', 0, 8192);
+    event.y = number(cmd.y, 'y', 0, 8192);
+  }
+  if (kind === 'down' || kind === 'up' || kind === 'click') event.button = oneOf(cmd.button ?? 'left', 'button', MOUSE_BUTTONS);
+  if (kind === 'wheel') {
+    event.deltaX = number(cmd.deltaX ?? 0, 'deltaX', -10000, 10000);
+    event.deltaY = number(cmd.deltaY ?? 0, 'deltaY', -10000, 10000);
+  }
+  if (kind === 'key') {
+    event.key = text(cmd.key, 'key', { max: 32 });
+    if (cmd.code !== undefined) event.code = text(cmd.code, 'code', { max: 32 });
+  }
+  if (kind === 'text') event.text = text(cmd.text, 'text', { max: 2000 });
+  if (cmd.modifiers !== undefined) {
+    if (Array.isArray(cmd.modifiers)) event.modifiers = cmd.modifiers.map((m) => oneOf(m, 'modifiers', KEY_MODIFIERS));
+    else event.modifiers = integer(cmd.modifiers, 'modifiers', 0, 15);
+  }
+  return event;
+}
+
 export function createHub({ config, log: rootLog, store, adapters = {}, features = {} }) {
   const log = rootLog.child('hub');
   const safety = createSafety({ config });
@@ -97,6 +152,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
   const volumeLane = createQueue({ concurrency: 1 }); // volume and mute commands run one at a time
   const lifetime = new AbortController();
   let lastDemand = '';
+  let browserViewers = new Set(); // clients last reported to features.browser.viewers
   let lastVolume = null; // { v, at } from our own read-backs
   let stopped = false;
 
@@ -142,6 +198,14 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
   function broadcast(msg) {
     for (const client of clients.keys()) send(client, msg);
+  }
+
+  // Sends to the clients currently showing `view` with a visible tab (browser frames, §11.3);
+  // `shouldSend(client)` can drop individual clients.
+  function sendToView(view, msg, shouldSend = () => true) {
+    for (const [client, presence] of clients) {
+      if (presence.visible && presence.view === view && shouldSend(client)) send(client, msg);
+    }
   }
 
   function touch(...keys) {
@@ -426,7 +490,23 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
   // ---------- presence ----------
 
+  // Tells the browser feature who is watching its frames whenever that set changes (it starts the
+  // idle shutdown when nobody is, and sends newcomers the current page).
+  function updateBrowserViewers() {
+    if (typeof features.browser?.viewers !== 'function') return;
+    const next = new Set();
+    for (const [client, presence] of clients) if (presence.visible && presence.view === 'browser') next.add(client);
+    if (next.size === browserViewers.size && [...next].every((client) => browserViewers.has(client))) return;
+    browserViewers = next;
+    try {
+      features.browser.viewers(new Set(next));
+    } catch (err) {
+      log.warn('browser viewers update failed', err);
+    }
+  }
+
   function updateDemand() {
+    updateBrowserViewers();
     const views = new Set();
     let visible = false;
     for (const presence of clients.values()) {
@@ -483,6 +563,25 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
   async function aiCancel(cmd) {
     return feature('ai', 'cancel', text(subject(cmd), 'target', { max: 128 }));
+  }
+
+  // ---------- browser (§11.3) ----------
+
+  // The TV agent opens the link in the TV browser; without the agent, the REST browser launch does.
+  async function openOnTv({ url }) {
+    const target = url === undefined ? valueOf('browser.url') : url;
+    if (typeof target !== 'string' || !target) throw invalid('Open a page first, or pass a link');
+    const href = webUrl(target, 'url', !!config.browser?.allowLoopback);
+    requireTvOn();
+    try {
+      const res = await timed(call('agent', 'request', 'open-url', { url: href }), OPEN_ON_TV_TIMEOUT_MS, 'The TV agent did not answer in time');
+      return { value: { url: href, via: 'agent', method: res.value?.method ?? null } };
+    } catch (err) {
+      if (err?.code === 'INVALID' || err?.code === 'TV_OFF') throw err;
+      log.debug('agent open-url failed; using the TV browser launch', { code: err?.code, message: err?.message });
+    }
+    await feature('cast', 'openOnTv', href);
+    return { value: { url: href, via: 'rest', method: null } };
   }
 
   // ---------- command table ----------
@@ -609,7 +708,9 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
         throw invalid('That is not a link');
       }
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw invalid('Only http and https links can be cast');
-      requireTvOn();
+      if (!config.browser?.allowLoopback && isLoopbackHost(parsed.hostname)) throw invalid('Links to this PC itself cannot be cast');
+      // A plain web page opens in Lumen's own browser (§11.3), so only the TV-bound kinds need the
+      // TV on; the cast feature checks after classifying the link.
       return feature('cast', 'castUrl', url);
     },
     'cast.file': async ({ fileId, name }) => {
@@ -626,6 +727,41 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
     'ai.ask': aiAsk,
     'ai.cancel': aiCancel,
+
+    'browser.open': async ({ url }) => feature('browser', 'open', webUrl(url, 'url', !!config.browser?.allowLoopback)),
+    'browser.nav': async ({ action }) => feature('browser', 'nav', oneOf(action, 'action', ['back', 'forward', 'reload', 'stop', 'home'])),
+    'browser.input': async (cmd) => feature('browser', 'input', browserInput(cmd)),
+    'browser.viewport': async ({ w, h }) => feature('browser', 'setViewport', number(w, 'w', 1, 16384), number(h, 'h', 1, 16384)),
+    'browser.ack': async ({ seq }, client) => {
+      integer(seq, 'seq', 0, Number.MAX_SAFE_INTEGER);
+      features.browser?.ack?.(client, seq);
+      return {};
+    },
+    'browser.close': async () => feature('browser', 'close'),
+    'browser.openOnTv': openOnTv,
+
+    // The VPN switch: Lumen's browser restarts with (or without) the tunnel proxy after every change.
+    'vpn.set': async ({ on }) => {
+      try {
+        return await feature('vpn', boolean(on, 'on') ? 'enable' : 'disable');
+      } finally {
+        await features.browser?.applyProxy?.();
+      }
+    },
+    'vpn.restoreBackup': async () => {
+      try {
+        return await feature('vpn', 'restoreBackup');
+      } finally {
+        await features.browser?.applyProxy?.();
+      }
+    },
+    'vpn.reload': async () => {
+      try {
+        return await feature('vpn', 'reload');
+      } finally {
+        await features.browser?.applyProxy?.();
+      }
+    },
   };
 
   async function handle(msg, client = INTERNAL) {
@@ -635,7 +771,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       if (stopped) throw new LumenError('UNAVAILABLE', 'Lumen is stopping');
       const run = typeof name === 'string' && Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : null;
       if (!run) throw invalid(`Unknown command ${String(name).slice(0, 40)}`);
-      safety.checkRate(client, name);
+      safety.checkRate(client, STREAMED.has(name) ? 'pointer.move' : name);
       const res = await run(msg, client);
       const ack = { ok: true, ms: Date.now() - startedAt };
       if (res?.value !== undefined) ack.value = res.value;
@@ -737,6 +873,6 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     clients.clear();
   }
 
-  const hub = { handle, attach, detach, broadcast, stop };
+  const hub = { handle, attach, detach, broadcast, sendToView, stop };
   return hub;
 }

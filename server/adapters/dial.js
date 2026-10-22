@@ -126,7 +126,8 @@ export function createDial({ config, log, store }) {
     },
 
     // Stops a DIAL-launched app (the TV advertises allowStop). → { value: { status } }
-    async stop(name) {
+    // (Named stopApp so it never shadows the adapter's own stop() lifecycle method.)
+    async stopApp(name) {
       const { status } = await request(name, { method: 'DELETE' }, `${name}/run`);
       if (status >= 200 && status < 300) {
         logger.info(`stopped ${name}`, { status });

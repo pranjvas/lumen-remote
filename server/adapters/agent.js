@@ -1,5 +1,5 @@
 // On-TV agent ingress: the Lumen Agent page (companion/agent) connects out to the TV-facing listener at
-// ws://<pc>:<lanPort>/agent?key=<agentKey>, reports TV state, and answers requests (apps, icon, exit).
+// ws://<pc>:<lanPort>/agent?key=<agentKey>, reports TV state, and answers requests (apps, icon, exit, open-url).
 import fs from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -17,8 +17,9 @@ const REQUEST_TIMEOUT_MS = 8000;
 const ICON_RETRY_MS = 10 * 60 * 1000;
 const MAX_ICON_BYTES = 512 * 1024;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
-const REQUEST_TYPES = new Set(['apps', 'icon', 'exit']);
+const REQUEST_TYPES = new Set(['apps', 'icon', 'exit', 'open-url']);
 const APP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const URL_MAX_LENGTH = 4096;
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const SOURCE_ORDER = ['TV', 'HDMI', 'AV', 'COMPONENT'];
 const CATALOG = new Map(APPS.map((app, rank) => [app.id, { ...app, rank }]));
@@ -86,6 +87,17 @@ function channelOf(channel) {
     number: channel.number === null || channel.number === undefined ? null : String(channel.number).slice(0, 20),
     type: str(channel.type, 40),
   };
+}
+
+// Only http(s) pages may be sent to the TV browser (spec §11.3: no javascript: or file:).
+function isWebUrl(url) {
+  if (typeof url !== 'string' || !url || url.length > URL_MAX_LENGTH) return false;
+  try {
+    const { protocol } = new URL(url);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function decodeIcon(dataUrl) {
@@ -288,6 +300,9 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
 
   function request(type, args = {}) {
     if (!REQUEST_TYPES.has(type)) return Promise.reject(new LumenError('INVALID', `Unknown agent request "${type}"`));
+    if (type === 'open-url' && !isWebUrl(args.url)) {
+      return Promise.reject(new LumenError('INVALID', 'Open on TV needs an http(s) URL'));
+    }
     const ws = active;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new LumenError('UNAVAILABLE', 'The TV agent is not connected'));

@@ -20,6 +20,8 @@ import { createScenes } from './features/scenes.js';
 import { createTracked } from './features/tracked.js';
 import { createMacros } from './features/macros.js';
 import { createCast } from './features/cast.js';
+import { createBrowser } from './features/browser.js';
+import { createVpn } from './features/vpn.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -86,16 +88,19 @@ export async function startServer(overrides = {}, seams = {}) {
     const adapters = { rest, remote, upnp, ipc, agent, wol, avtransport, dial };
 
     const features = {
+      vpn: createVpn(ctx),
       sleep: createSleep({ ...ctx, ipc, remote }),
       scenes: createScenes(ctx),
       tracked: createTracked(ctx),
       macros: createMacros({ ...ctx, remote }),
-      cast: createCast({ ...ctx, avtransport, dial, rest, lan }),
+      // Page links from Cast open in the Browser view, which is created after the hub (it sends frames through it).
+      cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser }),
     };
     const hub = createHub({ ...ctx, adapters, features });
     let http = null;
     // The MCP URL handed to the Claude Code CLI must use the bound port (port 0 in tests).
     features.ai = createAi({ ...ctx, hub, adapters, httpPort: () => http?.port ?? config.http.port, backends: seams.aiBackends });
+    features.browser = createBrowser({ ...ctx, hub, vpn: () => features.vpn });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);
@@ -125,6 +130,7 @@ export async function startServer(overrides = {}, seams = {}) {
       agentKey: config.secrets.agentKey,
       store,
       hub,
+      features, // tests reach features.browser.evaluate (spec §11.3) through this
       config,
       log,
       stop() {

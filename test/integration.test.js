@@ -41,6 +41,8 @@ describe('integration: browser commands across modules', { skip }, () => {
     const mark = mock.keysSent().length;
     const run = await b.send('macro.run', { target: id });
     assert.equal(run.ok, true, JSON.stringify(run.error));
+    // The ack and the key frame travel on different sockets: give the mock a moment to record the key.
+    await waitFor(() => mock.keysSent().length > mark, { timeout: 3000, message: 'the replayed key reached the mock' });
     assert.deepEqual(mock.keysSent().slice(mark), ['KEY_7']);
     assert.equal((await b.send('macro.delete', { target: id })).ok, true);
   });

@@ -9,7 +9,7 @@ const SOURCES = new Set(['live', 'agent', 'tracked', 'cache', 'derived']);
 const WEAK_SOURCES = new Set(['agent', 'derived', 'cache']);
 const PERSISTED_SOURCES = new Set(['live', 'agent', 'cache']);
 // Connection state, live interaction state and feature-owned keys are never cached.
-const EPHEMERAL = /^(?:conn\.|power\.|ime$|touch\.|sleep$|scenes$|macros$|cast\.)/;
+const EPHEMERAL = /^(?:conn\.|power\.|ime$|touch\.|sleep$|scenes$|macros$|cast\.|browser\.|vpn\.)/;
 const MARKABLE = ['stale', 'note'];
 
 export function deepEqual(a, b) {

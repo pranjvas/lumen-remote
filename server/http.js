@@ -177,6 +177,7 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
     if (pathname === '/api/health') return health(req, res);
     if (pathname.startsWith('/api/icon/')) return icon(req, res, pathname.slice('/api/icon/'.length));
     if (pathname === '/api/cast/upload') return upload(req, res);
+    if (pathname === '/api/vpn/config') return vpnConfig(req, res);
     if (pathname === '/mcp') return mcp(req, res);
     if (pathname.startsWith('/api/')) return reply(res, 404, 'Not found');
     return serveStatic(req, res, pathname);
@@ -217,6 +218,31 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
       'Cache-Control': 'private, max-age=86400',
     });
     res.end(req.method === 'HEAD' ? undefined : found.buffer);
+  }
+
+  // "Use a config file" for the VPN: the .conf text in the body (same-origin, CSRF header, 8 KB max).
+  // The reply carries only the summary (endpoint, tunnel address), never key material.
+  async function vpnConfig(req, res) {
+    if (req.method !== 'POST') return reply(res, 405, 'Method not allowed', { Allow: 'POST' });
+    if (!allowedOrigins.has(req.headers.origin) || !safeEqual(req.headers['x-lumen-csrf'], config.csrf)) {
+      return reply(res, 403, 'Forbidden');
+    }
+    if (typeof features.vpn?.saveConfig !== 'function') return reply(res, 503, 'The VPN is not available');
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > 8192) return reply(res, 413, { ok: false, error: { code: 'INVALID', message: 'That is not a WireGuard config (too large)' } });
+      chunks.push(chunk);
+    }
+    try {
+      const { value } = await features.vpn.saveConfig(Buffer.concat(chunks).toString('utf8'));
+      await features.browser?.applyProxy?.();
+      return reply(res, 200, { ok: true, value });
+    } catch (err) {
+      const code = err?.code ?? 'FAILED';
+      return reply(res, code === 'INVALID' ? 400 : 500, { ok: false, error: { code, message: err?.message ?? 'Could not save the config' } });
+    }
   }
 
   async function upload(req, res) {

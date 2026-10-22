@@ -13,6 +13,7 @@ export const VIEWS = [
   { id: 'remote', label: 'Remote', icon: 'remote', rank: 1 },
   { id: 'apps', label: 'Apps', icon: 'apps', rank: 1 },
   { id: 'cast', label: 'Cast', icon: 'cast', rank: 1 },
+  { id: 'browser', label: 'Browser', icon: 'globe', rank: 1 },
   { id: 'settings', label: 'Settings', icon: 'settings', rank: 1 },
   { id: 'keys', label: 'Keys', icon: 'numpad', rank: 2 },
   { id: 'mouse', label: 'Mouse', icon: 'mouse', rank: 1 },
