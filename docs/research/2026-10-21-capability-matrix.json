@@ -1,0 +1,532 @@
+[
+ {
+  "feature": "Pairing / authorisation status",
+  "primary_source": "WS wss 8002 events ms.channel.connect / unauthorized / timeOut (client 'Lumen Remote', token in data/tv.json)",
+  "fallback": "User fixes it in Device Connection Manager > Device List",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · Remote channel",
+  "confidence": "high",
+  "notes": "Paired today 09:42Z (recorded). Never change the client name; save every new data.token; never reconnect without a token or while PowerState != on."
+ },
+ {
+  "feature": "Power state (on/standby/off)",
+  "primary_source": "REST GET /api/v2/ device.PowerState; only 'on'=on, 'standby'/'' =standby, repeated connect failures=off, timeout=unknown",
+  "fallback": "SmartThings /health + switch; WS close as a hint",
+  "read": "polled",
+  "write": "none",
+  "ui_label": "POLLED · REST",
+  "confidence": "high",
+  "notes": "'on' and 'standby' both observed today; standby window ~1 min after off before deep standby. 2020 sets wake every 5-50 min, so reachability never means on. Never probe power via a WS connect."
+ },
+ {
+  "feature": "Power off",
+  "primary_source": "WS KEY_POWER Click only when a fresh REST read says on, then 5-20 s cooldown",
+  "fallback": "IP Control powerControl powerOff; SmartThings switch off",
+  "read": "polled",
+  "write": "key",
+  "ui_label": "SET · confirmed by REST",
+  "confidence": "high",
+  "notes": "KEY_POWER toggles; never hold (~5 s soft-resets; 3 s hold is Frame-only). UI hold-to-confirm."
+ },
+ {
+  "feature": "Power on / wake",
+  "primary_source": "If REST=standby: KEY_POWER over the paired WS + WoL. Else WoL: 102-byte packet to directed broadcast + 255.255.255.255 + unicast, ports 9/7, socket bound to LAN address; MAC=REST wifiMac (networkType wireless)",
+  "fallback": "SmartThings switch on; IP Control powerControl powerOn within ~1 min of off",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "Waking… · WoL",
+  "confidence": "medium",
+  "notes": "Needs Power On with Mobile. Not observed on this TV. Re-check PowerState after the socket opens before sending KEY_POWER."
+ },
+ {
+  "feature": "Navigation keys (d-pad/OK/Back/Home/Exit)",
+  "primary_source": "WS SendRemoteKey KEY_UP/DOWN/LEFT/RIGHT/ENTER/RETURN/HOME/EXIT",
+  "fallback": "IP Control remoteKeyControl; SmartThings samsungvd.remoteControl (slow)",
+  "read": "none",
+  "write": "key",
+  "ui_label": "KEY",
+  "confidence": "high",
+  "notes": "No ack; >=200 ms spacing; server repeat cadence + release watchdog. Back long-press = Exit."
+ },
+ {
+  "feature": "Menu/info keys (Settings/Info/Guide/Tools/Source/Channel list)",
+  "primary_source": "WS KEY_MENU/INFO/GUIDE/TOOLS/SOURCE/CH_LIST",
+  "fallback": "IP Control remoteKeyControl menu",
+  "read": "none",
+  "write": "key",
+  "ui_label": "KEY",
+  "confidence": "high",
+  "notes": "Label KEY_MENU 'TV Settings'. What it opens on 2020 learned live."
+ },
+ {
+  "feature": "Number pad / minus / previous channel",
+  "primary_source": "WS KEY_0..9, KEY_MINUS, KEY_PRECH",
+  "fallback": "IP Control remoteKeyControl number0-9",
+  "read": "none",
+  "write": "key",
+  "ui_label": "KEY",
+  "confidence": "high",
+  "notes": "tvinputdevice list includes Minus and PreviousChannel (recorded). KEY_MINUS is modern; verify."
+ },
+ {
+  "feature": "Colour keys",
+  "primary_source": "WS KEY_RED/GREEN/YELLOW/BLUE",
+  "fallback": "KEY_CYAN alias; IP Control colours",
+  "read": "none",
+  "write": "key",
+  "ui_label": "KEY",
+  "confidence": "medium",
+  "notes": "Check BLUE vs CYAN in the key lab. ColorF0-F3 exist on this TV (recorded)."
+ },
+ {
+  "feature": "Media transport keys",
+  "primary_source": "WS KEY_PLAY/PAUSE/PLAY_BACK/STOP/REWIND/FF/REC",
+  "fallback": "SmartThings mediaPlayback/mediaTrackControl",
+  "read": "none",
+  "write": "key",
+  "ui_label": "KEY",
+  "confidence": "medium",
+  "notes": "Behaviour depends on the app; REW/FF long-press = track skip."
+ },
+ {
+  "feature": "Smart keys (Ambient/Multi View/Bixby voice/123)",
+  "primary_source": "WS KEY_AMBIENT/MULTI_VIEW/BT_VOICE (ms.voiceApp.*)/MORE",
+  "fallback": "SmartThings samsungvd.ambient setAmbientOn",
+  "read": "live",
+  "write": "key",
+  "ui_label": "KEY · unverified",
+  "confidence": "low",
+  "notes": "Check each in a supervised key lab. numberpad/mbrlayout are The-Wall-only; browser draws its own 123/colour pad."
+ },
+ {
+  "feature": "Picture/sound shortcut keys",
+  "primary_source": "WS KEY_PMODE/PICTURE_SIZE/SOUND_MODE/MTS/ESAVING/SLEEP/CAPTION/AD/EXTRA",
+  "fallback": "Menu macro",
+  "read": "none",
+  "write": "key",
+  "ui_label": "SET-ONLY · unverified",
+  "confidence": "low",
+  "notes": "Set-only, often cycling. Physical-button list includes PictureSize/MTS/Caption/Extra/E-Manual/Teletext (recorded); WS names unverified."
+ },
+ {
+  "feature": "Volume level (read)",
+  "primary_source": "UPnP GetVolume on 9197 (InstanceID 0, Channel Master)",
+  "fallback": "IP Control getTVStates.volume; companion tvaudiocontrol.getVolume; SmartThings audioVolume",
+  "read": "polled",
+  "write": "none",
+  "ui_label": "LIVE · UPnP",
+  "confidence": "high",
+  "notes": "Returned 4 live (~12 ms). TV-speaker path only; label 'TV speaker volume' when output is ARC/optical/BT."
+ },
+ {
+  "feature": "Volume live updates (halo follows the physical remote)",
+  "primary_source": "GENA SUBSCRIBE /upnp/event/RenderingControl1, NOTIFY LastChange; finite TIMEOUT, renew SID-only",
+  "fallback": "Poll GetVolume/GetMute 1 s visible / 5 s hidden; 30 s safety",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · push",
+  "confidence": "high",
+  "notes": "VERIFIED: 14 change NOTIFYs (SEQ 1-14) in a 60-min session, 20-750 ms before the poll. Method is NOTIFY. Ignore empty LastChange; merge deltas; re-SUBSCRIBE on 412/standby."
+ },
+ {
+  "feature": "Volume set exact / step",
+  "primary_source": "UPnP SetVolume DesiredVolume 0-100 (step = current ± n, clear mute first)",
+  "fallback": "IP Control directVolumeControl; WS KEY_VOLUP/VOLDOWN; SmartThings setVolume (unmutes)",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET",
+  "confidence": "medium",
+  "notes": "Advertised and used by HA/ollo69; not yet written here. Fall back to keys on UPnP 501. Cap at 50, confirm jumps >20, debounce >=200 ms."
+ },
+ {
+  "feature": "Mute",
+  "primary_source": "Read: UPnP GetMute + GENA. Write: GetMute then KEY_MUTE only if state differs",
+  "fallback": "UPnP SetMute (advertised, unproven); IP Control muteControl",
+  "read": "live",
+  "write": "key",
+  "ui_label": "LIVE · UPnP",
+  "confidence": "medium",
+  "notes": "GetMute=1 live. Mute resets on standby and any volume change. The power-off self-mute is NOT evented; show Mute during standby as 'TV off'."
+ },
+ {
+  "feature": "Channel up/down, number entry, channel list",
+  "primary_source": "WS KEY_CHUP/CHDOWN/0-9+ENTER/CH_LIST",
+  "fallback": "SmartThings tvChannel (tuner only); IP Control channelUpDnControl",
+  "read": "none",
+  "write": "key",
+  "ui_label": "KEY",
+  "confidence": "medium",
+  "notes": "On an HDMI STB only via Anynet+/CEC passthrough."
+ },
+ {
+  "feature": "Current channel/programme",
+  "primary_source": "Companion UI tizen.tvchannel.getCurrentChannel + webapis.hybridchannelinfo",
+  "fallback": "SmartThings tvChannel/tvChannelName; hybridchannelinfo in the service (untested)",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP · snapshot",
+  "confidence": "medium",
+  "notes": "Recorded 'Ace TV' 1927 TVPLUS + programme. UI context only unless the service variant works."
+ },
+ {
+  "feature": "Current input source (read)",
+  "primary_source": "IP Control getTVStates.inputSource (after IP Remote)",
+  "fallback": "Companion SOURCE_INFO listener / tvwindow.getSource (TV 1); SmartThings samsungvd.mediaInputSource.inputSource",
+  "read": "polled",
+  "write": "none",
+  "ui_label": "POLLED · IP Control",
+  "confidence": "low",
+  "notes": "No REST/UPnP source read (7676 closed, 9110 SCPD empty). tvwindow has no name field."
+ },
+ {
+  "feature": "Switch input",
+  "primary_source": "IP Control inputSourceControl {inputSource:'HDMI1'}",
+  "fallback": "SmartThings setInputSource; companion tvwindow.setSource + launch org.tizen.tv-viewer; anchored KEY_SOURCE macro",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET (or MACRO)",
+  "confidence": "low",
+  "notes": "KEY_HDMI1-4 are no-ops; KEY_HDMI cycles. Macro needs the source-bar order learned once."
+ },
+ {
+  "feature": "Connected inputs + HDMI friendly names",
+  "primary_source": "Companion systeminfo VIDEOSOURCE (connected/disconnected)",
+  "fallback": "SmartThings supportedInputSourcesMap (only CEC/user names); user-entered (TRACKED)",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP",
+  "confidence": "medium",
+  "notes": "Recorded TV1+HDMI1 connected; AV1+HDMI2-4 disconnected. SmartThings map lists only some ports."
+ },
+ {
+  "feature": "Installed apps list",
+  "primary_source": "Companion tizen.application.getAppsInfo",
+  "fallback": "Curated ID table probed with REST GET (1.35 s each, serialized)",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP",
+  "confidence": "high",
+  "notes": "406 apps recorded incl. India apps. WS ed.installedApp.get is silent on 2020. REST cannot see service apps."
+ },
+ {
+  "feature": "Launch app",
+  "primary_source": "REST POST /api/v2/applications/<id>/ body {}",
+  "fallback": "WS ed.apps.launch; SmartThings custom.launchapp; companion tizen.application.launch",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "SET · confirmed by REST visible",
+  "confidence": "medium",
+  "notes": "Not exercised live. Use WAS IDs or 10-char-pkg Tizen IDs. Confirm with REST visible ~3 s later."
+ },
+ {
+  "feature": "Close app",
+  "primary_source": "REST DELETE /api/v2/applications/<id>/",
+  "fallback": "KEY_RETURN hold / KEY_EXIT; /api/v2 control socket ms.application.stop",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "SET · unverified",
+  "confidence": "low",
+  "notes": "DELETE behaviour on 2020 unverified."
+ },
+ {
+  "feature": "Foreground app (what is on screen)",
+  "primary_source": "REST GET /api/v2/applications/<id>/ visible flag",
+  "fallback": "Companion addAppStatusChangeListener (untested for other apps); SmartThings tvChannelName",
+  "read": "polled",
+  "write": "none",
+  "ui_label": "POLLED · REST",
+  "confidence": "high",
+  "notes": "Only visible means foreground; running is noise. ~1.35 s/call, one at a time. No visible app = Live TV/HDMI/system UI."
+ },
+ {
+  "feature": "Now-playing media details",
+  "primary_source": "YouTube Lounge via DIAL screenId; companion hybridchannelinfo; CineHD self-report",
+  "fallback": "App name + icon only",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP / YOUTUBE · cloud",
+  "confidence": "low",
+  "notes": "Third-party apps are sandboxed. Lounge is unofficial (may show a toast); opt-in. screenId is a secret."
+ },
+ {
+  "feature": "DLNA now-playing / cast URL",
+  "primary_source": "UPnP AVTransport getters + GENA AVTransport1; cast via SetAVTransportURI + Play",
+  "fallback": "None",
+  "read": "live",
+  "write": "direct",
+  "ui_label": "LIVE · DLNA",
+  "confidence": "medium",
+  "notes": "Getters live (NO_MEDIA_PRESENT). Only DLNA-pushed media. ProductCap includes WebURIPlayable."
+ },
+ {
+  "feature": "Text input / TV keyboard mirror",
+  "primary_source": "WS imeStart/imeUpdate/imeEnd; send SendInputString (base64 UTF-8) + SendInputEnd",
+  "fallback": "Password: HTTPS POST :8002/remoteControl/imeInput/<b64>?token= (unverified); manual keyboard button",
+  "read": "live",
+  "write": "direct",
+  "ui_label": "LIVE · TV keyboard",
+  "confidence": "medium",
+  "notes": "Native Tizen fields only (YouTube/Prime ignore). imeDone is not a close signal. Mask passwords, never log. Keep one persistent socket (no replay to a late joiner)."
+ },
+ {
+  "feature": "Touchpad / pointer",
+  "primary_source": "WS ProcessMouseDevice Move relative + LeftClick/RightClick after touchEnable",
+  "fallback": "Swipe gestures mapped to arrow keys",
+  "read": "live",
+  "write": "direct",
+  "ui_label": "POINTER (when TV allows)",
+  "confidence": "medium",
+  "notes": "~1920x1080 units; batch per frame. No scroll (use CH keys in browser)."
+ },
+ {
+  "feature": "Picture mode",
+  "primary_source": "IP Control getTVStates.pictureMode / pictureModeControl; avocd GetPictureMode",
+  "fallback": "SmartThings custom.picturemode (display name); KEY_PMODE; macro",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control (or SMARTTHINGS)",
+  "confidence": "medium",
+  "notes": "Use the exact strings the TV returns (FilmmakerMode no space; a 2025 Frame rejected 'Filmmaker Mode'). -32601 while Ambient active."
+ },
+ {
+  "feature": "Backlight (2020 menu 'Brightness', 0-50)",
+  "primary_source": "IP Control backlightControl GET/SET",
+  "fallback": "avocd GetBacklight(1)+BacklightValueChanged; macro Picture>Expert>Brightness + TRACKED",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control (or TRACKED)",
+  "confidence": "low",
+  "notes": "No 2020 field report of a real value. Per input/mode; HDR forces max; -32002 in Dynamic. avocd read path has push and may be the stronger route."
+ },
+ {
+  "feature": "Shadow Detail (protocol 'brightness', -5..5)",
+  "primary_source": "IP Control getVideoStates.brightness / brightnessControl; avocd GetBrightness",
+  "fallback": "Macro + TRACKED",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control",
+  "confidence": "low",
+  "notes": "Show as menu name 'Shadow Detail'; note the protocol calls it brightness."
+ },
+ {
+  "feature": "Contrast / Sharpness / Color / Tint",
+  "primary_source": "IP Control getVideoStates + <field>Control; avocd GetContrast/GetSharpness/GetColorStrength/GetColorTint",
+  "fallback": "Macro + TRACKED",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control",
+  "confidence": "low",
+  "notes": "Ranges confirm on this TV (2020 PDF self-contradicts). color/tint vanish on PC-classified inputs. -32002 in Dynamic."
+ },
+ {
+  "feature": "Color tone",
+  "primary_source": "IP Control colorToneControl (Cool/Standard/Warm1/Warm2); avocd GetColorToneMode",
+  "fallback": "Macro + TRACKED",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control",
+  "confidence": "medium",
+  "notes": "A 2020 Q90T reads Warm2 live [community]. A 2018 set returns -32003."
+ },
+ {
+  "feature": "Advanced picture (local dimming, picture clarity/AMP, noise reduction, contrast enhancer, film mode)",
+  "primary_source": "IP Control localDimmingControl/autoMotionPlusControl/AMP.*/digitalCleanViewControl/contrastEnhancerControl/filmModeControl",
+  "fallback": "Macro + TRACKED",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control (hidden if -32601)",
+  "confidence": "low",
+  "notes": "In the 2020 list but unverified on any 2020 TV. Probe each getter once; re-probe after mode changes."
+ },
+ {
+  "feature": "Calibration (gamma, white balance, colour space)",
+  "primary_source": "IP Control gammaModeControl/gamma.*/WB2PointControl/colorSpaceControl",
+  "fallback": "Hidden",
+  "read": "polled",
+  "write": "none",
+  "ui_label": "LIVE · read-only",
+  "confidence": "low",
+  "notes": "Read-only by default; writes permanently change calibration — require a snapshot and confirmation, and send all six WB channels."
+ },
+ {
+  "feature": "Picture size / aspect",
+  "primary_source": "IP Control getTVStates.pictureSize / pictureSizeControl (16:9/4:3)",
+  "fallback": "KEY_PICTURE_SIZE; macro for Fit to Screen/Zoom",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control",
+  "confidence": "low",
+  "notes": "UPnP X_GetAspectRatio (Default) is DLNA playback only. A 2025 set refused some sizes with -32002."
+ },
+ {
+  "feature": "Eco Solution (ALD, min brightness, power saving, motion lighting, auto power off)",
+  "primary_source": "Menu macro (General>Eco Solution) + TRACKED",
+  "fallback": "Probe 2025 IP getters (likely -32601); avocd GetLuxLevel for the sensor; MobileBFF eco vconf keys; KEY_ESAVING (set-only)",
+  "read": "tracked",
+  "write": "macro",
+  "ui_label": "TRACKED · set by Lumen",
+  "confidence": "low",
+  "notes": "Absent from 2020/2023 IP lists and SmartThings. ALD makes panel luminance drift."
+ },
+ {
+  "feature": "Intelligent Mode (Adaptive Picture/Sound+/Volume/AVA)",
+  "primary_source": "Menu macro (General>Intelligent Mode) + TRACKED",
+  "fallback": "None",
+  "read": "tracked",
+  "write": "macro",
+  "ui_label": "TRACKED · MACRO",
+  "confidence": "low",
+  "notes": "No API anywhere. Adaptive Picture changes brightness by itself; warn the user."
+ },
+ {
+  "feature": "Game Mode",
+  "primary_source": "Probe IP gameModeControl / avocd GetGameMode; else macro (External Device Manager>Game Mode)",
+  "fallback": "TRACKED; MobileBFF per-HDMI game-mode vconf",
+  "read": "tracked",
+  "write": "macro",
+  "ui_label": "TRACKED · may change by itself",
+  "confidence": "low",
+  "notes": "ALLM can switch it automatically, so tracked state goes stale."
+ },
+ {
+  "feature": "Sound mode",
+  "primary_source": "IP Control getTVStates.soundMode / soundModeControl (Standard/Amplify); avocd GetSoundMode",
+  "fallback": "SmartThings custom.soundmode; KEY_SOUND_MODE",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control (or SMARTTHINGS)",
+  "confidence": "low",
+  "notes": "List changes with the output device; writes may fail when output is external."
+ },
+ {
+  "feature": "Sound output (TV speaker / eARC / BT / optical)",
+  "primary_source": "IP Control getTVStates.speakerSelect / speakerSelectControl / externalSpeakerControl",
+  "fallback": "Macro + TRACKED",
+  "read": "polled",
+  "write": "direct",
+  "ui_label": "LIVE-SET · IP Control",
+  "confidence": "low",
+  "notes": "When external, IP volume returns -32002 and the TV volume number is meaningless; the UI must say so."
+ },
+ {
+  "feature": "Audio output format (PCM/Dolby/DTS)",
+  "primary_source": "Companion UI tizen.tvaudiocontrol.getOutputMode",
+  "fallback": "None",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP · snapshot",
+  "confidence": "medium",
+  "notes": "Recorded PCM. This is the codec, not the output device. UI context only."
+ },
+ {
+  "feature": "Sound expert settings (balance, EQ, auto volume, digital output, eARC mode)",
+  "primary_source": "Menu macro (Sound>Expert Settings) + TRACKED",
+  "fallback": "None",
+  "read": "tracked",
+  "write": "macro",
+  "ui_label": "TRACKED · MACRO",
+  "confidence": "low",
+  "notes": "No IP Control/SmartThings/Tizen API on consumer TVs."
+ },
+ {
+  "feature": "Sleep timer",
+  "primary_source": "App-owned PC timer that fires a guarded KEY_POWER or IP powerControl powerOff",
+  "fallback": "Optional macro to the TV's own timer; MobileBFF vconf sleeptimer/value (read, candidate)",
+  "read": "tracked",
+  "write": "key",
+  "ui_label": "TRACKED · Lumen timer",
+  "confidence": "medium",
+  "notes": "The TV's own timer cannot be read by any confirmed API. The app timer's countdown is exact."
+ },
+ {
+  "feature": "Captions on/off",
+  "primary_source": "Companion UI tizen.tvinfo.getCaptionValue('CAPTION_ONOFF_KEY') + listener",
+  "fallback": "Set: KEY_CAPTION or IP remoteKeyControl caption or macro; state TRACKED",
+  "read": "companion",
+  "write": "key",
+  "ui_label": "ON-TV APP (or TRACKED)",
+  "confidence": "low",
+  "notes": "UPnP X_GetCaptionState is DLNA only. Needs the companion in the foreground."
+ },
+ {
+  "feature": "Firmware / model / resolution / OS info",
+  "primary_source": "REST /api/v2/ + companion systeminfo BUILD and PANEL",
+  "fallback": "SmartThings ocf mnfv / samsungvd.firmwareVersion",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · REST + ON-TV APP",
+  "confidence": "high",
+  "notes": "REST firmwareVersion is 'Unknown'. Companion build string and panel 3840x2160 recorded. Mask DUID/MAC/serial."
+ },
+ {
+  "feature": "Network status",
+  "primary_source": "REST networkType (wireless), ip; PC-measured round trips",
+  "fallback": "Companion UI webapis.network type/signal only",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · REST",
+  "confidence": "high",
+  "notes": "Never show or log SSID/BSSID/MAC."
+ },
+ {
+  "feature": "Input signal resolution / refresh rate",
+  "primary_source": "Companion UI tizen.tvwindow.getVideoResolution + listener",
+  "fallback": "Unavailable",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP (often unavailable)",
+  "confidence": "low",
+  "notes": "Recorded 'Failed to get video resolution' (source was TV). May need the TV window shown."
+ },
+ {
+  "feature": "HDR state of current signal",
+  "primary_source": "avocd GetHdrType (candidate, unverified)",
+  "fallback": "None",
+  "read": "none",
+  "write": "none",
+  "ui_label": "UNAVAILABLE",
+  "confidence": "medium",
+  "notes": "Not exposed by IP Control/UPnP/REST/public Tizen APIs. HDR picture modes may appear in the pictureMode list."
+ },
+ {
+  "feature": "TV system health (CPU/memory/storage)",
+  "primary_source": "Companion systeminfo CPU/MEMORY/STORAGE + getTotalMemory/getAvailableMemory",
+  "fallback": "None",
+  "read": "companion",
+  "write": "none",
+  "ui_label": "ON-TV APP",
+  "confidence": "medium",
+  "notes": "Recorded CPU 0.26, ~84 MB free of 1.97 GB. Available in the service context."
+ },
+ {
+  "feature": "TV clock / timezone",
+  "primary_source": "Date header from http://192.168.1.2:9080/ (Netflix NRDP, IST)",
+  "fallback": "Companion tizen.time",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · TV clock",
+  "confidence": "medium",
+  "notes": "Obscure but cheap; other servers send GMT."
+ },
+ {
+  "feature": "Other remotes connected",
+  "primary_source": "WS data.clients + ms.channel.clientConnect/clientDisconnect",
+  "fallback": "None",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · Remote channel",
+  "confidence": "medium",
+  "notes": "Only same-channel clients. Dedupe, exclude our ids, never display/log their tokens."
+ },
+ {
+  "feature": "Connection health (phone->PC->TV)",
+  "primary_source": "PC measures REST/WS/GENA/IP Control round trips and last-event ages; browser measures its ping to the PC",
+  "fallback": "None",
+  "read": "live",
+  "write": "none",
+  "ui_label": "LIVE · health",
+  "confidence": "high",
+  "notes": "Drives the connection-chain indicator and degraded/offline states."
+ }
+]

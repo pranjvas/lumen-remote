@@ -1,0 +1,77 @@
+{
+  "note": "Real RenderingControl NOTIFY sequence (SEQ 1-14) captured on the Q95T on 2026-10-21 while the user pressed volume/mute keys. Bodies rebuilt from the logged inner XML; every byte length matches the TV.",
+  "initialVolume": 4,
+  "initialMute": true,
+  "notifies": [
+    {
+      "seq": 1,
+      "mute": false,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Mute channel=&quot;Master&quot; val=&quot;0&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 2,
+      "empty": true,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange/></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 3,
+      "volume": 5,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;5&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 4,
+      "empty": true,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange/></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 5,
+      "volume": 6,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;6&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 6,
+      "volume": 7,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;7&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 7,
+      "volume": 8,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;8&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 8,
+      "volume": 9,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;9&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 9,
+      "volume": 8,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;8&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 10,
+      "mute": true,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Mute channel=&quot;Master&quot; val=&quot;1&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 11,
+      "mute": false,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Mute channel=&quot;Master&quot; val=&quot;0&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 12,
+      "volume": 9,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;9&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 13,
+      "volume": 10,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;10&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    },
+    {
+      "seq": 14,
+      "volume": 9,
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;9&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property>\r\n</e:propertyset>\r\n"
+    }
+  ]
+}

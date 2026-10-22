@@ -1,0 +1,1 @@
+<service xmlns="urn:dial-multiscreen-org:schemas:dial" dialVer="2.2"><name>Netflix</name><options allowStop="true"/><state>stopped</state><version>80.25.23140</version><link rel="run" href="run"/></service>

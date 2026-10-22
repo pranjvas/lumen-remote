@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0e1013">
+  <meta name="description" content="Lumen — a calm, live remote and dashboard for the Samsung Q95T">
+  <title>Lumen</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/lumen.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/lumen-192.png">
+  <link rel="preload" href="/fonts/inter-var-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/css/tokens.css">
+  <link rel="stylesheet" href="/css/base.css">
+  <link rel="stylesheet" href="/css/components.css">
+  <link rel="stylesheet" href="/css/remote.css">
+  <link rel="stylesheet" href="/css/views.css">
+  <script src="/js/boot-theme.js"></script>
+  <script type="module" src="/js/main.js"></script>
+</head>
+<body>
+  <svg class="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    <!-- 24 px grid, 1.75 px stroke, round caps and joins, currentColor -->
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v7.5"/><path d="M6.6 6.9a7.6 7.6 0 1 0 10.8 0"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M6.5 14.5 12 9l5.5 5.5"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M6.5 9.5 12 15l5.5-5.5"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24"><path d="M14.5 6.5 9 12l5.5 5.5"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="M9.5 6.5 15 12l-5.5 5.5"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M9 14.5 4.5 10 9 5.5"/><path d="M4.5 10h10a5 5 0 0 1 0 10H11"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M3.8 10.8 12 4l8.2 6.8"/><path d="M6.2 9v10.5h11.6V9"/><path d="M10 19.5v-5h4v5"/></symbol>
+    <symbol id="i-tvmenu" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12.5" rx="2.2"/><path d="M8.5 20.5h7"/><path d="M7 8.8h5.5M7 12.4h10"/><circle cx="16" cy="8.8" r="1.1"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h9M17.5 7H20M4 17h3.5M12 17h8"/><circle cx="15.3" cy="7" r="2.3"/><circle cx="9.7" cy="17" r="2.3"/></symbol>
+    <symbol id="i-apps" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.9"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.9"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.9"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="3.25"/></symbol>
+    <symbol id="i-remote" viewBox="0 0 24 24"><rect x="7" y="2.8" width="10" height="18.4" rx="5"/><circle cx="12" cy="9" r="2.4"/><path d="M10 14.5h4M10 17.5h4"/></symbol>
+    <symbol id="i-numpad" viewBox="0 0 24 24"><g fill="currentColor" stroke="none"><circle cx="6.5" cy="5.5" r="1.45"/><circle cx="12" cy="5.5" r="1.45"/><circle cx="17.5" cy="5.5" r="1.45"/><circle cx="6.5" cy="11" r="1.45"/><circle cx="12" cy="11" r="1.45"/><circle cx="17.5" cy="11" r="1.45"/><circle cx="6.5" cy="16.5" r="1.45"/><circle cx="12" cy="16.5" r="1.45"/><circle cx="17.5" cy="16.5" r="1.45"/><circle cx="12" cy="21" r="1.45"/></g></symbol>
+    <symbol id="i-touch" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3.2"/><circle cx="12" cy="12" r="2.3"/><path d="M12 6.8v.4M12 16.8v.4M6.8 12h.4M16.8 12h.4"/></symbol>
+    <symbol id="i-mouse" viewBox="0 0 24 24"><rect x="6.5" y="2.8" width="11" height="18.4" rx="5.5"/><path d="M12 2.8v6.4M6.6 9.2h10.8"/></symbol>
+    <symbol id="i-cursor" viewBox="0 0 24 24"><path d="M6 3.5 18.5 13l-5.6 1.3 2.7 5.6-2.4 1.1-2.7-5.6L6 19.3z"/></symbol>
+    <symbol id="i-cast" viewBox="0 0 24 24"><path d="M3.5 8V6.8A1.8 1.8 0 0 1 5.3 5h13.4a1.8 1.8 0 0 1 1.8 1.8v10.4a1.8 1.8 0 0 1-1.8 1.8H14"/><path d="M3.5 12.2a7.3 7.3 0 0 1 7.3 7.3M3.5 15.8a3.7 3.7 0 0 1 3.7 3.7"/><path d="M3.6 19.4h.01" stroke-width="2.6"/></symbol>
+    <symbol id="i-scenes" viewBox="0 0 24 24"><path d="M11 3.5 12.7 8l4.5 1.7-4.5 1.7L11 16l-1.7-4.6-4.5-1.7L9.3 8z"/><path d="M18 14.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3.2c.5 4.6 2.9 7.3 8.8 8.8-5.9 1.5-8.3 4.2-8.8 8.8-.5-4.6-2.9-7.3-8.8-8.8 5.9-1.5 8.3-4.2 8.8-8.8z"/></symbol>
+    <symbol id="i-halo" viewBox="0 0 24 24"><path d="M6.3 17.7a8 8 0 1 1 11.4 0"/><circle cx="12" cy="12" r="3.2"/><path d="M17.7 17.7h.01" stroke-width="2.6"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><g fill="currentColor" stroke="none"><circle cx="5.5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/></g></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.5v13M5.5 12h13"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5.5 12h13"/></symbol>
+    <symbol id="i-mute" viewBox="0 0 24 24"><path d="M4 9.5h3.3L12 5.6v12.8l-4.7-3.9H4z"/><path d="M16 9.8l4.4 4.4M20.4 9.8 16 14.2"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 9.5h3.3L12 5.6v12.8l-4.7-3.9H4z"/><path d="M15.5 9.2a4 4 0 0 1 0 5.6M18 6.8a7.5 7.5 0 0 1 0 10.4"/></symbol>
+    <symbol id="i-source" viewBox="0 0 24 24"><path d="M14 5H5.3A1.8 1.8 0 0 0 3.5 6.8v10.4A1.8 1.8 0 0 0 5.3 19h13.4a1.8 1.8 0 0 0 1.8-1.8V12"/><path d="M8.5 12.2h8M13.5 9l3 3.2-3 3.2"/><path d="M18 3.5v4M16 5.5h4"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.8" y="6" width="18.4" height="12" rx="2.2"/><path d="M6.5 9.8h.01M9.5 9.8h.01M12.5 9.8h.01M15.5 9.8h.01M18 9.8h.01M6.5 13h.01M18 13h.01" stroke-width="2.2"/><path d="M9.2 14.6h5.6"/></symbol>
+    <symbol id="i-playpause" viewBox="0 0 24 24"><path d="M4 6.5v11l7.5-5.5z" fill="currentColor"/><path d="M15.5 6.5v11M20 6.5v11"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.8v12.4a.6.6 0 0 0 .9.5l9.6-6.2a.6.6 0 0 0 0-1L8.9 5.3a.6.6 0 0 0-.9.5z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6.5" y="5.5" width="3.6" height="13" rx="1" fill="currentColor" stroke="none"/><rect x="13.9" y="5.5" width="3.6" height="13" rx="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-rew" viewBox="0 0 24 24"><path d="M11.5 6.5v11L3.8 12z" fill="currentColor"/><path d="M20.2 6.5v11L12.5 12z" fill="currentColor"/></symbol>
+    <symbol id="i-ff" viewBox="0 0 24 24"><path d="M3.8 6.5v11l7.7-5.5z" fill="currentColor"/><path d="M12.5 6.5v11l7.7-5.5z" fill="currentColor"/></symbol>
+    <symbol id="i-rec" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5.5" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 11v5.2"/><path d="M12 7.9h.01" stroke-width="2.4"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.4 4.6 3 17.4A1.8 1.8 0 0 0 4.6 20h14.8a1.8 1.8 0 0 0 1.6-2.6L13.6 4.6a1.8 1.8 0 0 0-3.2 0z"/><path d="M12 9.5v4.2"/><path d="M12 16.6h.01" stroke-width="2.4"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5 9.5 17 19 7.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M3 12h2.5l2-5 3 10 3-12 3 9 2-2H21"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 11A7.6 7.6 0 0 0 6 7.2L4.5 9"/><path d="M4.5 4.5V9H9"/><path d="M4.5 13A7.6 7.6 0 0 0 18 16.8l1.5-1.8"/><path d="M19.5 19.5V15H15"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.8 12S6.2 5.8 12 5.8 21.2 12 21.2 12 17.8 18.2 12 18.2 2.8 12 2.8 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M9.9 6.1A9.5 9.5 0 0 1 12 5.8c5.8 0 9.2 6.2 9.2 6.2a16 16 0 0 1-2.4 3.1M6.4 7.6C4 9.3 2.8 12 2.8 12s3.4 6.2 9.2 6.2a8.6 8.6 0 0 0 4-1"/><path d="M4 4l16 16"/><path d="M10 10.1a2.8 2.8 0 0 0 3.9 3.9"/></symbol>
+    <symbol id="i-enter" viewBox="0 0 24 24"><path d="M19.5 5.5v6.2a3 3 0 0 1-3 3H5"/><path d="M9 10.5 5 14.7 9 19"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5.5M6.5 11 12 5.5l5.5 5.5"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3.2" width="6" height="11" rx="3"/><path d="M5.8 11.2a6.2 6.2 0 0 0 12.4 0M12 17.4v3.4"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4.5 19.5h3.8L19 8.8a2.7 2.7 0 0 0-3.8-3.8L4.5 15.7z"/><path d="M13.8 6.4l3.8 3.8"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7h15M10 11v6M14 11v6"/><path d="M6.5 7l.9 12.1a1.6 1.6 0 0 0 1.6 1.4h6a1.6 1.6 0 0 0 1.6-1.4L17.5 7M9.3 7V4.5h5.4V7"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10.2 13.8a4.2 4.2 0 0 0 6 0l2.6-2.6a4.2 4.2 0 0 0-6-6l-1 1"/><path d="M13.8 10.2a4.2 4.2 0 0 0-6 0l-2.6 2.6a4.2 4.2 0 0 0 6 6l1-1"/></symbol>
+    <symbol id="i-unlink" viewBox="0 0 24 24"><path d="M15 12.6l3.8-3.8a4.2 4.2 0 0 0-6-6L9 6.6"/><path d="M9 11.4l-3.8 3.8a4.2 4.2 0 0 0 6 6L15 17.4"/><path d="M4 4l16 16"/></symbol>
+    <symbol id="i-clipboard" viewBox="0 0 24 24"><rect x="5.5" y="4.5" width="13" height="16" rx="2"/><path d="M9 4.5V3.6h6v.9"/><path d="M9 10h6M9 14h4"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15.5V4.5M7.5 9 12 4.5 16.5 9"/><path d="M4.5 15.5v2.2a1.8 1.8 0 0 0 1.8 1.8h11.4a1.8 1.8 0 0 0 1.8-1.8v-2.2"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M7.5 4.5v15M16.5 4.5v15M3.5 9h4M3.5 15h4M16.5 9h4M16.5 15h4"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 17.5V5.5l10.5-2v12"/><circle cx="6.5" cy="17.5" r="2.5"/><circle cx="17" cy="15.5" r="2.5"/></symbol>
+    <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="9.5" r="1.8"/><path d="M3.5 17l5-4.5 3.5 3 3-2.5 5.5 4.5"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M3.4 12h17.2M12 3.4c2.4 2.4 3.6 5.3 3.6 8.6S14.4 18.2 12 20.6M12 3.4C9.6 5.8 8.4 8.7 8.4 12s1.2 6.2 3.6 8.6"/></symbol>
+    <symbol id="i-sleep" viewBox="0 0 24 24"><path d="M19.5 14.6A7.9 7.9 0 1 1 9.4 4.5a6.3 6.3 0 0 0 10.1 10.1z"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.6A7.9 7.9 0 1 1 9.4 4.5a6.3 6.3 0 0 0 10.1 10.1z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.8"/><path d="M12 2.8v2M12 19.2v2M2.8 12h2M19.2 12h2M5.5 5.5l1.4 1.4M17.1 17.1l1.4 1.4M5.5 18.5l1.4-1.4M17.1 6.9l1.4-1.4"/></symbol>
+    <symbol id="i-agent" viewBox="0 0 24 24"><path d="M12 3.5 20.5 12 12 20.5 3.5 12z"/><path d="M12 8.5 15.5 12 12 15.5 8.5 12z" fill="currentColor"/></symbol>
+    <symbol id="i-guide" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 9h17M9 9v10.5M12.5 13h5M12.5 16h3.5"/></symbol>
+    <symbol id="i-tools" viewBox="0 0 24 24"><path d="M14.6 6.2a4 4 0 0 0-5.3 5.2L4.4 16.3a1.8 1.8 0 0 0 2.6 2.6l4.9-4.9a4 4 0 0 0 5.2-5.3l-2.5 2.5-2.4-.4-.4-2.4z"/></symbol>
+    <symbol id="i-exit" viewBox="0 0 24 24"><path d="M10 4.5H6.3a1.8 1.8 0 0 0-1.8 1.8v11.4a1.8 1.8 0 0 0 1.8 1.8H10"/><path d="M15 8l4 4-4 4M19 12H9.5"/></symbol>
+    <symbol id="i-caption" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M10.3 10.2a2.3 2.3 0 1 0 0 3.6M17 10.2a2.3 2.3 0 1 0 0 3.6"/></symbol>
+    <symbol id="i-aspect" viewBox="0 0 24 24"><rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="M6.5 11V9h2.5M17.5 13v2H15"/></symbol>
+    <symbol id="i-ambient" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="13" rx="1.6"/><path d="M3.5 14l4.5-4.5 3.5 3.5 2.5-2.5 6.5 6"/><circle cx="15.5" cy="7.8" r="1.3"/><path d="M9 20.5h6"/></symbol>
+    <symbol id="i-pmode" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4"/><path d="M12 3.6a8.4 8.4 0 0 1 0 16.8z" fill="currentColor"/></symbol>
+    <symbol id="i-smode" viewBox="0 0 24 24"><path d="M5 9v6M9 6v12M13 9.5v5M17 7v10M21 10.5v3"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h7"/><path d="M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01" stroke-width="2.6"/></symbol>
+    <symbol id="i-multiview" viewBox="0 0 24 24"><rect x="3" y="5.5" width="10.5" height="8" rx="1.5"/><rect x="15.5" y="5.5" width="5.5" height="8" rx="1.5"/><path d="M7 18.5h10"/></symbol>
+    <symbol id="i-ad" viewBox="0 0 24 24"><circle cx="12" cy="4.8" r="1.6"/><path d="M5 8.5l7 1.5 7-1.5M12 10v4.5M8.5 21l3.5-6.5 3.5 6.5"/></symbol>
+    <symbol id="i-tv" viewBox="0 0 24 24"><rect x="2.8" y="4.5" width="18.4" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 17v3.5"/></symbol>
+    <symbol id="i-hdmi" viewBox="0 0 24 24"><path d="M3 8.5h18v4.2L18 16H6l-3-3.3z"/><path d="M7 12h10"/></symbol>
+    <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M5 19c0-8.3 5.6-13.5 14-13.5 0 8.4-5.2 14-13.5 14"/><path d="M5 19c3-4 6-6.5 9.5-8.5"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 4l2.4 5 5.4.7-4 3.7 1 5.4L12 16.2 7.2 18.8l1-5.4-4-3.7 5.4-.7z"/></symbol>
+  </svg>
+
+  <div class="room" aria-hidden="true"></div>
+
+  <div class="app" data-view="remote">
+    <header class="topbar">
+      <span id="power-slot"></span>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">Lumen</span>
+        <div class="brand-stack">
+          <span class="brand-name" id="tv-name">Samsung Q95T</span>
+          <span id="chain-slot"></span>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="theme-slot"></span>
+        <button class="icon-btn only-desktop" id="help-btn" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-keyboard"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="banners" id="banners"></div>
+
+    <section class="instrument" id="instrument" aria-label="Remote"></section>
+    <main class="panel" id="panel"></main>
+
+    <span id="askbar-slot"></span>
+
+    <nav class="nav" id="nav" aria-label="Views"></nav>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+  <div class="sr-only" id="live-region" aria-live="polite" aria-atomic="true"></div>
+  <noscript><p style="padding:24px;color:#f2efe8">Lumen needs JavaScript to talk to the TV.</p></noscript>
+</body>
+</html>

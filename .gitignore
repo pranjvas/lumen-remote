@@ -1,0 +1,11 @@
+node_modules/
+data/
+*.log
+tools/scratch/
+# Built TV agent: agent-config.json carries the agent key; the .wgt is a signed build output.
+companion/agent/agent-config.json
+companion/build/
+# Screenshots: keep only the real-TV sets (live/, phone-lan/); mock-TV iteration shots are regenerable.
+docs/screenshots/*.png
+docs/screenshots/stack/
+docs/screenshots/mouse/

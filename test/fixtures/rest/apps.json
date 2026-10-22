@@ -1,0 +1,72 @@
+[
+  {
+    "id": "3201907018807",
+    "name": "Netflix",
+    "running": true,
+    "version": "80.25.23140",
+    "visible": false
+  },
+  {
+    "id": "3201807016597",
+    "name": "Apple TV",
+    "running": true,
+    "version": "16.2.0",
+    "visible": false
+  },
+  {
+    "id": "3201606009684",
+    "name": "Spotify - Music and Podcasts",
+    "running": false,
+    "version": "2.1.66",
+    "visible": false
+  },
+  {
+    "id": "3201512006963",
+    "name": "Plex",
+    "running": false,
+    "version": "5.64.1",
+    "visible": false
+  },
+  {
+    "id": "3201907018784",
+    "name": "Internet",
+    "running": true,
+    "version": "3.5.10100",
+    "visible": false
+  },
+  {
+    "id": "3201910019378",
+    "name": "SmartThings",
+    "running": false,
+    "version": "2.0.116",
+    "visible": false
+  },
+  {
+    "id": "3201710015037",
+    "name": "Gallery",
+    "running": false,
+    "version": "2.0.46",
+    "visible": false
+  },
+  {
+    "id": "3201908019041",
+    "name": "Apple Music",
+    "running": false,
+    "version": "16.2.0",
+    "visible": false
+  },
+  {
+    "id": "3202004020626",
+    "name": "Amazon Alexa",
+    "running": false,
+    "version": "0.20.08060",
+    "visible": false
+  },
+  {
+    "id": "pvcinehd01.CineHDTV",
+    "name": "CineHD TV",
+    "running": true,
+    "version": "0.17.421",
+    "visible": true
+  }
+]

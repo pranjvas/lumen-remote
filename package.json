@@ -1,0 +1,23 @@
+{
+  "name": "lumen-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-hosted remote and live dashboard for a Samsung Tizen TV",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test \"test/*.test.js\"",
+    "agent:build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/agent/build.ps1",
+    "screenshot": "node tools/screenshot.mjs",
+    "dev:stack": "node tools/dev-stack.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.306",
+    "@anthropic-ai/sdk": "^0.137.0",
+    "ws": "^8.22.0",
+    "zod": "^4.6.7"
+  }
+}

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lumen Agent</title>
+  <style>
+    html, body {
+      margin: 0; width: 1920px; height: 1080px; overflow: hidden;
+      background: #06070b; color: #ece6da;
+      font-family: "SamsungOne", "Samsung Sans", "Helvetica Neue", Arial, sans-serif;
+    }
+    .glow {
+      position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+      background:
+        radial-gradient(circle at 50% 46%, rgba(255, 176, 96, .16), transparent 34%),
+        radial-gradient(circle at 70% 70%, rgba(96, 132, 255, .08), transparent 40%);
+    }
+    .card {
+      position: absolute; left: 50%; top: 50%; width: 760px;
+      transform: translate(-50%, -50%);
+      padding: 44px 56px; box-sizing: border-box;
+      border-radius: 28px; border: 1px solid rgba(255, 214, 170, .14);
+      background: linear-gradient(160deg, rgba(28, 26, 32, .92), rgba(12, 12, 17, .92));
+      box-shadow: 0 30px 80px rgba(0, 0, 0, .55), inset 0 1px 0 rgba(255, 255, 255, .04);
+      display: flex; align-items: center;
+      animation: rise .32s ease-out both;
+    }
+    .halo {
+      flex: none; width: 76px; height: 76px; margin-right: 36px; border-radius: 50%;
+      border: 5px solid #ffb468;
+      box-shadow: 0 0 24px rgba(255, 180, 104, .55), inset 0 0 18px rgba(255, 180, 104, .35);
+    }
+    .title { font-size: 40px; font-weight: 300; letter-spacing: .04em; margin: 0 0 8px; }
+    .title b { font-weight: 600; }
+    .status { font-size: 24px; opacity: .66; letter-spacing: .02em; }
+    .status.error { color: #ff9a8a; opacity: .9; }
+    @keyframes rise { from { opacity: 0; transform: translate(-50%, -46%); } to { opacity: 1; transform: translate(-50%, -50%); } }
+  </style>
+</head>
+<body>
+  <div class="glow"></div>
+  <div class="card">
+    <div class="halo"></div>
+    <div>
+      <p class="title"><b>Lumen</b> Agent</p>
+      <div id="status" class="status">starting</div>
+    </div>
+  </div>
+  <script src="agent.js"></script>
+</body>
+</html>

@@ -1,0 +1,183 @@
+/* HALO design tokens — Nocturne (dark, default) and Gallery (light). */
+
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/inter-var-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Fraunces";
+  src: url("/fonts/fraunces-var-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Fraunces";
+  src: url("/fonts/fraunces-var-italic-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/jetbrains-mono-var-latin.woff2") format("woff2");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* The app tint is a registered colour so it can crossfade. */
+@property --tint {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #ffb454;
+}
+
+:root {
+  color-scheme: dark;
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI Variable", "SF Pro Text", system-ui, Roboto, sans-serif;
+  --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, Consolas, monospace;
+
+  --void: #07080a;
+  --chassis: #0e1013;
+  --panel: #15181d;
+  --panel-glass: rgba(21, 24, 29, 0.72);
+  --key: #1d2128;
+  --key-hi: #262b33;
+  --key-top: #232830;
+  --key-bottom: #1a1e24;
+  --hair: rgba(255, 255, 255, 0.08);
+  --hair-strong: rgba(255, 255, 255, 0.16);
+  --ink: #f2efe8;
+  --ink-2: #b4b9c2;
+  --ink-3: #8f95a0;
+  --ember: #ffb454;
+  --quantum: #7cc8ff;
+  --live: #5fd99e;
+  --warn: #ffc85c;
+  --danger: #ff7a70;
+  --violet: #b9a4ff;
+  --focus: #ffd089;
+  --tint: var(--ember);
+  --accent: var(--tint);
+  --accent-ink: #1a1206;
+  --shadow-deep: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
+  --shadow-key: inset 0 1px 0 rgba(255, 255, 255, 0.06), inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 1px 2px rgba(0, 0, 0, 0.6), 0 8px 16px -8px rgba(0, 0, 0, 0.7);
+  --shadow-key-pressed: inset 0 2px 6px rgba(0, 0, 0, 0.6), 0 0 0 1px color-mix(in oklab, var(--tint) 40%, transparent),
+    0 0 18px color-mix(in oklab, var(--tint) 25%, transparent);
+  --ring-a: #1c2027;
+  --ring-b: #20252d;
+  --glow-strength: 14%;
+
+  --r-key: 14px;
+  --r-card: 20px;
+  --r-pill: 999px;
+
+  --dur-press: 90ms;
+  --dur-state: 160ms;
+  --dur-panel: 280ms;
+  --dur-scene: 520ms;
+  --dur-tint: 1200ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-io: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+/* Gallery: warm paper. Applied by choice or by the system preference. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --void: #f3f0e9;
+    --chassis: #efebe2;
+    --panel: #fbfaf6;
+    --panel-glass: rgba(251, 250, 246, 0.78);
+    --key: #e9e5dc;
+    --key-hi: #ded9ce;
+    --key-top: #f4f1ea;
+    --key-bottom: #e3dfd5;
+    --hair: rgba(0, 0, 0, 0.08);
+    --hair-strong: rgba(0, 0, 0, 0.18);
+    --ink: #16181c;
+    --ink-2: #474d57;
+    --ink-3: #5a606a;
+    --ember: #8f5400;
+    --quantum: #0b5e9f;
+    --live: #0f6e44;
+    --warn: #7f5900;
+    --danger: #b3261e;
+    --violet: #5b45b8;
+    --focus: #0b5e9f;
+    --accent-ink: #fffaf0;
+    --shadow-deep: 0 24px 50px -28px rgba(60, 45, 20, 0.35);
+    --shadow-key: inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 -1px 0 rgba(0, 0, 0, 0.06),
+      0 1px 2px rgba(60, 45, 20, 0.18), 0 8px 16px -10px rgba(60, 45, 20, 0.35);
+    --shadow-key-pressed: inset 0 2px 5px rgba(60, 45, 20, 0.22), 0 0 0 1px color-mix(in oklab, var(--tint) 45%, transparent),
+      0 0 16px color-mix(in oklab, var(--tint) 22%, transparent);
+    --ring-a: #e4dfd4;
+    --ring-b: #ebe7de;
+    --glow-strength: 18%;
+  }
+}
+
+[data-theme="gallery"] {
+  color-scheme: light;
+  --void: #f3f0e9;
+  --chassis: #efebe2;
+  --panel: #fbfaf6;
+  --panel-glass: rgba(251, 250, 246, 0.78);
+  --key: #e9e5dc;
+  --key-hi: #ded9ce;
+  --key-top: #f4f1ea;
+  --key-bottom: #e3dfd5;
+  --hair: rgba(0, 0, 0, 0.08);
+  --hair-strong: rgba(0, 0, 0, 0.18);
+  --ink: #16181c;
+  --ink-2: #474d57;
+  --ink-3: #5a606a;
+  --ember: #8f5400;
+  --quantum: #0b5e9f;
+  --live: #0f6e44;
+  --warn: #7f5900;
+  --danger: #b3261e;
+  --violet: #5b45b8;
+  --focus: #0b5e9f;
+  --accent-ink: #fffaf0;
+  --shadow-deep: 0 24px 50px -28px rgba(60, 45, 20, 0.35);
+  --shadow-key: inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 -1px 0 rgba(0, 0, 0, 0.06),
+    0 1px 2px rgba(60, 45, 20, 0.18), 0 8px 16px -10px rgba(60, 45, 20, 0.35);
+  --shadow-key-pressed: inset 0 2px 5px rgba(60, 45, 20, 0.22), 0 0 0 1px color-mix(in oklab, var(--tint) 45%, transparent),
+    0 0 16px color-mix(in oklab, var(--tint) 22%, transparent);
+  --ring-a: #e4dfd4;
+  --ring-b: #ebe7de;
+  --glow-strength: 18%;
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --hair: rgba(255, 255, 255, 0.22);
+    --hair-strong: rgba(255, 255, 255, 0.4);
+  }
+  .key, .chip, .seg button {
+    outline: 1px solid var(--ink-3);
+    outline-offset: -1px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-press: 0ms;
+    --dur-state: 0ms;
+    --dur-panel: 120ms;
+    --dur-scene: 0ms;
+    --dur-tint: 0ms;
+  }
+}

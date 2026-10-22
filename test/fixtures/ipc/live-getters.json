@@ -1,0 +1,17 @@
+{
+  "note": "GET results observed on the Q95T over IP Control on 2026-10-21 (docs/research/2026-10-21-live-findings.md). The mock starts from these values.",
+  "getTVStates": { "inputSource": "TV", "mute": "muteOff", "pictureMode": "Standard", "pictureSize": "16:9", "soundMode": "Amplify", "speakerSelect": "internal", "volume": 2 },
+  "getVideoStates": { "brightness": 2, "color": 25, "contrast": 50, "sharpness": 7, "tint": 0 },
+  "backlightControl": { "backlight": 10 },
+  "colorToneControl": { "colorTone": "Standard" },
+  "localDimmingControl": { "localDimming": "High" },
+  "autoMotionPlusControl": { "autoMotionPlus": "Off" },
+  "digitalCleanViewControl": { "digitalCleanView": "Off" },
+  "contrastEnhancerControl": { "contrastEnhancer": "High" },
+  "filmModeControl": { "filmMode": "Off" },
+  "gammaModeControl": { "gammaMode": "BT.1886" },
+  "speakerSelectControl": { "speakerSelect": "Internal" },
+  "externalSpeakerControl": {},
+  "pictureModeControl": { "pictureMode": "Standard" },
+  "soundModeControl": { "soundMode": "Amplify" }
+}
