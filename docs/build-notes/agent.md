@@ -127,3 +127,7 @@ No TTL: `device.firmware` (build string), `device.panel` (`"3840x2160"`), `app.i
   - The card screenshot is in `tools/scratch/agent/card.png`.
 - `node tools/scratch/agent/grace-test.mjs`: `conn.agent` read `unknown` at 0 s and 34 s and `offline` at 35.5 s. That run also exercised `lan: null` and the `data.readJson` key path.
 - An early e2e run left headless Edge processes behind. I stopped them all, and the script now closes the browser over CDP and sweeps processes by profile path. The final check found 0 left.
+
+## 0.4.0 (2026-10-23): request `launch`
+
+`{ t: 'req', rid, type: 'launch', appId, operation?, data? }` → `tizen.application.launchAppControl(new ApplicationControl(operation || 'http://tizen.org/appcontrol/operation/default', null, null, null, [ApplicationControlData(key, values)...]), appId)`. Limits: app id `[A-Za-z0-9._-]{1,128}`, http(s) operation URI, ≤ 16 keys, ≤ 4 KB of keys+values. Reply `{ appId, operation, keys }`. Used by `features/cast.js` for Netflix the way Smart Hub tiles launch it (decompiled CoBA `WebAppTileLauncher.LaunchNetflix`: `--root=app`, `--app-js=netflix`, `callerid`, `action_play_url`, `__K_SPLASH_SCREEN`, `__LEGACY_LAUNCH__`, `__K_RELOCATE_BELOW`); `config.cast.netflixSmartHub` picks the `action_play_url` candidate. Not yet verified on the TV.

@@ -337,6 +337,9 @@ export function connectAgent({
     } else if (msg.type === 'open-url') {
       // Agent 0.3.0 (spec §11.3): the view app control opened the URL on the TV.
       send({ t: 'reply', rid: msg.rid, ok: true, data: { method: 'view' } });
+    } else if (msg.type === 'launch') {
+      // Agent 0.4.0: an app-control launch (Smart Hub-style deep link).
+      send({ t: 'reply', rid: msg.rid, ok: true, data: { appId: msg.appId, operation: msg.operation ?? null, keys: Object.keys(msg.data ?? {}) } });
     } else send({ t: 'reply', rid: msg.rid, ok: false, error: `unknown request ${msg.type}` });
   });
   return {

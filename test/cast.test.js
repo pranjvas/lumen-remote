@@ -449,6 +449,25 @@ describe('cast: through the server and the mock TV', { skip }, () => {
     }
   });
 
+  test('Netflix links go to the TV agent as a Smart Hub app-control launch when it is online, DIAL otherwise', async () => {
+    const agent = stack.agent();
+    await b.waitForState('conn.agent', (r) => r?.v === 'online', { timeout: 10000 });
+    const dialBefore = mock.state.dial.launches.length;
+    const ack = await b.send('cast.url', { url: 'https://www.netflix.com/title/70153404' }, { timeout: 15000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    const launch = agent.requests.find((r) => r.type === 'launch');
+    assert.ok(launch, 'the agent got a launch request');
+    assert.equal(launch.appId, 'org.tizen.netflix-app');
+    assert.equal(launch.data.action_play_url, 'm=https://www.netflix.com/watch/70153404&source_type=4');
+    assert.equal(launch.data['--app-js'], 'netflix');
+    assert.equal(mock.state.dial.launches.length, dialBefore, 'no DIAL launch when the agent handled it');
+    agent.ws.close();
+    await b.waitForState('conn.agent', (r) => r?.v !== 'online', { timeout: 30000 });
+    const viaDial = await b.send('cast.url', { url: 'https://www.netflix.com/title/70153404' }, { timeout: 15000 });
+    assert.equal(viaDial.ok, true, JSON.stringify(viaDial.error));
+    assert.equal(mock.state.dial.launches.length, dialBefore + 1);
+  });
+
   test('the mock saw nothing a correct client must never do', () => {
     assert.deepEqual(mock.state.violations, []);
     assert.deepEqual(mock.state.errors, []);

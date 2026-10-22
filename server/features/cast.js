@@ -215,7 +215,14 @@ async function retryTransient(fn, { everyMs, totalMs = Infinity, attempts = Infi
 }
 
 // `browser` (optional) returns the Browser-view feature (spec §11.3); it is created after Cast, hence lazy.
-export function createCast({ config, data, log, store, lan, avtransport, dial, rest, browser = () => null }) {
+// Candidate action_play_url strings for Netflix (provider-defined; ranked, config.cast.netflixSmartHub picks).
+const SMART_HUB_NETFLIX = [
+  (id) => `m=https://www.netflix.com/watch/${id}&source_type=4`,
+  (id) => `m=${id}&source_type=4`,
+  (id) => `m=${id}&showMovieInfoOnly=true&source_type_payload=groupIndex%3D1%26tileIndex%3D0%26action%3Dmdp%26movieId%3D${id}`,
+];
+
+export function createCast({ config, data, log, store, lan, avtransport, dial, rest, browser = () => null, agent = () => null }) {
   const logger = log.child('cast');
   const castDir = path.join(config.dataDir, 'cast');
   // rest.baseUrl is the adapter's "http://<tv>:8001/api/v2/" (not part of the shared contract, hence the fallback).
@@ -342,7 +349,33 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
     return result;
   }
 
+  // Smart Hub's own tile launch (decompiled from CoBA's WebAppTileLauncher.LaunchNetflix): the Netflix
+  // app is started with app-control extra data, which DIAL cannot send. Needs TV agent 0.4.0+.
+  async function launchViaAgent(target) {
+    const a = agent();
+    if (target.kind !== 'netflix' || !target.id || !a?.request || store.get('conn.agent')?.v !== 'online') return false;
+    const forms = SMART_HUB_NETFLIX;
+    const playUrl = forms[config.cast?.netflixSmartHub ?? 0](target.id);
+    try {
+      await a.request('launch', {
+        appId: 'org.tizen.netflix-app',
+        data: {
+          '--root': 'app', '--app-js': 'netflix', callerid: 'com.samsung.tv.csfs', action_play_url: playUrl,
+          __K_SPLASH_SCREEN: 'LA_UI_DEFAULT', __LEGACY_LAUNCH__: 'true', __K_RELOCATE_BELOW: 'com.samsung.tv.csfs',
+        },
+      });
+      return true;
+    } catch (err) {
+      logger.debug('agent launch failed; falling back to DIAL', { message: err?.message });
+      return false;
+    }
+  }
+
   async function launchApp(target) {
+    if (await launchViaAgent(target)) {
+      supersede();
+      return publish({ kind: 'dial', app: target.kind, title: APP_TITLES[target.kind], uri: target.url, state: 'PLAYING', position: null, duration: null, via: 'agent' });
+    }
     const index = config.cast?.[`${target.kind}Payload`] ?? 0;
     const body = pickPayload(target.kind, target, index);
     await dial.launch(DIAL_APPS[target.kind], body);

@@ -94,7 +94,7 @@ export async function startServer(overrides = {}, seams = {}) {
       tracked: createTracked(ctx),
       macros: createMacros({ ...ctx, remote }),
       // Page links from Cast open in the Browser view, which is created after the hub (it sends frames through it).
-      cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser }),
+      cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser, agent: () => agent }),
     };
     const hub = createHub({ ...ctx, adapters, features });
     let http = null;

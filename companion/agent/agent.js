@@ -286,11 +286,54 @@
     if (msg.type === 'apps') return listApps();
     if (msg.type === 'icon') return iconFor(msg.appId);
     if (msg.type === 'open-url') return openUrl(msg.url);
+    if (msg.type === 'launch') return launchApp(msg.appId, msg.operation, msg.data);
     if (msg.type === 'exit') {
       setTimeout(quit, 200);
       return null;
     }
     throw new Error('unknown request: ' + msg.type);
+  }
+
+  // ---- launch: open an app with app-control extra data (how Smart Hub tiles deep-link) ----
+
+  const APP_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+  const DEFAULT_OPERATION = 'http://tizen.org/appcontrol/operation/default';
+
+  // data: { key: string | string[] }, at most 16 keys and 4 KB of values in total.
+  function launchApp(appId, operation, data) {
+    if (!APP_ID_RE.test(String(appId || ''))) return Promise.reject(new Error('launch needs a Tizen app id'));
+    const op = operation || DEFAULT_OPERATION;
+    if (!/^https?:\/\/[A-Za-z0-9./_-]{1,200}$/.test(op)) return Promise.reject(new Error('bad app-control operation'));
+    const entries = Object.keys(data || {});
+    if (entries.length > 16) return Promise.reject(new Error('too many app-control keys'));
+    let total = 0;
+    const extra = [];
+    for (let i = 0; i < entries.length; i++) {
+      const key = entries[i];
+      const raw = data[key];
+      const values = (Array.isArray(raw) ? raw : [raw]).map(function (v) { return String(v); });
+      values.forEach(function (v) { total += v.length + key.length; });
+      extra.push(new tizen.ApplicationControlData(key, values));
+    }
+    if (total > 4096) return Promise.reject(new Error('app-control data too large'));
+    return new Promise(function (resolve, reject) {
+      let settled = false;
+      const timer = setTimeout(function () { finish(new Error('launch timed out')); }, LAUNCH_TIMEOUT_MS);
+      function finish(err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve({ appId: appId, operation: op, keys: entries });
+      }
+      try {
+        const control = new tizen.ApplicationControl(op, null, null, null, extra);
+        tizen.application.launchAppControl(control, appId, function () { finish(null); },
+          function (e) { finish(new Error((e && e.name ? e.name + ': ' : '') + ((e && e.message) || e))); });
+      } catch (e) {
+        finish(e);
+      }
+    });
   }
 
   // ---- open-url: show a web page in the TV browser ----
