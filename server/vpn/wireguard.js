@@ -38,7 +38,7 @@ const IPV4_LITERAL = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 // core, 64 in Lumen's rebuild) and fails the next one at once ("dns-failed"), so the hub keeps
 // fewer than that in flight, shares one lookup per name, and remembers answers briefly. Names are
 // still resolved only inside the tunnel (DNS frames to the core); nothing here touches node:dns.
-export const DNS_MAX_INFLIGHT = 6; // below the original core's 8, so either core works
+export const DNS_MAX_INFLIGHT = 24; // well below the rebuilt core's DNS_TABLE_SIZE 64 (keep < 8 with the original core)
 export const DNS_CACHE_TTL_MS = 60000; // lwIP does not hand the record TTL over the mux
 export const DNS_NEGATIVE_TTL_MS = 15000; // a name the DNS server refused (e.g. a filtered ad host)
 const DNS_CACHE_MAX = 1024;

@@ -37,7 +37,7 @@
 #define MEM_ALIGNMENT                   4
 #define MEM_SIZE                        (12 * 1024 * 1024)
 #define MEMP_NUM_PBUF                   256
-#define MEMP_NUM_UDP_PCB                8
+#define MEMP_NUM_UDP_PCB                72 /* DNS uses one random source port per pending lookup (DNS_TABLE_SIZE) */
 #define MEMP_NUM_TCP_PCB                300
 #define MEMP_NUM_TCP_PCB_LISTEN         2
 #define MEMP_NUM_TCP_SEG                6144
@@ -55,8 +55,9 @@
 #define LWIP_WND_SCALE                  1
 #define TCP_RCV_SCALE                   4
 #define TCP_LISTEN_BACKLOG              0
+#define LWIP_TCP_RTO_TIME               1000 /* first SYN/segment retry after 1 s (RFC 6298), not lwIP's 3 s */
 
-#define DNS_TABLE_SIZE                  8
+#define DNS_TABLE_SIZE                  64 /* pending lookups + cached names; 8 failed heavy pages */
 #define DNS_MAX_NAME_LENGTH             256
 #define DNS_MAX_SERVERS                 2
 
