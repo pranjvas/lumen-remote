@@ -117,24 +117,41 @@ test('playback starts near the live edge, jumps back when far behind, reports st
   ms().open();
   await flush();
   ranges.push([5, 6]);
-  tick(250);
-  assert.ok(video.currentTime > 5.8 && video.currentTime < 6, `starts just behind the newest frame (${video.currentTime})`);
+  tick(500);
+  assert.ok(video.currentTime > 5.7 && video.currentTime < 6, `starts just behind the newest frame (${video.currentTime})`);
   assert.equal(video.paused, false);
   video.onplaying();
   assert.ok(classes.has('live'));
   assert.equal(sent.find((m) => m.state === 'playing').w, 1920);
   ranges[0][1] = 9; // far behind (3 s)
-  tick(250);
-  assert.ok(video.currentTime > 8.8, 'jumped to the live edge');
-  ranges[0][1] = 9.5; // 0.6 s behind: a little faster
-  tick(250);
+  tick(500);
+  assert.ok(video.currentTime > 8.7, 'jumped to the live edge');
+  ranges[0][1] = 9.6; // 0.7 s behind: a little faster
+  tick(500);
   assert.ok(video.playbackRate > 1);
-  tick(1000);
+  tick(2000);
   const stats = sent.filter((m) => m.state === 'stats').at(-1);
   assert.deepEqual([stats.dropped, stats.decoded], [2, 100]);
   live.message({ t: 'screen-live-stop' });
   assert.equal(classes.has('live'), false);
   assert.equal(live.isShowing(), false);
+});
+
+test('played video is removed every few seconds, not on every check', async () => {
+  const { live, ms, ranges, video, tick } = setup();
+  live.data(init(1));
+  ms().open();
+  await flush();
+  ranges.push([0, 20]);
+  tick(500); // the start: jumps near the live edge
+  video.onplaying();
+  const sb = ms().buffers[0];
+  for (let i = 0; i < 8; i++) tick(500);
+  assert.equal(sb.removed.length, 0, 'no remove() on the frequent checks');
+  tick(500);
+  tick(500);
+  assert.equal(sb.removed.length, 1, 'one remove() every 10 checks (5 s)');
+  assert.ok(sb.removed[0][1] <= video.currentTime - 3.9, 'a few seconds behind the playhead are kept');
 });
 
 test('agent scripts use no syntax newer than the TV engine (Chromium 69: no ?. ?? or object spread)', () => {

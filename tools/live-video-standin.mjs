@@ -19,6 +19,7 @@ const SECS = Number(arg('secs', 20));
 const MAX_HEIGHT = Number(arg('max-height', 1080));
 const CODECS = arg('codecs', null);
 const SHOT = arg('shot', null);
+const THROTTLE = Number(arg('throttle', 1)); // CPU slow-down of the stand-in TV (DevTools CPU throttling), e.g. 6 for a weak TV SoC
 const JPEG = process.argv.includes('--jpeg'); // baseline: live video off, the still frames only (CPU numbers)
 const EDGE = process.env.LUMEN_EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const AGENT_DIR = fileURLToPath(new URL('../companion/agent/', import.meta.url));
@@ -74,7 +75,7 @@ function cpuSeconds(pattern) {
 
 async function main() {
   const stack = await startStack({ config: { browser: { allowLoopback: true, idleMs: 120000 }, liveVideo: { enabled: !JPEG, maxHeight: MAX_HEIGHT }, log: { level: 'info', console: true } } });
-  const agentConfig = JSON.stringify({ pcHost: '127.0.0.1', pcPort: stack.lanPort, key: stack.server.agentKey, version: '0.8.0' });
+  const agentConfig = JSON.stringify({ pcHost: '127.0.0.1', pcPort: stack.lanPort, key: stack.server.agentKey, version: '0.8.1' });
   const web = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/test') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(TEST_PAGE); return; }
@@ -101,6 +102,7 @@ async function main() {
     let target;
     await waitFor(async () => { try { target = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find((t) => t.url.includes('/agent/index.html')); return !!target; } catch { return false; } }, { timeout: 20000, what: 'the stand-in TV page' });
     page = await cdp(target.webSocketDebuggerUrl);
+    if (THROTTLE > 1) await page.send('Emulation.setCPUThrottlingRate', { rate: THROTTLE });
     if (CODECS) await evaluate(page, `(() => { const real = MediaSource.isTypeSupported.bind(MediaSource); const allow = ${JSON.stringify(CODECS.split(','))};
       MediaSource.isTypeSupported = (t) => allow.some((c) => t.includes(c)) && real(t); return true; })()`);
     const t0 = Date.now();
@@ -119,7 +121,7 @@ async function main() {
     const states = [];
     const tStart = Date.now();
     while (Date.now() - tStart < SECS * 1000) {
-      await sleep(250);
+      await sleep(THROTTLE > 1 ? 1000 : 250);
       const tl = stack.server.features.livevideo.timeline().baseWallMs;
       if (tl) await evaluate(page, `window.__timeline = ${tl}`);
       const s = JPEG ? null : await evaluate(page, PROBE);
@@ -142,7 +144,7 @@ async function main() {
     const rows = smiOut.trim().split(/\r?\n/).map((l) => l.split(',').map(Number)).filter((x) => x.length === 3 && !x.some(Number.isNaN));
     const avg = (i) => Math.round(rows.reduce((s, x) => s + x[i], 0) / Math.max(1, rows.length));
     console.log(JSON.stringify({
-      startupMs: startup, size: `${last.w}x${last.h}`, presentedFps: +((last.frames - first.frames) / wall).toFixed(1),
+      throttle: THROTTLE, startupMs: startup, size: `${last.w}x${last.h}`, presentedFps: +((last.frames - first.frames) / wall).toFixed(1),
       droppedFrames: last.dropped - first.dropped, decodedFrames: last.total - first.total,
       latencyMs: { median: lats[lats.length >> 1], p95: lats[Math.floor(lats.length * 0.95)], min: lats[0], max: lats.at(-1) },
       captureToPresentMs: med(samples.map((s) => s.present).filter((x) => x !== null)),

@@ -289,9 +289,14 @@
     if (JSON.stringify(fast) !== lastFastSig) send({ t: 'state', snapshot: snapshotWith(fast) });
   }
 
+  let slowTicks = 0;
   async function stateTick() {
     if (!greeted) return;
-    slow = await readSlow();
+    // While live video plays, the heavier system readings (storage, network, Bluetooth) are refreshed
+    // only once a minute: the heartbeat itself stays cheap.
+    const liveOn = !!(window.LumenLive && window.LumenLive.isShowing());
+    slowTicks += 1;
+    if (!liveOn || slowTicks % 12 === 0) slow = await readSlow();
     if (greeted) send({ t: 'state', snapshot: snapshotWith(readFast()) });
   }
 

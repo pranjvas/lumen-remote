@@ -9,7 +9,7 @@ import {
   VIDEO_TRACK, AUDIO_TRACK,
 } from '../server/util/fmp4.js';
 import {
-  createMuxer, createFanout, createRateControl, usableLadder, initMessage, mediaMessage, parseMessage, LADDER, TV_CODEC_PROBES,
+  createMuxer, createFanout, createRateControl, usableLadder, startIndexOf, initMessage, mediaMessage, parseMessage, TV_CODEC_PROBES,
 } from '../server/features/livevideo.js';
 
 // An avcC as Chrome's encoder gives it (High profile, level 4.2) with a dummy SPS/PPS.
@@ -74,28 +74,71 @@ describe('fmp4', () => {
 });
 
 describe('muxer', () => {
-  function run(clock = { t: 0 }) {
+  // A fake clock and timers: fragments close on media time, or after 2× the fragment time on the clock.
+  function run() {
     const out = [];
-    const mux = createMuxer({ emit: (m) => out.push(m), now: () => clock.t });
-    return { mux, out, clock };
+    const clock = { t: 0 };
+    const timers = [];
+    const mux = createMuxer({ emit: (m) => out.push(m), now: () => clock.t, fragmentMs: 160,
+      setTimer: (fn) => { timers.push(fn); return timers.length; }, clearTimer: (id) => { if (id) timers[id - 1] = null; } });
+    const fire = () => { const list = timers.splice(0); list.forEach((fn) => fn && fn()); };
+    return { mux, out, clock, fire };
   }
-  const vconfig = (extra = {}) => ({ t: 'vconfig', codec: 'avc1.64002A', width: 1920, height: 1080, fps: 60, format: 'avc', description: AVCC.toString('base64'), ...extra });
+  const vconfig = (extra = {}) => ({ t: 'vconfig', codec: 'avc1.640028', width: 1920, height: 1080, fps: 30, format: 'avc', description: AVCC.toString('base64'), ...extra });
+  const media = (out) => out.filter((m) => m.kind === 'media');
+  // Samples per track in a fragment: [[track, count, firstTime]].
+  const runs = (buf) => {
+    const moof = findBox(buf, 'moof');
+    return listBoxes(buf, moof.start + 8, moof.start + moof.size).filter((b) => b.type === 'traf').map((traf) => {
+      const inner = listBoxes(buf, traf.start + 8, traf.start + traf.size);
+      const tfhd = inner.find((b) => b.type === 'tfhd');
+      const tfdt = inner.find((b) => b.type === 'tfdt');
+      const trun = inner.find((b) => b.type === 'trun');
+      return [buf.readUInt32BE(tfhd.start + 12), buf.readUInt32BE(trun.start + 12), Number(buf.readBigUInt64BE(tfdt.start + 12))];
+    });
+  };
 
-  test('the init segment waits for audio, then media starts at a key frame at time 0', () => {
+  test('the init segment waits for audio; media starts at a key frame; ~160 ms of media per fragment', () => {
     const { mux, out } = run();
     mux.videoConfig(vconfig());
     mux.video(1_000_000, false, Buffer.from('p'));
     assert.equal(out.length, 0, 'nothing before the audio config (or its timeout)');
     mux.audioConfig({ sampleRate: 48000, channels: 2, description: ASC.toString('base64') });
     assert.equal(out[0].kind, 'init');
-    assert.equal(out[0].mime, 'video/mp4; codecs="avc1.64002A,mp4a.40.2"');
+    assert.equal(out[0].mime, 'video/mp4; codecs="avc1.64002A,mp4a.40.2"', 'the codec string comes from the encoder avcC');
     assert.equal(out[0].reset, true);
     mux.video(1_016_000, false, Buffer.from('p'));
     assert.equal(out.length, 1, 'a frame that is not a key frame is not the start');
-    mux.video(1_033_000, true, Buffer.from('k'));
-    mux.video(1_050_000, false, Buffer.from('p'));
-    const media = out.filter((m) => m.kind === 'media');
-    assert.deepEqual(media.map((m) => [m.track, m.key, +m.time.toFixed(3)]), [['video', true, 0], ['video', false, 0.017]]);
+    let audioAt = 1_033_000;
+    for (let i = 0; i < 12; i++) {
+      const t = 1_033_000 + i * 33_333;
+      mux.video(t, i === 0, Buffer.from(`f${i}`));
+      for (; audioAt <= t; audioAt += 21_333) mux.audio(audioAt, Buffer.from('a')); // AAC: 1024 samples at 48 kHz
+    }
+    const m = media(out);
+    assert.equal(m.length, 2, '12 frames at 30 fps → two fragments');
+    assert.equal(m[0].key, true);
+    assert.equal(m[1].key, false);
+    assert.equal(m[0].time, 0);
+    const [video, audio] = runs(m[0].buf);
+    assert.deepEqual([video[0], video[1], video[2]], [1, 6, 0], 'six video frames from time 0');
+    assert.equal(audio[0], 2);
+    assert.ok(audio[1] >= 3, 'the audio of that time rides in the same fragment');
+    const trun = findBox(m[0].buf, 'moof/traf/trun');
+    const offset = m[0].buf.readUInt32BE(trun.start + 16);
+    assert.equal(m[0].buf.subarray(offset, offset + 2).toString(), 'f0', 'the data offset points at the first frame');
+  });
+
+  test('a key frame always starts a fragment of its own', () => {
+    const { mux, out } = run();
+    mux.videoConfig(vconfig());
+    mux.audioConfig({ sampleRate: 48000, channels: 2 });
+    mux.video(0, true, Buffer.from('k'));
+    mux.video(33_333, false, Buffer.from('p'));
+    mux.video(66_666, true, Buffer.from('K'));
+    const m = media(out);
+    assert.equal(m.length, 1, 'the run before the new key frame went out');
+    assert.equal(runs(m[0].buf)[0][1], 2);
   });
 
   test('without audio the init segment goes after the wait, video only', () => {
@@ -103,22 +146,26 @@ describe('muxer', () => {
     mux.videoConfig(vconfig());
     mux.video(0, true, Buffer.from('k'));
     clock.t = 2000;
-    mux.video(16_000, false, Buffer.from('p'));
+    mux.video(33_000, false, Buffer.from('p'));
     assert.equal(out[0].kind, 'init');
     assert.equal(out[0].audio, false);
     assert.equal(out[0].mime, 'video/mp4; codecs="avc1.64002A"');
   });
 
-  test('AAC frames follow each other exactly; a real gap is kept', () => {
-    const { mux, out } = run();
+  test('AAC frames follow each other exactly; a real gap is kept; audio alone goes out after a while', () => {
+    const { mux, out, fire } = run();
     mux.videoConfig(vconfig());
     mux.audioConfig({ sampleRate: 48000, channels: 2 });
     mux.video(100_000, true, Buffer.from('k'));
     mux.audio(100_000, Buffer.from('a'));
     mux.audio(121_400, Buffer.from('a')); // 21.4 ms later: jitter around 1024 samples
-    mux.audio(500_000, Buffer.from('a')); // a gap in the capture
-    const audio = out.filter((m) => m.track === 'audio').map((m) => Math.round(m.time * 48000));
-    assert.deepEqual(audio, [0, 1024, 19200]);
+    mux.audio(500_000, Buffer.from('a')); // a gap in the capture: a new run
+    fire(); // no video for a while (a still page): what is packed goes out
+    const m = media(out);
+    const first = runs(m[0].buf).find((r) => r[0] === 2);
+    assert.deepEqual([first[1], first[2]], [2, 0], 'two contiguous AAC frames from 0');
+    const second = runs(m[1].buf).find((r) => r[0] === 2);
+    assert.deepEqual([second[1], second[2]], [1, 19200]);
   });
 
   test('a new size is a new init without reset; a new codec family resets', () => {
@@ -126,21 +173,22 @@ describe('muxer', () => {
     mux.videoConfig(vconfig());
     mux.audioConfig({ sampleRate: 48000, channels: 2 });
     mux.video(0, true, Buffer.from('k'));
-    mux.videoConfig(vconfig({ codec: 'avc1.640028', width: 1280, height: 720, description: Buffer.concat([AVCC.subarray(0, 3), Buffer.from([0x28]), AVCC.subarray(4)]).toString('base64') }));
-    const inits = out.filter((m) => m.kind === 'init');
-    assert.equal(inits.length, 2);
-    assert.equal(inits[1].reset, false);
-    assert.equal(inits[1].codec, 'avc1.640028');
+    mux.videoConfig(vconfig({ codec: 'avc1.64001F', width: 1280, height: 720, description: Buffer.concat([AVCC.subarray(0, 3), Buffer.from([0x1f]), AVCC.subarray(4)]).toString('base64') }));
+    const kinds = out.map((m) => m.kind);
+    assert.deepEqual(kinds, ['init', 'media', 'init'], 'the packed frames of the old size go before the new init');
+    assert.equal(out[2].reset, false);
+    assert.equal(out[2].codec, 'avc1.64001F');
     // HEVC (Annex B): the record comes from the next key frame's parameter sets.
     mux.videoConfig({ t: 'vconfig', codec: 'hvc1.1.6.L153.B0', width: 320, height: 240, fps: 30, format: 'annexb' });
     mux.video(50_000, true, annexB([...HEVC_UNITS, Buffer.from([0x26, 0x01, 0xaf])]));
+    mux.flush();
     const last = out.filter((m) => m.kind === 'init').at(-1);
     assert.equal(last.codec, 'hvc1.4.10.L60.9E.8');
     assert.equal(last.reset, true);
-    const media = out.at(-1);
-    assert.equal(media.kind, 'media');
-    assert.ok(!media.buf.includes(HEVC_UNITS[1]), 'parameter sets are not repeated in the samples');
-    assert.ok(media.time > 0, 'the timeline continues');
+    const tail = out.at(-1);
+    assert.equal(tail.kind, 'media');
+    assert.ok(!tail.buf.includes(HEVC_UNITS[1]), 'parameter sets are not repeated in the samples');
+    assert.ok(tail.time > 0, 'the timeline continues');
   });
 });
 
@@ -159,21 +207,14 @@ describe('TV message framing', () => {
 describe('fan-out', () => {
   function setup() {
     let keys = 0;
-    const timers = [];
-    const fan = createFanout({
-      requestKey: () => { keys += 1; },
-      now: (() => { let t = 0; return () => (t += 1000); })(),
-      setTimer: (fn) => { timers.push(fn); return timers.length; },
-      clearTimer: () => {},
-      limitBytes: () => 100,
-    });
+    const fan = createFanout({ requestKey: () => { keys += 1; }, now: (() => { let t = 0; return () => (t += 1000); })(), limitBytes: () => 100 });
     const viewer = (accept = () => true) => {
       const got = [];
       return { got, send: (buf, opts) => { if (!accept(buf, opts)) return false; got.push(parseMessage(buf)); return true; } };
     };
-    const init = (extra = {}) => fan.onInit({ mime: 'video/mp4', codec: 'avc1.64002A', width: 1920, height: 1080, fps: 60, audio: true, reset: true, buf: Buffer.from('I'), ...extra });
-    const media = (track, key, tag = track[0]) => fan.onMedia({ track, key, buf: Buffer.from(tag), time: 0 });
-    return { fan, viewer, init, media, timers, keys: () => keys };
+    const init = (extra = {}) => fan.onInit({ mime: 'video/mp4', codec: 'avc1.640028', width: 1920, height: 1080, fps: 30, audio: true, reset: true, buf: Buffer.from('I'), ...extra });
+    const media = (key, tag) => fan.onMedia({ key, buf: Buffer.from(tag), time: 0 });
+    return { fan, viewer, init, media, keys: () => keys };
   }
 
   test('a viewer that joins gets the init segment, asks for a key frame, and starts at one', () => {
@@ -184,13 +225,11 @@ describe('fan-out', () => {
     assert.equal(v.got[0].kind, 'init');
     assert.equal(v.got[0].info.reset, true);
     assert.ok(keys() >= 1);
-    media('video', false);
-    media('audio', true);
-    assert.equal(v.got.length, 1, 'nothing until the key frame');
-    media('video', true, 'K');
-    media('audio', true, 'A');
-    media('video', false, 'P');
-    assert.deepEqual(v.got.slice(1).map((m) => [m.key, m.data.toString()]), [[true, 'K'], [false, 'AP']], 'audio rides with the next video fragment');
+    media(false, 'P0');
+    assert.equal(v.got.length, 1, 'nothing until a fragment that starts with a key frame');
+    media(true, 'K');
+    media(false, 'P');
+    assert.deepEqual(v.got.slice(1).map((m) => [m.key, m.data.toString()]), [[true, 'K'], [false, 'P']]);
   });
 
   test('a backed-up link skips to the next key frame and asks for one', () => {
@@ -199,14 +238,14 @@ describe('fan-out', () => {
     let open = true;
     const v = viewer(() => open);
     fan.add(v);
-    media('video', true, 'K1');
+    media(true, 'K1');
     open = false;
     const before = keys();
-    media('video', false, 'P1');
+    media(false, 'P1');
     assert.ok(keys() > before, 'a key frame is requested');
     open = true;
-    media('video', false, 'P2');
-    media('video', true, 'K2');
+    media(false, 'P2');
+    media(true, 'K2');
     assert.deepEqual(v.got.filter((m) => m.kind === 'media').map((m) => m.data.toString()), ['K1', 'K2']);
     assert.equal(fan.takeStats(v).drops, 1);
   });
@@ -216,13 +255,13 @@ describe('fan-out', () => {
     init();
     const v = viewer();
     fan.add(v);
-    media('video', true, 'K1');
+    media(true, 'K1');
     fan.pause(v);
-    media('video', false, 'P');
-    media('video', true, 'K2');
+    media(false, 'P');
+    media(true, 'K2');
     fan.resume(v);
-    media('video', false, 'P3');
-    media('video', true, 'K3');
+    media(false, 'P3');
+    media(true, 'K3');
     const kinds = v.got.map((m) => (m.kind === 'init' ? `init${m.info.reset ? '!' : ''}` : m.data.toString()));
     assert.deepEqual(kinds, ['init!', 'K1', 'init!', 'K3']);
   });
@@ -232,9 +271,9 @@ describe('fan-out', () => {
     init();
     const v = viewer();
     fan.add(v);
-    media('video', true, 'K1');
+    media(true, 'K1');
     init({ reset: false, width: 1280, height: 720 });
-    media('video', true, 'K2');
+    media(true, 'K2');
     const msgs = v.got;
     assert.equal(msgs.at(-2).kind, 'init');
     assert.equal(msgs.at(-2).info.reset, false);
@@ -243,47 +282,68 @@ describe('fan-out', () => {
 });
 
 describe('rate control and the ladder', () => {
-  const ladder = usableLadder({ caps: Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, true])) });
+  const allCaps = Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, true]));
+  const full = usableLadder({ caps: allCaps, maxHeight: 2160 });
+  const tv = usableLadder({ caps: allCaps }); // the default: 1080p at most
 
-  test('the ladder follows the TV and the encoder; HEVC first at 4K', () => {
-    assert.deepEqual(ladder.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:hevc', '1080p60:avc', '720p60:avc']);
-    const noHevc = usableLadder({ caps: { 'avc1.640033': true, 'avc1.64002A': true, 'avc1.640028': true }, encoders: { '2160p30:hevc': true } });
-    assert.deepEqual(noHevc.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:avc', '1080p60:avc', '720p60:avc']);
-    const capped = usableLadder({ caps: Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, true])), maxHeight: 1080 });
-    assert.equal(capped[0].name, '1080p60');
-    const noEncoder = usableLadder({ caps: Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, true])), encoders: { '2160p30:hevc': false, '2160p30:avc': false } });
-    assert.equal(noEncoder[0].name, '1080p60');
+  test('the ladder follows the TV, the encoder and maxHeight; it starts at 1080p30, never at 4K', () => {
+    assert.deepEqual(tv.map((s) => s.name), ['1080p30', '720p30', '540p30']);
+    assert.ok(tv.every((s) => s.fps === 30), '30 fps throughout for this TV');
+    assert.deepEqual(full.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:hevc', '1080p30:avc', '720p30:avc', '540p30:avc']);
+    assert.equal(startIndexOf(full), 1, '4K is a probe step');
+    assert.equal(startIndexOf(full, 1), 2, 'one step lower after the TV went away');
+    const noHevc = usableLadder({ caps: { 'avc1.640033': true, 'avc1.640028': true }, encoders: { '2160p30:hevc': true }, maxHeight: 2160 });
+    assert.deepEqual(noHevc.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:avc', '1080p30:avc', '720p30:avc', '540p30:avc']);
+    const noEncoder = usableLadder({ caps: allCaps, encoders: { '2160p30:hevc': false, '2160p30:avc': false }, maxHeight: 2160 });
+    assert.equal(noEncoder[0].name, '1080p30');
   });
 
   test('congestion lowers the bitrate to the floor, then steps down; quiet raises it again', () => {
-    const rc = createRateControl({ ladder });
-    assert.equal(rc.bitrate, LADDER[0].bitrate.start);
-    let change;
-    for (let i = 0; i < 10 && rc.bitrate > ladder[0].bitrate.min; i++) change = rc.tick({ drops: 1 });
-    assert.equal(rc.bitrate, ladder[0].bitrate.min);
+    const rc = createRateControl({ ladder: tv });
+    assert.equal(rc.step.name, '1080p30');
+    for (let i = 0; i < 10 && rc.bitrate > tv[0].bitrate.min; i++) rc.tick({ drops: 1 });
+    assert.equal(rc.bitrate, tv[0].bitrate.min);
     const steps = [];
     for (let i = 0; i < 3; i++) steps.push(rc.tick({ queueSec: 1 }));
     assert.deepEqual(steps.slice(0, 2), [null, null], 'two congested seconds at the floor are borne');
     assert.equal(steps[2].step, 1);
-    assert.equal(rc.step.name, '1080p60');
-    for (let i = 0; i < 8; i++) change = rc.tick({});
-    assert.ok(rc.bitrate > ladder[1].bitrate.start, 'the bitrate creeps back up');
+    assert.equal(rc.step.name, '720p30');
+    for (let i = 0; i < 8; i++) rc.tick({});
+    assert.ok(rc.bitrate > tv[1].bitrate.start, 'the bitrate creeps back up');
+  });
+
+  test('a TV that stops reporting counts as congestion', () => {
+    const rc = createRateControl({ ladder: tv });
+    const change = rc.tick({ statsLate: true });
+    assert.ok(change.bitrate < tv[0].bitrate.start);
   });
 
   test('a TV that drops frames or refuses the format gets the next step; the end is reported', () => {
-    const rc = createRateControl({ ladder });
+    const rc = createRateControl({ ladder: tv });
     for (let i = 0; i < 3; i++) rc.tick({ dropRatio: 0.3 });
-    assert.equal(rc.step.name, '1080p60');
+    assert.equal(rc.step.name, '720p30');
     assert.equal(rc.tick({ refused: true }).step, 2);
     assert.deepEqual(rc.tick({ refused: true }), { exhausted: true });
   });
 
-  test('a step lowered for congestion is tried again after a quiet while', () => {
-    const rc = createRateControl({ ladder });
-    for (let i = 0; i < 6; i++) rc.tick({ drops: 1 });
-    assert.equal(rc.step.name, '1080p60');
-    let up = null;
-    for (let i = 0; i < 60 && !up?.step && up?.step !== 0; i++) up = rc.tick({});
+  test('4K is tried only after a long quiet spell, and dropped for good at its first trouble', () => {
+    const rc = createRateControl({ ladder: full, probeAfter: 20 });
+    assert.equal(rc.step.name, '1080p30');
+    let change = null;
+    for (let i = 0; i < 25 && rc.step.name !== '2160p30'; i++) change = rc.tick({});
     assert.equal(rc.step.name, '2160p30');
+    assert.equal(change.cause, 'probe');
+    assert.equal(rc.tick({ dropRatio: 0.2 }).cause, 'probe-failed');
+    assert.equal(rc.step.name, '1080p30');
+    for (let i = 0; i < 60; i++) rc.tick({});
+    assert.equal(rc.step.name, '1080p30', 'not tried again');
+  });
+
+  test('a step lowered for congestion is tried again after a quiet while', () => {
+    const rc = createRateControl({ ladder: tv });
+    for (let i = 0; i < 6; i++) rc.tick({ drops: 1 });
+    assert.equal(rc.step.name, '720p30');
+    for (let i = 0; i < 60 && rc.step.name !== '1080p30'; i++) rc.tick({});
+    assert.equal(rc.step.name, '1080p30');
   });
 });

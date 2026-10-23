@@ -56,9 +56,10 @@ export const DEFAULTS = deepFreeze({
   },
   // Live video of the Lumen browser on the TV (features/livevideo.js): the page captured with its
   // sound, hardware-encoded on this PC and played by the TV agent's MSE player; the JPEG frames stay
-  // as the fallback. maxHeight 2160 allows 4K (HEVC when the TV takes it), stepping down to 1080p60
-  // and 720p60 when the TV or the link cannot keep up.
-  liveVideo: { enabled: true, maxHeight: 2160, preferHevc: true, idleStopMs: 15000, gopSeconds: 2 },
+  // as the fallback. The Q95T's web engine is slow, so the stream starts at 1080p30 and steps down
+  // to 720p30 and 540p30 when the TV or the link cannot keep up. maxHeight 2160 also lets it try 4K
+  // (HEVC when the TV takes it) after a long quiet spell. fragmentMs: media per WebSocket message.
+  liveVideo: { enabled: true, maxHeight: 1080, preferHevc: true, idleStopMs: 15000, gopSeconds: 2, fragmentMs: 160 },
   log: { level: 'info', console: true },
 });
 

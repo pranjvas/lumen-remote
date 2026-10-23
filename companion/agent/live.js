@@ -8,12 +8,18 @@
 (function () {
   'use strict';
 
-  const TARGET_LAG = 0.08; // seconds behind the newest frame the player aims for
-  const SOFT_LAG = 0.16; // above this the rate goes up, in proportion to the drift
-  const HARD_LAG = 0.9; // above this the player jumps to the live edge
-  const KEEP_BEHIND = 6; // seconds of played video kept in the buffer
-  const MAX_QUEUE_BYTES = 12 * 1024 * 1024; // appends waiting beyond this: start over from a key frame
+  // Media arrives ~160 ms at a time, so the player stays a little more than one fragment behind
+  // the newest frame: closer, it would run dry between fragments and stall.
+  const TARGET_LAG = 0.25; // seconds behind the newest frame the player aims for
+  const SOFT_LAG = 0.5; // above this the rate goes up, in proportion to the drift
+  const HARD_LAG = 1.5; // above this the player jumps to the live edge
+  const KEEP_BEHIND = 4; // seconds of played video kept in the buffer
+  const TRIM_EVERY = 10; // control ticks (500 ms) between buffer trims: remove() is not cheap here
+  const MAX_QUEUE_BYTES = 8 * 1024 * 1024; // appends waiting beyond this: start over from a key frame
   const STALL_MS = 1500;
+  // This TV's web engine is slow: the PC sends a few large fragments a second, this page appends them
+  // one at a time (all that waited, in one append), checks the live edge twice a second, trims the
+  // buffer every few seconds and reports every 2 s (the PC treats silence as overload).
 
   let send = function () { return false; };
   let el = null; // <video id="live">
@@ -34,6 +40,7 @@
   let statsTimer = null;
   let objectUrl = null;
   let failed = false;
+  let ticks = 0;
 
   function now() { return Date.now(); }
 
@@ -120,8 +127,8 @@
     el.onwaiting = function () { if (ms === source) lastProgress = Math.min(lastProgress, now()); };
     objectUrl = URL.createObjectURL(source);
     el.src = objectUrl;
-    controlTimer = setInterval(control, 250);
-    statsTimer = setInterval(stats, 1000);
+    controlTimer = setInterval(control, 500);
+    statsTimer = setInterval(stats, 2000);
   }
 
   // The TV cannot play this stream: the PC tries the next format down (or JPEG frames).
@@ -140,8 +147,8 @@
     parts.forEach(function (p) { total += p.byteLength; });
     const out = new Uint8Array(total);
     let at = 0;
-    parts.forEach(function (p) { out.set(new Uint8Array(p), at); at += p.byteLength; });
-    return out.buffer;
+    parts.forEach(function (p) { out.set(p, at); at += p.byteLength; });
+    return out;
   }
 
   function pump() {
@@ -201,8 +208,9 @@
       el.currentTime = Math.max(ranges.start(ranges.length - 1), end - TARGET_LAG);
       el.playbackRate = 1;
     } else if (lag > SOFT_LAG) {
-      el.playbackRate = Math.min(1.25, 1 + (lag - TARGET_LAG) * 0.5);
-    } else if (lag < TARGET_LAG + 0.03) {
+      const rate = Math.round(Math.min(1.25, 1 + (lag - TARGET_LAG) * 0.5) * 20) / 20;
+      if (el.playbackRate !== rate) el.playbackRate = rate;
+    } else if (lag < TARGET_LAG + 0.03 && el.playbackRate !== 1) {
       el.playbackRate = 1;
     }
     if (el.paused) el.play().catch(function () {});
@@ -212,7 +220,8 @@
       lastProgress = now();
       el.currentTime = Math.max(ranges.start(ranges.length - 1), end - TARGET_LAG);
     }
-    trim(false);
+    ticks += 1;
+    if (ticks % TRIM_EVERY === 0) trim(false);
   }
 
   function stats() {
@@ -276,9 +285,9 @@
         const len = view.getUint16(8);
         let info = null;
         try { info = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 10, len))); } catch (e) { info = null; }
-        if (info) onInit(g, info, buffer.slice(10 + len));
+        if (info) onInit(g, info, new Uint8Array(buffer, 10 + len));
       } else if (b[2] === 0x4d) { // 'M'
-        onMedia(g, buffer.slice(8));
+        onMedia(g, new Uint8Array(buffer, 8));
       }
       return true;
     },

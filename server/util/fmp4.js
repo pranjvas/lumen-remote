@@ -197,17 +197,33 @@ export function mimeType(videoCodec, audio = true) {
 const SYNC = 0x02000000; // sample_depends_on = 2 (I), sync sample
 const NON_SYNC = 0x01010000; // sample_depends_on = 1, sample_is_non_sync_sample
 
+/**
+ * One moof + mdat holding a run of samples per track: tracks = [{ track, time (first sample, track
+ * timescale), samples: [{ duration, data, key }] }]. The mdat holds the tracks' data in that order.
+ * Fewer, larger fragments cost the TV's player far less than one per frame.
+ */
+export function fragmentBatch({ seq, tracks }) {
+  const runs = tracks.filter((t) => t.samples.length);
+  const trunFlags = 0x000001 | 0x000100 | 0x000200 | 0x000400; // data offset, duration, size, flags
+  const build = (offsets) => box('moof',
+    fullbox('mfhd', 0, 0, u32(seq)),
+    ...runs.map((t, i) => box('traf',
+      fullbox('tfhd', 0, 0x020000, u32(t.track)), // default-base-is-moof
+      fullbox('tfdt', 1, 0, u64(t.time)),
+      fullbox('trun', 0, trunFlags, u32(t.samples.length), u32(offsets[i]),
+        ...t.samples.flatMap((s) => [u32(s.duration), u32(s.data.length), u32(s.key ? SYNC : NON_SYNC)])))));
+  const moofSize = build(runs.map(() => 0)).length;
+  const offsets = [];
+  let at = moofSize + 8;
+  for (const t of runs) { offsets.push(at); at += t.samples.reduce((n, s) => n + s.data.length, 0); }
+  const data = runs.flatMap((t) => t.samples.map((s) => s.data));
+  const dataSize = at - moofSize - 8;
+  return Buffer.concat([build(offsets), u32(8 + dataSize), str4('mdat'), ...data]);
+}
+
 /** One moof + mdat holding one sample of `track` at `time` (track timescale), lasting `duration`. */
 export function fragment({ seq, track, time, duration, data, key = true }) {
-  const trunFlags = 0x000001 | 0x000100 | 0x000200 | 0x000400; // data offset, duration, size, flags
-  const build = (offset) => box('moof',
-    fullbox('mfhd', 0, 0, u32(seq)),
-    box('traf',
-      fullbox('tfhd', 0, 0x020000, u32(track)), // default-base-is-moof
-      fullbox('tfdt', 1, 0, u64(time)),
-      fullbox('trun', 0, trunFlags, u32(1), u32(offset), u32(duration), u32(data.length), u32(key ? SYNC : NON_SYNC))));
-  const size = build(0).length;
-  return Buffer.concat([build(size + 8), u32(8 + data.length), str4('mdat'), data]);
+  return fragmentBatch({ seq, tracks: [{ track, time, samples: [{ duration, data, key }] }] });
 }
 
 // ---------- reading (tests and diagnostics) ----------

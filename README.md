@@ -87,12 +87,12 @@ wsl -d Ubuntu -u pv -- bash /mnt/c/Users/pranj/source/lumen-remote/tools/agent/i
 
 ### Live video of the Lumen browser on the TV
 
-With agent 0.8.0 or later, "On TV" plays Lumen's browser as live video with the page's sound, not still frames. Lumen's own Edge captures the page from a second tab and encodes it on this PC's GPU (H.264, or HEVC for 4K, with AAC audio). The TV agent plays the fragmented MP4 through MSE. The stream starts at 2160p30 when the TV accepts HEVC and steps down to 1080p60 and then 720p60 when the TV drops frames or the Wi-Fi can't carry it. The bitrate also adapts within each step. The PC stays silent. A sign-in pop-up, the TV's own video player and older agents use the still frames.
+With agent 0.8.1 or later, "On TV" plays Lumen's browser as live video with the page's sound, not still frames. Lumen's own Edge captures the page from a second tab and encodes it on this PC's GPU (H.264 with AAC audio). The TV agent plays the fragmented MP4 through MSE. About six fragments a second go to the TV, and no still frames while the video plays. The Q95T's web engine is slow, so the stream starts at 1080p30 and steps down to 720p30 and then 540p30 when the TV drops frames, stops reporting, or the Wi-Fi can't carry it. The bitrate also adapts within each step. A TV that stops reporting goes back to still frames. If the agent dies during live video, the next "On TV" starts a step lower. After two such deaths the TV stays on still frames until live video is turned on again. The PC stays silent. A sign-in pop-up, the TV's own video player and older agents use the still frames.
 
-- Off for good: set `"liveVideo": { "enabled": false }` in `data/config.json`. Turn it off just for now with the hub command `tvscreen.live {on:false}`.
-- 1080p60 at most (smoother than 4K30): `"liveVideo": { "maxHeight": 1080 }`.
+- Off for good: set `"liveVideo": { "enabled": false }` in `data/config.json`. Turn it off or on just for now with the hub command `tvscreen.live {on:false|true}`. Turning it on also clears the record of agent deaths.
+- 4K experiment: `"liveVideo": { "maxHeight": 2160 }` lets the stream try 2160p30 (HEVC when the TV takes it) after 90 quiet seconds at 1080p30. It drops back for good at the first trouble.
 - Live state (step, codec, bitrate, sent kbit/s, TV lag): store key `tvscreen.live`.
-- Without the TV: `node tools/live-video-standin.mjs` runs the real agent page in a second headless Edge as a stand-in TV and measures latency and frame rate. `node tools/live-video-check.mjs` writes the stream to an MP4.
+- Without the TV: `node tools/live-video-standin.mjs` runs the real agent page in a second headless Edge as a stand-in TV and measures latency and frame rate (`--throttle 6` slows its CPU like a weak TV). `node tools/live-video-check.mjs` writes the stream to an MP4.
 
 ## Verified on the TV (21–22 Oct 2026) and known limits
 
