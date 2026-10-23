@@ -635,9 +635,14 @@ export function mountBrowser(root, ctx) {
       if (!padLive()) return;
       if (nativeTv()) {
         const gain = readGain();
-        native.dx += accelerate(dx, gain);
-        native.dy += accelerate(dy, gain);
+        const ax = accelerate(dx, gain);
+        const ay = accelerate(dy, gain);
+        native.dx += ax;
+        native.dy += ay;
         if (!nativeFrame) nativeFrame = requestAnimationFrame(flushNative);
+        // The phone's pointer follows along (the TV's pointer moves in 1920x1080 screen pixels).
+        ptr = { x: clamp(ptr.x + ax / 1920, POINTER_EDGE, 1 - POINTER_EDGE), y: clamp(ptr.y + ay / 1080, POINTER_EDGE, 1 - POINTER_EDGE) };
+        placePointer();
         return;
       }
       const p = pad.getBoundingClientRect();
