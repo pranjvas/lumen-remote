@@ -23,6 +23,9 @@ const AUDIO_WAIT_MS = 1500; // the init segment waits this long for the audio tr
 const AUDIO_FLUSH_MS = 60; // audio fragments ride with the next video fragment, or go alone after this
 const KEY_REQUEST_GAP_MS = 300;
 const RETRY_MS = [1000, 3000, 8000, 15000];
+// getDisplayMedia waits for a picker that headless Edge never shows when no tab carries the title
+// (the page changed its title in that moment): the attempt is abandoned and tried again.
+const PICK_TIMEOUT_MS = 6000;
 
 // ---------- the ladder ----------
 
@@ -554,9 +557,14 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     try {
       const saved = await evaluate(main, 'document.title');
       await evaluate(main, `document.title = ${JSON.stringify(CAPTURE_TITLE)}`);
+      let pickTimer = null;
       try {
-        started = await evaluate(cdp, `lumenStart(${JSON.stringify({ width: step.width, height: step.height, fps: step.fps })})`, { gesture: true });
+        started = await Promise.race([
+          evaluate(cdp, `lumenStart(${JSON.stringify({ width: step.width, height: step.height, fps: step.fps })})`, { gesture: true }),
+          new Promise((_, reject) => { pickTimer = setTimeout(() => reject(new Error('the tab capture did not start')), PICK_TIMEOUT_MS); }),
+        ]);
       } finally {
+        clearTimeout(pickTimer);
         await evaluate(main, `document.title = ${JSON.stringify(saved ?? '')}`).catch(() => {});
       }
     } finally {
@@ -601,7 +609,23 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     retry += 1;
     log.info('live video lost; restarting', { reason, inMs: delay });
     publishState('restarting');
-    retryTimer = setTimeout(() => { ensureCapture().catch(() => {}); }, delay);
+    retryTimer = setTimeout(() => { ensureCapture().catch(startFailed); }, delay);
+  }
+
+  // A start that failed is tried again a few times (spaced out); then the TV goes back to frames.
+  // Nothing the TV can play is not retried.
+  function startFailed(err) {
+    if (stopped || !viewers.size) return;
+    const hopeless = err instanceof LumenError && /none of the stream formats|turned off/.test(err.message);
+    if (!hopeless && retry < RETRY_MS.length) {
+      const delay = RETRY_MS[retry];
+      retry += 1;
+      publishState('restarting');
+      retryTimer = setTimeout(() => { ensureCapture().catch(startFailed); }, delay);
+      return;
+    }
+    retry = 0;
+    for (const v of [...viewers.values()]) v.onFallback?.(`live video could not start: ${err.message}`);
   }
 
   // ---- muxer output ----
@@ -681,7 +705,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     statsTimer ??= setInterval(controlTick, 1000);
     // New caps (another TV, an agent update) choose the ladder again.
     if (changedCaps && page) { stopCapture(); }
-    ensureCapture().catch((err) => viewer.onFallback?.(err.message));
+    ensureCapture().catch(startFailed);
     publishState('starting');
     return {
       pause: () => fanout.pause(viewer),
