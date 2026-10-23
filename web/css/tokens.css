@@ -72,6 +72,34 @@
   --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
   --ease-io: cubic-bezier(0.65, 0, 0.35, 1);
 
+  /* Spacing: one 4 px scale for gaps, paddings and margins. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 40px;
+  --gutter: 16px;
+
+  /* Type: nothing a person must read goes below --fs-2xs. */
+  --fs-2xs: 10px;
+  --fs-xs: 11.5px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+
+  /* Press response shared by every tappable surface. */
+  --press-scale: 0.965;
+  --press-wash: color-mix(in oklab, var(--tint) 14%, transparent);
+
+  /* Phone chrome heights (the tab bar and header), used to place toasts and sheets. */
+  --header-h: 56px;
+  --tabbar-h: 58px;
+
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);

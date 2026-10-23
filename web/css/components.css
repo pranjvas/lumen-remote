@@ -30,7 +30,7 @@
   background: radial-gradient(closest-side, color-mix(in oklab, var(--tint) 30%, transparent), transparent);
   transition: opacity var(--dur-state) var(--ease-out);
 }
-.key:hover { color: var(--ink); }
+@media (hover: hover) { .key:hover { color: var(--ink); } }
 .key.is-pressed,
 .key:active:not(:disabled) {
   transform: translateY(1px);
@@ -39,7 +39,7 @@
 .key.is-pressed::after { opacity: 1; }
 .key:disabled { opacity: 0.4; }
 .key .icon { color: var(--ink); }
-.key .silk { font-size: 9.5px; }
+.key .silk { font-size: var(--fs-2xs); }
 .key.round { border-radius: 50%; }
 
 /* ---------- Buttons ---------- */
@@ -61,7 +61,7 @@
   transition: background var(--dur-state), border-color var(--dur-state), transform var(--dur-press);
   white-space: nowrap;
 }
-.btn:hover { background: var(--key-hi); }
+@media (hover: hover) { .btn:hover { background: var(--key-hi); } }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: 0.45; }
 .btn.primary {
@@ -70,9 +70,9 @@
   border-color: transparent;
   box-shadow: 0 10px 24px -14px var(--accent);
 }
-.btn.primary:hover { background: color-mix(in oklab, var(--accent) 88%, white); }
+@media (hover: hover) { .btn.primary:hover { background: color-mix(in oklab, var(--accent) 88%, white); } }
 .btn.ghost { background: transparent; }
-.btn.ghost:hover { background: var(--hair); }
+@media (hover: hover) { .btn.ghost:hover { background: var(--hair); } }
 .btn.danger { color: var(--danger); }
 .btn.sm { height: 32px; padding: 0 12px; font-size: 12.5px; }
 .btn.lg { height: 48px; padding: 0 22px; font-size: 15px; }
@@ -115,7 +115,7 @@
   white-space: nowrap;
   transition: color var(--dur-state), background var(--dur-state), border-color var(--dur-state);
 }
-.chip:hover { color: var(--ink); border-color: var(--hair-strong); }
+@media (hover: hover) { .chip:hover { color: var(--ink); border-color: var(--hair-strong); } }
 .chip[aria-pressed="true"],
 .chip.is-active {
   color: var(--ink);
@@ -360,7 +360,7 @@
   color: var(--ink-2);
   transition: background var(--dur-state), color var(--dur-state), box-shadow var(--dur-state);
 }
-.seg button:hover { color: var(--ink); }
+@media (hover: hover) { .seg button:hover { color: var(--ink); } }
 .seg button[aria-checked="true"] {
   color: var(--ink);
   background: linear-gradient(180deg, var(--key-hi), var(--key));
@@ -495,11 +495,14 @@ textarea.field { height: auto; min-height: 92px; padding: 12px 14px; resize: ver
 
 /* ---------- Toasts and whispers ---------- */
 
+/* Phones: toasts rise from just above the tab bar (and above a view's own bottom bar), so they never
+   cover the header or the now-playing strip. */
 .toasts {
+  --toast-lift: 0px;
   position: fixed;
   z-index: 60;
   left: 50%;
-  top: calc(64px + var(--safe-top));
+  bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--toast-lift) + 10px);
   transform: translateX(-50%);
   display: flex;
   flex-direction: column;
@@ -538,13 +541,17 @@ textarea.field { height: auto; min-height: 92px; padding: 12px 14px; resize: ver
   border-radius: var(--r-pill);
 }
 .toast.whisper .icon { color: var(--accent); width: 14px; height: 14px; }
-.toast.is-leaving { animation: toastOut 220ms var(--ease-io) forwards; }
-@keyframes toastIn { from { opacity: 0; transform: translateY(-8px) scale(0.98); } }
-@keyframes toastOut { to { opacity: 0; transform: translateY(-6px); } }
-@media (min-width: 980px) {
-  .toast { animation-name: toastInUp; }
-  .toast.is-leaving { animation-name: toastOutDown; }
+.toast.is-leaving { animation: toastOutDown 220ms var(--ease-io) forwards; }
+.toast { animation-name: toastInUp; }
+.app[data-view="browser"] ~ .toasts { --toast-lift: 58px; }
+.app[data-view="ask"] ~ .toasts { --toast-lift: 72px; }
+@media (min-height: 760px) { .app[data-view="remote"] ~ .toasts { --toast-lift: 54px; } }
+/* A bottom sheet owns the lower half: toasts drop from the top instead. */
+@media (max-width: 759px) {
+  body:has(> .sheet) .toasts { bottom: auto; top: calc(var(--safe-top) + 12px); }
+  body:has(> .sheet) .toast { animation-name: toastIn; }
 }
+@keyframes toastIn { from { opacity: 0; transform: translateY(-8px) scale(0.98); } }
 @keyframes toastInUp { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
 @keyframes toastOutDown { to { opacity: 0; transform: translateY(6px); } }
 
@@ -558,6 +565,56 @@ textarea.field { height: auto; min-height: 92px; padding: 12px 14px; resize: ver
     align-items: flex-end;
   }
 }
+
+/* ---------- Touch system: press response, 16 px fields, quiet provenance ---------- */
+
+/* Every tappable surface answers the finger the same way: a quick dip and a tint wash. */
+.btn, .chip, .icon-btn, .app-btn, .seg button, .now-strip, .input-main, .readout, .skill-card, .cast-route {
+  -webkit-touch-callout: none;
+  transition-property: background, border-color, color, box-shadow, transform, opacity;
+  transition-duration: var(--dur-state), var(--dur-state), var(--dur-state), var(--dur-state), var(--dur-press), var(--dur-state);
+  transition-timing-function: var(--ease-out);
+}
+.btn:active:not(:disabled),
+.chip:active:not(:disabled),
+.icon-btn:active:not(:disabled),
+.seg button:active:not(:disabled),
+.now-strip:active,
+.input-main:active,
+.skill-card:active,
+.readout:is(button, a):active {
+  transform: scale(var(--press-scale));
+}
+.btn:active:not(:disabled):not(.primary),
+.chip:active:not(:disabled),
+.icon-btn:active:not(:disabled):not(.send) { background: var(--press-wash); }
+.btn.primary:active:not(:disabled) { filter: brightness(0.94); }
+
+/* iOS Safari zooms the page into any field under 16 px; on touch screens every field is 16 px. */
+@media (pointer: coarse) {
+  html input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  :root textarea,
+  :root select { font-size: 16px; }
+}
+
+/* Provenance: normal states (live, agent, tracked, derived, reading) are a coloured dot and a quiet
+   label; only the exceptions (stale, locked, unavailable) keep an outline and draw the eye. */
+.badge {
+  padding: 0 2px;
+  gap: 6px;
+  background: transparent;
+  border-color: transparent;
+  color: color-mix(in oklab, var(--b, var(--ink-3)) 62%, var(--ink-3));
+  letter-spacing: 0.08em;
+}
+.badge[data-kind="stale"],
+.badge[data-kind="locked"],
+.badge[data-kind="unavailable"] {
+  padding: 0 8px;
+  color: var(--b);
+  border-color: color-mix(in oklab, var(--b) 35%, transparent);
+}
+.badge[data-kind="locked"] { background: color-mix(in oklab, var(--b) 10%, transparent); }
 
 /* ---------- Misc ---------- */
 
