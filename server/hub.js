@@ -157,6 +157,8 @@ function browserPointer(cmd) {
   for (const name of ['dx', 'dy']) if (cmd[name] !== undefined) event[name] = number(cmd[name], name, -1, 1);
   for (const name of ['x', 'y']) if (cmd[name] !== undefined) event[name] = number(cmd[name], name, 0, 1);
   if (event.action === 'click') event.button = oneOf(cmd.button ?? 'left', 'button', MOUSE_BUTTONS);
+  // native: the phone's pad drives the TV's own pointer and its position is the one that counts.
+  if (cmd.native !== undefined) event.native = cmd.native === true;
   if (event.action === 'wheel') {
     event.deltaX = number(cmd.deltaX ?? 0, 'deltaX', -10000, 10000);
     event.deltaY = number(cmd.deltaY ?? 0, 'deltaY', -10000, 10000);

@@ -193,6 +193,28 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
   });
+
+  test('while the phone pad drives the TV pointer, the phone position counts; the TV pointer is reported apart', async () => {
+    ok(await b.send('browser.openOnTv', {}, { timeout: 40000 }));
+    await b.waitForState('tvscreen.on', (r) => r?.v === true, { timeout: 5000 });
+    const placed = ok(await b.send('browser.pointer', { x: 0.2, y: 0.3, native: true }));
+    assert.ok(near(placed.x, 0.2) && near(placed.y, 0.3), JSON.stringify(placed));
+    // The TV's own pointer is still on its way (or off): it is reported, but does not move the page pointer.
+    agent.sendScreenInput({ pointer: { x: 0.7, y: 0.6 } });
+    await waitFor(async () => ok(await b.send('browser.pointer', { native: true })).native?.x === 0.7, { timeout: 5000, what: 'the TV pointer reported' });
+    const held = ok(await b.send('browser.pointer', { native: true }));
+    assert.ok(near(held.x, 0.2) && near(held.y, 0.3), `the phone position holds: ${JSON.stringify(held)}`);
+    assert.deepEqual(held.native, { x: 0.7, y: 0.6 });
+    // A pad click lands at the phone position.
+    const page = stack.server.features.browser;
+    await page.evaluate('log.length = 0');
+    ok(await b.send('browser.pointer', { x: 0.2, y: 0.3, action: 'click', native: true }));
+    await waitFor(async () => (await pageLog('click')).length === 1, { timeout: 5000, what: 'a click on the page' });
+    const [w] = await page.evaluate('[innerWidth]');
+    assert.ok(Math.abs((await pageLog('click'))[0][1] - 0.2 * w) <= 2, 'the click lands at the phone position');
+    agent.sendScreenInput({ key: 'red' });
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
+  });
 });
 
 // The trackpad's validation (hub browser.pointer) and the pointer's edges (tvscreen.pointer) need no

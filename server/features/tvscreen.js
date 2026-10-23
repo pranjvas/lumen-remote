@@ -190,7 +190,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   /** The pointer a phone's trackpad drives (hub browser.pointer): moves by dx/dy (fractions of the
    *  page) or to x/y, then clicks or scrolls where it is. It is the same pointer the TV remote moves,
    *  so the TV's cursor follows while the page is on the TV. → where it is now. */
-  async function pointer({ dx = 0, dy = 0, x, y, action = 'move', button = 'left', deltaX = 0, deltaY = 0 } = {}) {
+  // Where the TV's own pointer is (the agent reports it), kept apart from the page pointer while the
+  // phone's pad is in charge: then the phone's position counts and the TV pointer is only steered
+  // towards it (the Browser view checks nativeAt and nudges it again if it is off).
+  let nativeAt = null;
+  let padUntil = 0;
+  const PAD_AUTHORITY_MS = 2500;
+
+  async function pointer({ dx = 0, dy = 0, x, y, action = 'move', button = 'left', deltaX = 0, deltaY = 0, native = false } = {}) {
+    if (native) padUntil = Date.now() + PAD_AUTHORITY_MS;
     const next = {
       x: Math.min(1 - EDGE, Math.max(EDGE, x ?? cursor.x + dx)),
       y: Math.min(1 - EDGE, Math.max(EDGE, y ?? cursor.y + dy)),
@@ -202,12 +210,12 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       if (on) bringToFront();
       const feature = b();
       cursor = next;
-      if (on && moved) sendCursor();
+      if (on && moved && !native) sendCursor();
       if (action === 'click') await feature.input({ kind: 'click', ...at(), button });
       else if (action === 'wheel') await feature.input({ kind: 'wheel', ...at(), deltaX, deltaY });
       else await feature.input({ kind: 'move', ...at() });
     }
-    return { value: { x: cursor.x, y: cursor.y, tv: on } };
+    return { value: { x: cursor.x, y: cursor.y, tv: on, native: nativeAt } };
   }
 
   // The TV's YouTube app Lumen handed a video to is in front of Lumen's page: using the trackpad
@@ -222,8 +230,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   }
 
   async function onPointer({ x, y }, click) {
+    nativeAt = { x: Math.min(1, Math.max(0, Number(x) || 0)), y: Math.min(1, Math.max(0, Number(y) || 0)) };
+    // The phone's pad is in charge: its position counts, the TV pointer is only being steered there.
+    if (Date.now() < padUntil) { hideCursor(); return; }
     if (click) lastRemoteInput = Date.now();
-    cursor = { x: Math.min(1, Math.max(0, Number(x) || 0)), y: Math.min(1, Math.max(0, Number(y) || 0)) };
+    cursor = { ...nativeAt };
     hideCursor(); // the TV draws its own pointer here
     await b().input({ kind: click ? 'click' : 'move', ...at() });
   }

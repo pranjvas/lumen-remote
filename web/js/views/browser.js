@@ -678,6 +678,28 @@ export function mountBrowser(root, ctx) {
   let native = { dx: 0, dy: 0 };
   let nativeFrame = 0;
   let nativeSync = 0;
+  // After a stroke the phone's position is the one that counts: the page's pointer is put exactly
+  // there, then the TV's pointer is checked and nudged towards it, a few times if it lands off.
+  let alignRun = 0;
+  const ALIGN_TRIES = 3;
+  async function alignTv() {
+    const run = ++alignRun;
+    const target = { ...ptr };
+    const placed = await ctx.live.send('browser.pointer', { x: target.x, y: target.y, native: true }, { timeoutMs: 5000 });
+    if (!placed?.ok) return;
+    for (let i = 0; i < ALIGN_TRIES; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (run !== alignRun) return; // a new stroke took over
+      const ack = await ctx.live.send('browser.pointer', { native: true }, { timeoutMs: 5000 });
+      const at = ack?.ok ? ack.value?.native : null;
+      if (!at || run !== alignRun) return;
+      const ex = target.x - at.x;
+      const ey = target.y - at.y;
+      if (Math.abs(ex) < 0.006 && Math.abs(ey) < 0.01) return;
+      ctx.live.post('pointer.move', { dx: clamp(Math.round(ex * 1920), -400, 400), dy: clamp(Math.round(ey * 1080), -400, 400) });
+    }
+  }
+
   const flushNative = () => {
     nativeFrame = 0;
     const dx = Math.round(native.dx);
@@ -685,7 +707,8 @@ export function mountBrowser(root, ctx) {
     native = { dx: 0, dy: 0 };
     if (dx || dy) ctx.live.post('pointer.move', { dx: clamp(dx, -400, 400), dy: clamp(dy, -400, 400) });
     clearTimeout(nativeSync);
-    nativeSync = setTimeout(syncPointer, 300);
+    alignRun += 1; // a stroke in progress: no alignment until it pauses
+    nativeSync = setTimeout(alignTv, 300);
   };
 
   bindTrackpad(pad, {
@@ -721,7 +744,11 @@ export function mountBrowser(root, ctx) {
       if (!padLive()) return;
       if (nativeTv()) {
         if (nativeFrame) { cancelAnimationFrame(nativeFrame); flushNative(); }
-        ctx.cmd('pointer.click', { button }, { silent: false });
+        // The click lands where the phone shows the pointer, whatever the TV pointer did.
+        clearTimeout(nativeSync);
+        alignRun += 1;
+        sendPointer({ x: ptr.x, y: ptr.y, action: 'click', button, native: true });
+        nativeSync = setTimeout(alignTv, 300);
         pad.classList.remove('is-tap');
         void pad.offsetWidth;
         pad.classList.add('is-tap');
