@@ -10,7 +10,6 @@ import { youtubeVideo } from '../server/features/tvscreen.js';
 import { callTool } from '../server/ai/tools.js';
 
 const ID = 'dQw4w9WgXcQ';
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe('youtubeVideo: the YouTube link forms', () => {
   test('watch?v=, youtu.be/, /shorts/, /embed/, /live/, m., music., nocookie; t= and start=', () => {
@@ -46,6 +45,10 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
   function fakePage() {
     return {
       playing: false, pauses: 0, evaluated: [],
+      videoArea: 1, // fraction of the page the playing <video> covers
+      minAreas: [], // the minimum area of every page video check (pageVideoScript)
+      ticks: 0, // auto hand-off ticks (lastInputAt calls)
+      lastInput: 0, // when someone last used the page (the browser feature's lastInputAt)
       player: null, // { id, t, ad, live } as YouTube's player API reports it, or null
       frames: [], // [{ src, area }]
       videos: [], // [{ src, area, playing }]
@@ -78,7 +81,8 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
       addSink: () => () => {},
       media: () => [],
       frameSize: () => ({ w: 1280, h: 720 }),
-      lastInputAt: () => page.lastInput ?? 0,
+      // Called once per auto hand-off tick, before anything else is checked: the tests count ticks by it.
+      lastInputAt: () => { page.ticks += 1; return page.lastInput ?? 0; },
       async evaluate(expression) {
         const src = String(expression);
         page.evaluated.push(src);
@@ -89,7 +93,13 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
           return p && p.id === want ? { found: true, t: p.t, ad: !!p.ad, live: !!p.live } : { found: false, t: null, ad: false, live: false };
         }
         if (src.includes('iframe')) return { videos: page.videos, frames: page.frames };
-        if (src.includes('innerWidth * innerHeight')) return page.playing;
+        if (src.includes('innerWidth * innerHeight')) {
+          // pageVideoScript(minArea): a playing <video> counts only if it covers minArea of the page.
+          const minArea = Number(/area \* ([\d.]+)/.exec(src)?.[1]);
+          assert.ok(Number.isFinite(minArea), `page video script without a minimum area: ${src}`);
+          page.minAreas.push(minArea);
+          return page.playing && page.videoArea >= minArea;
+        }
         throw new Error(`unexpected page script: ${src.slice(0, 60)}`);
       },
     });
@@ -204,23 +214,55 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
     const n = launches().length;
     const before = plays();
     page.player = { id: other, t: 3.2 };
-    await sleep(1800); // a paused page is left alone
-    assert.equal(launches().length, n);
-    page.playing = true; // started by itself (autoplay, a preview): stays on the page
-    await sleep(1800);
-    assert.equal(launches().length, n);
-    page.playing = false;
-    page.lastInput = Date.now(); // someone tapped play
+    // Negative checks wait for the hand-off to actually look (ticks, page video checks), not a fixed time.
+    const ticks = async (k, message) => { const s = page.ticks; await waitFor(() => page.ticks >= s + k, { timeout: 10000, message }); };
+    const checks = async (k, message) => { const s = page.minAreas.length; await waitFor(() => page.minAreas.length >= s + k, { timeout: 10000, message }); };
+
+    // Someone just used the page, but its video is paused: left alone.
+    page.lastInput = Date.now();
+    await checks(2, 'two page video checks with the page paused');
+    assert.equal(launches().length, n, 'a paused page is left alone');
+    assert.deepEqual([...new Set(page.minAreas)], [0.15], 'a YouTube page checks against the YouTube minimum area');
+
+    // Started by itself (autoplay), nobody acted for a while: stays on the page.
+    page.lastInput = Date.now() - 11000;
     page.playing = true;
-    await waitFor(() => launches().length > n, { timeout: 8000, what: 'YouTube launched on the TV' });
+    await ticks(2, 'two hand-off ticks with an autoplaying page');
+    assert.equal(launches().length, n, 'autoplay stays on the page');
+    assert.equal(page.pauses, 0);
+
+    // Someone acted, but the playing video is a small preview: stays on the page.
+    page.lastInput = Date.now();
+    page.videoArea = 0.1;
+    await checks(2, 'two page video checks with a small preview playing');
+    assert.equal(launches().length, n, 'a muted preview below the YouTube minimum stays');
+    assert.equal(page.pauses, 0);
+
+    // Off YouTube the minimum is bigger: a fifth of the page stays there.
+    setPage('https://news.example.com/story', 'A story');
+    page.videoArea = 0.2;
+    page.lastInput = Date.now();
+    const at = page.minAreas.length;
+    await checks(2, 'two page video checks on another site');
+    assert.equal(launches().length, n);
+    assert.equal(plays(), before, 'nothing goes to the agent\'s player');
+    assert.deepEqual([...new Set(page.minAreas.slice(at))], [0.3], 'another site checks against the general minimum area');
+    assert.equal(page.pauses, 0);
+
+    // Someone tapped play on a Short-sized player (a fifth of the page) on YouTube: it goes to the app.
+    page.playing = false;
+    setPage(`https://www.youtube.com/watch?v=${other}`);
+    page.lastInput = Date.now();
+    page.playing = true;
+    await waitFor(() => launches().length > n, { timeout: 8000, message: 'YouTube launched on the TV' });
     assert.equal(launches().at(-1).body, `v=${other}&t=3`);
-    await waitFor(() => page.playing === false, { timeout: 3000, what: 'the page video paused' });
+    await waitFor(() => page.playing === false, { timeout: 3000, message: 'the page video paused' });
     assert.ok(agent.screen.some((m) => m.t === 'screen-toast' && /YouTube/.test(m.text)));
     // YouTube starting the same video again on the page right away is paused, not launched again.
     const pauses = page.pauses;
     page.playing = true;
-    await waitFor(() => page.pauses > pauses, { timeout: 5000, what: 'the repeat paused' });
-    await sleep(300);
+    await waitFor(() => page.pauses > pauses, { timeout: 5000, message: 'the repeat paused' });
+    await ticks(1, 'a hand-off tick after the repeat');
     assert.equal(launches().length, n + 1);
     assert.equal(plays(), before, 'nothing goes to the agent\'s player');
     const closed = await b.send('tvscreen.close', {}, { timeout: 10000 });
