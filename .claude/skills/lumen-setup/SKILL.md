@@ -32,7 +32,8 @@ The reference is `docs/SETUP.md` (Part A: development, Part B: real TV). Every c
 4. **Pair:** the owner presses **Allow** on the TV for Settings → Connection → **Pair**, then IP Control. Verify with `lumen.log` (`IP Control paired`, `GENA push is live`) and one harmless key such as `KEY_INFO`.
 5. **TV agent:** pick the route with the owner (SETUP.md B4).
    - **Apps2Samsung:** run `npm run agent:package:a2s`. Give the owner the package path and the four Apps2Samsung steps. After they install it, run `agent.connect` and verify.
-   - **Tizen Studio:** run `npm run agent:build`, then `wsl bash /mnt/c/Users/pranj/source/lumen-remote/tools/agent/install.sh`. If the TV already has the other route's build, it must be uninstalled first; that clears the agent's stored data, so ask.
+   - **Tizen Studio:** run `npm run agent:build`, then `wsl bash /mnt/c/Users/pranj/source/lumen-remote/tools/agent/install.sh`.
+   - **One route per TV:** a TV that has had one signer's build refuses the other's for the same app, even after an uninstall (`[118, -22]`). Before picking a route, check `vd_applist` for `lumenrmt01`, and keep whichever signer is already there.
    - **Verify:** `agent connected {"version":"<config.xml version>"}` in `lumen.log`.
 6. **Lumen Eyes (optional):** `tools\eyes\build.ps1` + `tools/eyes/install.sh`. Verify with `screen.capture` and `eyes connected` in the log.
 7. **Optional extras:** autostart (`tools/install-autostart.ps1`), the phone URL, ffmpeg in `data/bin/`. The VPN config is uploaded by the owner in the Browser view; never handle the file yourself.
@@ -43,5 +44,5 @@ The reference is `docs/SETUP.md` (Part A: development, Part B: real TV). Every c
 Use `docs/BUILD-AND-DEPLOY.md` §7. The usual causes:
 - **"Edge did not start in time":** leftover headless Edge.
 - **Agent offline after an install:** start it with `agent.connect`.
-- **The TV refuses the Apps2Samsung build:** use the Tizen Studio route.
+- **`install failed[118, -22]`:** this TV first had the agent from the other signer, and it keeps the app id bound to that certificate. Stay with that route; only a Smart Hub reset clears it.
 - **Live video falls back to still frames:** check the `live video …` lines in `lumen.log`.

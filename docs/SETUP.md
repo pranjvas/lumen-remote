@@ -107,7 +107,7 @@ Pick one of two ways:
 **Option 1: Apps2Samsung (no Tizen Studio, no certificate of your own).**
 1. `npm run agent:package:a2s` writes an unsigned package: `companion/build/LumenAgent-<version>-apps2samsung.wgt`.
 2. Install [Apps2Samsung](https://github.com/Apps2Samsung/Apps2Samsung/releases), open it, pick the TV, choose **Custom WGT / TPK**, select the package, keep the default certificate, and install. On Tizen 4–6 it signs with a bundled developer certificate. On Tizen 7+ it asks you to sign in to a Samsung account.
-3. Not yet confirmed on the Q95T: the TV may refuse that generic certificate for the TV-specific privileges. If it does, use option 2.
+3. Tested on the Q95T: the agent installs, connects and gets its TV privileges. One catch: a TV that has ever had the Tizen Studio build (option 2) refuses another signer for the same app, even after an uninstall (`[118, -22]`). Pick one route per TV and stay on it.
 
 **Option 2: Tizen Studio (your own Samsung certificate).**
 1. Install the Tizen Studio CLI. Create a Samsung certificate profile named `Q95T` (Certificate Manager → Samsung → TV) that includes the TV's DUID.
@@ -118,7 +118,7 @@ Pick one of two ways:
    wsl bash /mnt/c/Users/pranj/source/lumen-remote/tools/agent/install.sh
    ```
 
-The two options sign differently, so switching between them means uninstalling the agent first. That also clears its stored data.
+The two options sign differently and can't replace each other on the same TV, so choose once.
 
 Then **Settings → Connect TV agent**. `data/logs/lumen.log` should show `agent connected {"version":…}`.
 

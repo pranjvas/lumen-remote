@@ -135,7 +135,8 @@ Rules for agent code: the TV's engine is Chromium 69, so **no `?.`, `??` or othe
 3. **Start it** as in step 4 above.
 
 Things to know:
-- **The first install replaces the `Q95T`-signed copy.** The certificates differ, so the TV refuses to overwrite; Apps2Samsung uninstalls the old copy and installs again (if it can't, delete Lumen Agent from the TV's Apps screen first). The agent's local storage goes with it. Afterwards, `install.sh` builds (signed with `Q95T`) hit the same mismatch the other way: delete the Apps2Samsung copy first, or keep using Apps2Samsung.
+- **Tested on the Q95T (23 Oct 2026).** Signed with Apps2Samsung's bundled certificate, the agent installs, runs and connects. It reads the channel, firmware, audio output, inputs and app list, so the TV grants it the privileges it declares.
+- **A TV that already had a `Q95T`-signed agent can't switch.** The TV keeps the package id `lumenrmt01` bound to the certificate it was first installed with. Even after an uninstall, a copy signed by anyone else fails with `install failed[118, -22] … Security error : :Invalid function parameter was given:<2>`. Only a Smart Hub reset clears that, or a build with another package id. So Apps2Samsung suits a TV that never had the Tizen Studio build; on this TV, keep using `install.sh`. Going the other way would hit the same wall.
 - **One sdb host at a time.** Apps2Samsung talks to the TV's sdbd itself and stops a Tizen Studio `sdb` server it finds on the same PC. Don't run it while `install.sh` or a CineHD pipeline is using the TV.
 - The version rule still applies: bump `config.xml` before each new build.
 - If the agent is ever given a Partner privilege (`vpnservice`, `drminfo`, `*.partner`) or `on-boot="true"`, Apps2Samsung needs a Partner certificate. The script refuses such a `config.xml`.
@@ -207,3 +208,5 @@ The VPN configuration itself is uploaded in the Browser view (**Use a config fil
 | Phone shows an old UI | Bump `CACHE` in `web/sw.js`, restart the server, and reload the phone twice. |
 | `install.sh` says another `sdb` client is active | A CineHD pipeline is using the TV. Wait, or set `LUMEN_SDB_FORCE=1`. |
 | High CPU on the PC | Usually leftover headless Edge or Chrome from test or screenshot runs. End the ones whose profile is under `%TEMP%`. |
+| `restart.ps1` reports healthy, but the old server keeps running (same pid) | That server was started from an elevated (administrator) session, so a normal one can't stop it ("Access is denied"). Stop it from an elevated PowerShell, or restart from the same kind of session that started it. |
+| Agent install fails with `[118, -22]` | The package id is bound to another signing certificate on this TV (see *Installing with Apps2Samsung*). Use the same signer as the first install. |

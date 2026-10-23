@@ -67,7 +67,7 @@ Design, research and notes: `docs/design/2026-10-23-ux-pass.md`, `docs/superpowe
 
 ## Known limits
 
-- The TV agent and Lumen Eyes need the TV in **developer mode**. The agent can be installed with Apps2Samsung, with no certificate of your own (not yet confirmed on the Q95T), or signed with your own Samsung certificate. Each build carries this PC's address and key, and the apps use undocumented TV features, so Lumen is a personal tool, not a store app.
+- The TV agent and Lumen Eyes need the TV in **developer mode**. The agent can be installed with Apps2Samsung, with no certificate of your own (tested on the Q95T), or signed with your own Samsung certificate. Pick one per TV: the TV won't accept the other signer for the same app. Each build carries this PC's address and key, and the apps use undocumented TV features, so Lumen is a personal tool, not a store app.
 - Live video of the browser runs at 1080p60, or 4K30 with `maxHeight: 2160`, on the Q95T. The agent has still been cut off once on a heavy page (no cause found yet). When that happens, live video falls back to still frames by itself.
 - Cloudflare's "verify you are human" refuses Lumen's headless browser; Google sign-in may do the same.
 - The VPN's DNS (Proton NetShield) blocks ad hosts; a few hosts with very large DNS answers fail inside the tunnel.
