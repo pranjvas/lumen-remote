@@ -1,0 +1,677 @@
+{
+ "vpnTunnel": {
+  "summary": "The VPN tunnel has three separate problems. Each was measured on this PC against the repo's Go WireGuard test peer on 127.0.0.1. The peer was used two ways: loopback (no internet) and `-exit` mode, which forwards to the real internet. That reproduces the whole Lumen tunnel stack except the Proton WAN leg.\n\n(1) The idle core is a busy-wait poll in the Samsung Emscripten glue. `___syscall168` in `wg-core.cjs` never blocks. It calls the shim's `poll(timeout 0)` for each fd in a loop until the 20 ms `POLL_MS` slice runs out. That is about 28,000 postMessage + Atomics.wait round trips per second at idle (1.04–1.07 cores). The UDP fd always answers POLLOUT, so the spin never sleeps. The glue already contains a blocking path (`SOCKFS.callPoll`); routing socket-only polls to it drops idle CPU to 0.02–0.04 cores with the same new-connection latency (7 ms median). No wasm rebuild is needed.\n\n(2) \"Heavy pages don't load properly\" fits a hard limit in lwIP's in-tunnel DNS. With `DNS_TABLE_SIZE 8`, at most 8 lookups can be pending (duplicates count) and only 8 names are cached. Every extra concurrent CONNECT gets an immediate `vpn: dns-failed` 502, which Edge reports as `ERR_TUNNEL_CONNECTION_FAILED`. In tests, 30 concurrent CONNECTs to 15 hosts got 22 failures cold and 14 warm. 12 concurrent CONNECTs to one new host got 4 failures.\n\n(3) Throughput is capped by the shim's per-syscall cross-thread round trip, not by wasm crypto. Each call costs 24–36 µs unloaded, with p99 85 µs. At 43 Mbit/s there are about 14,000 round trips per second: one per received packet, one per lwIP ACK, plus polls. Waiting on the bridge takes 76% of the tunnel worker's time; wasm itself takes about 8–10%. Under CPU contention a round trip averages 2.3 ms (p99 30 ms), and a 5 MB loopback download collapsed to a few KB/s with 16 s stalls. That fits heavy pages, where Edge rendering uses the CPU.\n\nA JS-only prototype that batches UDP receives and sends without waiting raised 20-parallel throughput 2.5x on loopback and 1.75x to the internet. Against the internet, base Lumen did 48 Mbit/s on one stream versus 212 direct and 96 for a native wireguard-go client on the same peer.\n\nNot caps: lwIP TCP_WND, mux credit and pbuf/MEM sizes. A 30-stream slow-consumer test completed fully and probes kept working.\n\nLimits of these numbers:\n- The live Lumen VPN was off (vpn.state \"off\", proxyPort null), so nothing was measured through the live proxy. I did not turn the owner's VPN on, and I did not start a second tunnel with the real config, because that could take over the live WireGuard session. The live process was confirmed idle: 16 ms of CPU in 10 s, 11 threads, no VPN worker.\n- Other agents' Edge/Chrome processes had the machine at 100% CPU for long stretches. Where marked, I ran at High priority or in quiet windows and repeated runs. Throughput varies by about ±30% between runs.\n- No repo files were changed. Scratch scripts and the prototype copies (base, instr, p1 = poll patch, p2 = +8 MiB rcvbuf, p3 = +batched UDP) are in C:/Users/pranj/AppData/Local/Temp/lumen-vpnperf-tunnel. Its `keys.json` holds throwaway keys made with `testpeer genkey`. Every Edge I started was killed, its temp profile was deleted, and the reference conf file was removed.",
+  "measurements": [
+   {
+    "what": "Idle CPU, tunnel up, no streams (repo code)",
+    "value": "1.04-1.07 cores (High or normal priority on a quiet machine); 0.81 at normal priority under load",
+    "how": "bench.mjs <vpn> --idle 10 against testpeer on loopback; process.cpuUsage() delta over the window (covers all threads)"
+   },
+   {
+    "what": "Shim calls per second at idle (repo code)",
+    "value": "27,914 poll(timeout=0) per second on 1 fd with events=59, every one 'ready'; only 50 wg_poll loops/s. So about 560 poll round trips inside each wg_poll(20)",
+    "how": "instrumented shim copy (instr2): counters around Bridge.call written to SHIM_STATS every second"
+   },
+   {
+    "what": "Idle CPU with the glue poll patch (p1)",
+    "value": "0.02-0.04 cores; 33 blocking poll calls/s (nfds 2, events 1,1)",
+    "how": "same bench with patch-poll.cjs applied to the copied wg-core.cjs"
+   },
+   {
+    "what": "New-connection fetch latency on an idle tunnel",
+    "value": "median 7 ms base / 7 ms p1 / 5 ms p3 (p90 9-12 ms); CPU during the test 1.08 vs 0.06 vs 0.06 cores",
+    "how": "bench.mjs --hello 30 (30 sequential GET http://10.66.0.1/hello through the proxy, each on a new tunnel stream)"
+   },
+   {
+    "what": "Round trip of one shim call (postMessage + Atomics.wait)",
+    "value": "Quiet machine: mean 27.7 us, p50 24, p99 85, 36k calls/s, 52 us CPU per call. Machine at 100% CPU, normal priority: mean 2,368 us, p50 180, p99 31,820, 422 calls/s. Same load at High priority: mean 92 us, p99 475",
+    "how": "bridge-rtt.cjs (getsockopt / poll(0) / recv-EAGAIN loops on a shim UDP socket)"
+   },
+   {
+    "what": "Shim calls per second during a 43 Mbit/s loopback download (base)",
+    "value": "14,031/s in total: UDP recv 6,085 (689 EAGAIN), poll 3,706, UDP send 3,302 (80 B ACKs), mux send 696 (about 7 KB), mux recv 242. Bridge waiting = 76% of the tunnel worker's time",
+    "how": "instr2 copy + agg.cjs over the busy seconds of bench.mjs --blob 30000000"
+   },
+   {
+    "what": "CPU profile of the tunnel worker during downloads",
+    "value": "Base: 64% self time in shim call (Atomics.wait), 9% postMessage, 2% SockError construction, wasm functions about 8%. I/O worker 50% idle (dgram doSend 16%). Main thread 83% idle",
+    "how": "node --cpu-prof (one profile per thread) + prof.cjs self-time summary"
+   },
+   {
+    "what": "Loopback throughput (zero-RTT peer), 2 runs each",
+    "value": "Base: 1 stream 31-37 Mbit/s, 20 parallel x 1 MB 45-69 Mbit/s (about 1.5 cores). p1: 27-47 / 46-76. p3: 47-60 / 125-188 (about 1.9 cores). Reference wireguard-go client, same peer: 81-85 Mbit/s single",
+    "how": "bench.mjs <vpn> --idle 5 --blob 30000000 --par 20 --parBytes 1000000; ref.mjs (testpeer client -url)"
+   },
+   {
+    "what": "Internet download via the local exit peer (no Proton WAN)",
+    "value": "Direct: 50 MB at 26.5 MB/s (212 Mbit/s), TTFB 0.12 s; 20 x 1 MB in 1.34 s (120 Mbit/s). Base tunnel: 5.96 MB/s (48 Mbit/s); 20 x 1 MB in 2.64 s (61 Mbit/s). p3: 7.3 MB/s (59 Mbit/s); 1.50 s (107 Mbit/s). wireguard-go reference: 96 Mbit/s single. TTFB through the tunnel 0.11-0.29 s, about the same as direct",
+    "how": "bench.mjs <vpn> --exit --serve 45, then curlset.sh <proxyPort> (curl -x CONNECT to speed.cloudflare.com 50 MB, then curl --parallel 20 x 1 MB); ref.mjs --exit"
+   },
+   {
+    "what": "Concurrent CONNECT burst (in-tunnel DNS)",
+    "value": "15 hosts x 2, cold: 8 OK, 22 'vpn: dns-failed'. Same names warm: 16 OK, 14 failed. 12 distinct new hosts: 8 OK, 4 failed. 12 copies of one new host: 8 OK, 4 failed; warm: 12 OK. Failures arrive in 14-57 ms (immediate ERR_MEM in dns_enqueue)",
+    "how": "burst.mjs <proxyPort> <copies> hosts... through bench.mjs --exit (DNS answered by the exit peer via 1.1.1.1)"
+   },
+   {
+    "what": "Slow consumer (Edge not reading, e.g. a full media buffer)",
+    "value": "30 streams x 4 MB paused 9.4 s: 67 MB buffered on the hub/proxy side, a fresh fetch still worked in 80-180 ms (5-7 ms when idle), and all 30 completed after resume. No sign of a TCP window, mux credit or lwIP heap cap",
+    "how": "bench.mjs <vpn> --stall 30 --parBytes 4000000 (loopback and --exit)"
+   },
+   {
+    "what": "Heavy page in headless Edge (Lumen's flags), cold cache",
+    "value": "theverge.com, 250-270 requests, 5.4 MB. Direct: load 7.0 / 9.7 s. Base tunnel: 18.1 / 6.8 s. p3: 9.6 / 5.5 s. One ERR_TUNNEL_CONNECTION_FAILED seen through the tunnel. Too noisy on this loaded machine to rank anything; a 5 MB page is not throughput-bound",
+    "how": "edge-load.mjs [--proxy port] --runs 2 URL (CDP Page.loadEventFired + Network events); Edge killed by profile path and profile deleted"
+   },
+   {
+    "what": "Tunnel start time under contention",
+    "value": "wasm ready +22.5 s and tunnel up at 40 s at normal priority with the machine at 100% CPU (twice exceeding the 15 s startTimeoutMs, which caused vpn-start-timeout); 0.12-0.3 s ready / 0.6-0.9 s up at High priority",
+    "how": "timestamped createTestLog lines in bench.mjs"
+   },
+   {
+    "what": "UDP socket receive buffer in the I/O worker",
+    "value": "Default 65,536 bytes; setRecvBufferSize(8 MiB) takes effect (65536 -> 8388608). No throughput change on loopback",
+    "how": "p2 copy logs getRecvBufferSize before and after; bench blob/par runs"
+   }
+  ],
+  "rootCauses": [
+   {
+    "cause": "The Samsung Emscripten glue implements poll() as a busy-wait. ___syscall168 loops over the fds, calling stream_ops.poll, which runs tizentvwasm poll([fd], 0) with all event bits (59), until the timeout runs out. wg_poll(POLL_MS=20) therefore makes hundreds of synchronous shim round trips per slice instead of one blocking wait. The I/O worker's readiness() always reports POLLOUT for UDP, so every probe returns 'ready' and nothing ever sleeps. The glue already has a blocking path (SOCKFS.callPoll, behind syscall168TizenSocketOnly), but ___syscall168 does not use it.",
+    "evidence": "At idle: 27,914 poll(0) calls/s (ev=59, all ready, timeoutSum 0) against 50 wg_poll loops/s, and 1.04-1.07 cores. Routing socket-only polls to SOCKFS.callPoll (patch-poll.cjs) gave 33 polls/s, 0.02-0.04 cores and an unchanged 7 ms new-connection fetch. The live server showed 1 core busy when its VPN was on, matching the owner's report. That burned core also competes with Edge's renderer and screencast encoder.",
+    "impact": "critical"
+   },
+   {
+    "cause": "lwIP DNS inside the wasm is limited to DNS_TABLE_SIZE 8 (lwipopts.h), so DNS_MAX_REQUESTS is 8. At most 8 lookups can be pending, duplicates of one name each take a slot, and only 8 names are cached. mux.c handles a MUX_OPEN with a hostname by calling dns_gethostbyname. When it returns ERR_MEM, mux.c sends RST 'dns-failed', the proxy replies 502 'vpn: dns-failed', and Edge marks the resource ERR_TUNNEL_CONNECTION_FAILED. Heavy pages open many connections to many hosts at once, and Edge preconnects up to 6 per host.",
+    "evidence": "30 concurrent CONNECTs to 15 hosts: 22 failed cold, 14 failed warm. 12 distinct new hosts: exactly 8 OK, 4 failed. 12 copies of one new host: 8 OK, 4 failed; 12 OK once cached. The failures are immediate (14-57 ms). lwIP 2.2.1 dns.c dns_enqueue returns ERR_MEM when the table or request slots are full. One ERR_TUNNEL_CONNECTION_FAILED appeared in a real Edge load of theverge.com through the tunnel.",
+    "impact": "critical"
+   },
+   {
+    "cause": "Every socket syscall from the wasm is a synchronous cross-thread round trip (shim Bridge.call: postMessage, Atomics.wait, the I/O worker's event loop, reply, Atomics.notify), with structured clone, Array.from of the 60 control words, and an Error with a stack trace for each EAGAIN. A received WireGuard packet costs one round trip, and each ACK lwIP sends (about every 2 segments) costs another. The cost is two thread wake-ups per syscall, so it explodes under CPU contention.",
+    "evidence": "14,031 round trips/s at 43 Mbit/s; waiting on the bridge is 76% of the tunnel worker's time; wasm about 8-10%. A round trip is 24-36 us unloaded, but 2.4 ms mean / 32 ms p99 with the machine at 100% CPU, where a 5 MB loopback download crawled at about 3-4 KB/s with 16 s stalls. Base tunnel vs direct internet: 48 vs 212 Mbit/s single, 61 vs 120 Mbit/s for 20 parallel. A native wireguard-go client on the same peer did 96 Mbit/s. Prototype p3 (batched UDP recv, unacknowledged batched UDP send) cut UDP round trips by about 4x: 20-parallel 45-69 -> 125-188 Mbit/s loopback and 61 -> 107 internet; single stream 31-37 -> 47-60 loopback and 48 -> 59 internet.",
+    "impact": "high"
+   },
+   {
+    "cause": "Because of the per-packet two-thread design (above) and the self-inflicted spinning core, the tunnel is very sensitive to CPU contention. A heavy page makes Edge use several cores, and the tunnel threads run at normal priority.",
+    "evidence": "Bridge throughput: 422 calls/s at normal priority under load vs 10,854 at High priority under the same load. The tunnel start took 40 s (wasm ready at 22 s) under load, past the 15 s start timeout (vpn-start-timeout seen twice), against 0.6-0.9 s at High priority.",
+    "impact": "high"
+   },
+   {
+    "cause": "The I/O worker's UDP socket uses the 64 KB default receive buffer, while a 706 KB lwIP TCP window lets about 500 datagrams arrive in one burst. At 160-210 Mbit/s line rate, 64 KB fills in about 3 ms, so any I/O-worker hiccup drops packets, and TCP backs off.",
+    "evidence": "getRecvBufferSize() = 65536 by default; setRecvBufferSize(8 MiB) is accepted (8388608). No change on the zero-latency loopback, so the WAN effect is inferred, not measured.",
+    "impact": "medium"
+   },
+   {
+    "cause": "The poll waiter list grows without limit in the I/O worker once poll blocks (needed together with the poll fix). ops.poll pushes an evaluate closure onto every polled socket, and only wake() clears it. The idle mux socket receives no data from the hub, so its list grows by about 33 entries/s.",
+    "evidence": "Code reading of tizentvwasm-io-worker.cjs ops.poll / wake(). With the current spin it does not happen, because every poll returns 'ready' immediately.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Small per-packet overheads: readStatus() runs at every wg_poll (malloc, snprintf of JSON in wasm, JSON.parse; 50-700/s); SockError captures a stack for each EAGAIN; the glue allocates a temporary Uint8Array per recv. The hub receives one 1.3-1.4 KB DATA frame per lwIP pbuf (thousands/s), each pushed and written separately. TunnelStream.push ignores backpressure (up to 1 MiB of credit per stream is buffered on the main thread). encodeFrame copies upload payloads, and Buffer.concat in the decoder only runs for frames that span chunks.",
+    "evidence": "Profiles: readStatus 1.2%, SockError 2.0-4.5%, getErrorCode 1.1-1.8% of the tunnel worker; main thread 73-83% idle with writev 4.5-7.4%. The slow-consumer test buffered 67 MB on the hub/proxy side.",
+    "impact": "low"
+   },
+   {
+    "cause": "Not caps at present (checked): lwIP TCP_WND 706 KB, TCP_SND_BUF, MUX_INITIAL_CREDIT 1 MiB, MEM_SIZE 12 MiB and the pbuf pool. All rx pbufs are PBUF_RAM, so PBUF_POOL_SIZE 6144 is unused. Proxy piping and the main thread are also not a cap. A separate browser-side limit that I did not verify here: Chromium allows at most 32 sockets per proxy server for all traffic through --proxy-server.",
+    "evidence": "Slow-consumer run: 30 paused x 4 MB streams completed with probes still working. A single stream on a zero-RTT loopback is limited by processing, not window (47-60 Mbit/s with p3). The main thread is mostly idle in profiles. At 60 ms RTT the window still allows about 94 Mbit/s per stream.",
+    "impact": "low"
+   }
+  ],
+  "plan": [
+   {
+    "change": "Make poll block for real. Add a 10th glue anchor (same post-processing step as tools/patch-glue.cjs, recorded in NOTICE.md). In ___syscall168, right after reading fds/nfds/timeout, insert: if(nfds>0&&SOCKFS.countFDsInPollFDs(fds,nfds).sockets===nfds){return SOCKFS.callPoll(fds,nfds,timeout)}. In the same change, fix the I/O worker poll so a finished poll removes its evaluate closure from every socket's waiters (for example a per-poll token checked and spliced on timeout and on completion). Optionally also skip the per-loop readStatus() unless 250 ms have passed.",
+    "files": [
+     "server/vpn/third_party/wg-core/wg-core.cjs",
+     "server/vpn/third_party/cinehd/tizentvwasm-io-worker.cjs",
+     "server/vpn/third_party/NOTICE.md",
+     "server/vpn/wireguard.js"
+    ],
+    "expectedGain": "Idle CPU about 1.05 -> 0.02-0.04 cores (measured with p1); new-connection latency unchanged (7 ms median); frees a core for Edge rendering and the screencast at all times",
+    "risk": "Low. The glue's own callPoll is used, wasm is unchanged, readiness bits are mapped by the glue's pollFlagsMap. Without the waiter cleanup, memory leaks at idle. Verify with test/vpn.test.js and test/browser-vpn.test.js."
+   },
+   {
+    "change": "Add a JS-side resolver in front of OPEN in wireguard.js connect(). Keep a hostname -> IPv4 cache (60-300 s, dropped after a failed open). Deduplicate in-flight lookups per name. Run at most 6 concurrent T.DNS lookups so lwIP's 8 slots are never exceeded. Retry once after 50-100 ms on an empty DNSANSWER. Then send OPEN 'port:ip'. The hostname still reaches the far side in TLS SNI and the Host header, because only the dial target changes. Optional: rebuild the wasm with DNS_TABLE_SIZE 32-64; NOTICE says the Samsung emsdk build in the worktree reproduces byte for byte.",
+    "files": [
+     "server/vpn/wireguard.js",
+     "server/vpn/third_party/wg-core/src/lwipopts.h (only if rebuilt)"
+    ],
+    "expectedGain": "Removes the dns-failed RSTs: 22/30 failed CONNECTs cold and 14/30 warm, down to 0 expected. Saves one in-tunnel DNS round trip to Proton per new connection on a cache hit (lwIP's 8-entry cache thrashes on heavy pages). Directly targets 'heavy pages don't load properly'.",
+    "risk": "Low-medium. No TTL from lwIP (use a short fixed TTL and refresh when a dial fails). Status counts and 'vpn-dns-*' error codes should stay the same for the UI."
+   },
+   {
+    "change": "Cut UDP round trips in the shim, as in prototype p3. (a) recvFrom on a nonblocking UDP fd is served from a local queue, filled by one 'recvmany' round trip that packs up to 64 datagrams [u16 len][u16 port][4 ip][payload] into the shared buffer. (b) sendTo on UDP is queued locally and flushed as one 'sendbatch' postMessage (transferring the buffers) before the next synchronous call, or at 128 items / 512 KB. (c) poll reports POLLIN for fds with queued datagrams and then probes the others with timeout 0. Also throw cached errno objects without a stack for EAGAIN, and replace s.rx.shift() with a head index.",
+    "files": [
+     "server/vpn/third_party/cinehd/tizentvwasm-shim.cjs",
+     "server/vpn/third_party/cinehd/tizentvwasm-io-worker.cjs",
+     "server/vpn/third_party/NOTICE.md"
+    ],
+    "expectedGain": "Measured: 20-parallel x 1 MB 45-69 -> 125-188 Mbit/s loopback (about 2.5x) and 61 -> 107 Mbit/s internet via the exit peer (1.75x). Single stream 31-37 -> 47-60 Mbit/s loopback and 48 -> 59 internet. UDP round trips drop from about 9,400/s to about 1,400/s at a similar rate.",
+    "risk": "Medium. UDP send errors become asynchronous (the current code already replies payload.length before the send callback). postMessage FIFO keeps ordering with later synchronous ops. MSG_PEEK and TCP paths are unchanged. The shim is a vendored third_party file, so record the change in NOTICE."
+   },
+   {
+    "change": "Structural fix: drop the I/O worker. Let the tunnel worker own the dgram/net sockets and give the shim synchronous calls over local queues, where poll never blocks. Drive wg_poll(0) from events: setImmediate-coalesced on UDP 'message' or mux 'data', plus a 10-25 ms timer while streams are open (about 100-250 ms idle) for sys_check_timeouts. Resolve a hostname endpoint in JS before wg_start (gethostbyname is the only blocking call). Next step: replace the loopback-TCP hub link with a MessagePort or SharedArrayBuffer ring and coalesce DATA frames per stream before push().",
+    "files": [
+     "server/vpn/wireguard.js",
+     "server/vpn/third_party/cinehd/tizentvwasm-shim.cjs (Lumen-specific fork)",
+     "server/vpn/third_party/cinehd/tizentvwasm-io-worker.cjs (removed)"
+    ],
+    "expectedGain": "Removes the remaining about 2,900 synchronous round trips/s (bridge waiting is still 56% of the tunnel worker in p3). Estimated: single stream close to the wireguard-go reference on this machine (96 Mbit/s internet, 81-85 loopback); parallel up to the link (110-210 Mbit/s direct). Throughput would no longer collapse under CPU contention, since a packet would no longer need two thread wake-ups. These are estimates; I did not build a prototype.",
+    "risk": "Medium-high. A larger rewrite of vendored code: nonblocking connect/EINPROGRESS and SO_ERROR emulation, sockets that bind asynchronously, and an extra event loop in the tunnel worker. Needs the full VPN test suite plus soak and rekey tests (tools/scratch/review-vpn-robustness scripts)."
+   },
+   {
+    "change": "After ensureUdp's 'listening', call setRecvBufferSize(8 MiB) and setSendBufferSize(1 MiB) on the I/O worker's UDP socket (or the tunnel worker's, after the structural fix). Optionally raise Lumen's process priority with os.setPriority(PRIORITY_ABOVE_NORMAL) at startup, once fix 1 has made the tunnel idle-cheap.",
+    "files": [
+     "server/vpn/third_party/cinehd/tizentvwasm-io-worker.cjs",
+     "server/index.js"
+    ],
+    "expectedGain": "Fewer burst drops (and less TCP backoff) on the real Proton path at 100-200 Mbit/s; this cannot be measured on loopback. Under contention, High priority made bridge calls 25x faster (422 -> 10,854 calls/s) and start 30x faster; ABOVE_NORMAL should land in between.",
+    "risk": "Low for the buffers. Low-medium for priority: Lumen must not starve Edge, which is why it comes after fix 1."
+   },
+   {
+    "change": "Hub and stream small fixes: coalesce consecutive DATA payloads per stream within one socket chunk before TunnelStream.push. Respect push() returning false: delay CREDIT and stop buffering past about 256 KB per stream. Add a fast path in encodeFrame for Buffers (header in a separate small Buffer plus socket.cork/writev, no payload copy). Keep a single pending chunk in the decoder instead of repeated Buffer.concat for straddling frames.",
+    "files": [
+     "server/vpn/wireguard.js"
+    ],
+    "expectedGain": "A few % of main-thread CPU now; it matters more once the tunnel is about 3x faster (thousands of 1.4 KB frames/s). Also bounds memory with 250 streams (now up to 1 MiB of credit each on the main thread).",
+    "risk": "Low. The frame protocol is unchanged and the decoder is unit-tested in test/vpn.test.js."
+   }
+  ],
+  "benchmark": "All scripts are in C:/Users/pranj/AppData/Local/Temp/lumen-vpnperf-tunnel and use the repo's Go test peer on 127.0.0.1 (throwaway keys in keys.json; run `node genkeys.mjs` once to regenerate). Point <VPN> at the repo dir C:/Users/pranj/source/lumen-remote/server/vpn for after-change runs, or at a copy (base/vpn, p1/vpn, p3/vpn) for before. Prefix with PRIO=high when the machine is loaded, and run each twice.\n\n1) Idle CPU, new-connection latency, loopback throughput:\n   cd C:/Users/pranj/AppData/Local/Temp/lumen-vpnperf-tunnel && node bench.mjs <VPN> --idle 10 --hello 30 --blob 30000000 --par 20 --parBytes 1000000\n   Read the \"idle\" cores, \"hello\" newConnFetchMsMedian, \"blob\" mbit/cores and \"par\" mbit/ttfbMedian lines. Before: idle about 1.05 cores, blob 31-37 Mbit/s, par 45-69 Mbit/s.\n\n2) Shim calls per second: copy <VPN> to a scratch dir, overlay the instrumented shim from instr2/vpn/third_party/cinehd/tizentvwasm-shim.cjs, then:\n   SHIM_STATS=C:/Users/pranj/AppData/Local/Temp/lumen-vpnperf-tunnel/st.jsonl node bench.mjs <copy> --idle 3 --blob 30000000 && node agg.cjs st.jsonl\n\n3) DNS concurrency, the heavy-page failure:\n   node bench.mjs <VPN> --exit --serve 60   (note the proxyPort it prints), then\n   node burst.mjs <proxyPort> 2 www.theverge.com cdn.vox-cdn.com www.google-analytics.com fonts.googleapis.com fonts.gstatic.com www.googletagmanager.com securepubads.g.doubleclick.net cdn.cookielaw.org static.chartbeat.com c.amazon-adsystem.com platform.twitter.com connect.facebook.net assets.adobedtm.com cdn.cnn.com media.cnn.com\n   Before: 22 of 30 get 'vpn: dns-failed'. Target: 0.\n\n4) Internet through the tunnel vs direct (in a second shell while bench.mjs <VPN> --exit --serve 60 runs):\n   ./curlset.sh <proxyPort> after ; ./curlset.sh direct direct\n   Reference ceiling: URL=\"https://speed.cloudflare.com/__down?bytes=50000000\" node ref.mjs --exit\n\n5) Slow-consumer regression check:\n   node bench.mjs <VPN> --stall 30 --parBytes 4000000   (expect ok=30)\n\n6) Raw shim round-trip cost:\n   node bridge-rtt.cjs 5000\n\nOptional real browser check:\n   node edge-load.mjs --proxy <proxyPort> --runs 2 https://www.theverge.com/\n   It starts its own headless Edge with a temp profile and kills it and deletes the profile at the end.\n\nLive check, only if the owner turns the VPN on themselves:\n   node C:/Users/pranj/source/lumen-remote/tools/scratch/live/client.mjs state vpn.proxyPort\n   then ./curlset.sh <livePort> live\n   and sample per-thread CPU with: powershell -File threads.ps1 -procId <lumen pid> -secs 10"
+ },
+ "pageLoad": {
+  "summary": "Heavy pages fail or load slowly over the VPN for four separate reasons. I measured each one with my own tunnel and proxy on data/vpn/wg.conf, because the live VPN was off the whole time (vpn.enabled=false, so there was no live proxy port). Every one of my runs checked that the live VPN stayed off.\n\n(1) The machine was at 100% CPU on all 16 logical cores. The load came from browsers other agents leaked: 147 chrome.exe processes using 12.8 cores (about 17 headless Chrome instances under %TEMP%/lumen-review/cdp*) and 167 msedge.exe processes using 3.7 cores (stale lumen-shot-* Edges). The VPN engine routes every socket call through postMessage + Atomics.wait, so it collapsed: 4-10 KB/s, TLS handshakes of 4-16 s, a 7-15 s fetch for a tiny google.com/generate_204 page, and the tunnel took 8-9 s to come up. After the leaked browsers were cleaned up, the same path ran at 1.2-2.9 MB/s. Over the same period the live Browser showed \"Microsoft Edge did not start in time\".\n\n(2) Running the VPN process at AboveNormal priority restores full speed under CPU contention: 0.47-0.71 MB/s becomes 2.25-2.51 MB/s. A bigger UDP receive buffer does not help.\n\n(3) wg-core's lwIP DNS table holds only 8 entries. With more than 8 lookups in flight, the extra ones fail instantly (about 5 ms) with dns-failed, and Edge shows that as ERR_TUNNEL_CONNECTION_FAILED. In a burst of 30 real hostnames, 22 failed. Every CNN load lost 5 real hosts this way, including CNN's own lightning.cnn.com and registry.api.cnn.io. The cache also keeps only 8 names, so each lookup beyond that costs about 80 ms again. A prototype fix in a scratch copy of proxy.js resolves names in JS (at most 6 lookups at a time, same-name lookups shared, TTL cache) and then dials the IP. With it, these instant failures dropped to 0; only the Proton DNS filter's ad and tracker blocks were left.\n\n(4) Smaller causes:\n- lwIP's 3 s first SYN retransmit (the initial TCP retry timeout) made 3-4 tunnel opens per 5-page cycle stall for 3.07-3.36 s.\n- Lumen acks every screencast frame immediately, so Edge encodes 32-53 fps on animated pages while Lumen forwards at most 15. That wastes about 0.3-0.5 of a core per page, compared with spacing the acks 66 ms apart.\n- Proton's NetShield DNS filter blocks about 25-37 ad and tracker hosts per CNN load, plus brunhild.challenges.cloudflare.com.\n- Through the VPN, vimeo.com/watch is stuck on Cloudflare's \"Just a moment... Verify to continue\" page: 8 requests, against 445 requests loaded directly.\n\nWhat is not the problem: the proxy's limits (real pages peaked at 93-107 streams against the cap of 250, with no busy refusals or evictions), Edge's own queue before connecting (p90 at most 263 ms), and the Edge flags. --disable-quic is required, HTTP/2 works through CONNECT, and the 226 MB profile is normal.\n\nThe main fixes, in order: run the Lumen process at AboveNormal priority, stop the leaked browsers, add the JS DNS limiter and cache to proxy.js, space out the screencast acks, then rebuild wg-core with a larger DNS table and a 1 s first retry.\n\nAll scripts are in C:/Users/pranj/AppData/Local/Temp/lumen-pageload. The prototype is vpnmod/proxy.js there; no repo files were changed. Every Edge I started was killed and its temp profile deleted.",
+  "measurements": [
+   {
+    "what": "Host CPU while the owner sees choppiness / my first runs",
+    "value": "100% total on 16 logical CPUs; chrome.exe x147 = 12.8 cores (about 17 leaked headless Chrome roots, --user-data-dir %TEMP%/lumen-review/cdp93xx, created 12:46-13:38), msedge.exe x167 = 3.7 cores (leaked lumen-shot-* headless Edges). Later: 13 chrome processes, CPU 15-40%",
+    "how": "Get-Process CPU deltas over 5 s grouped by name; Win32_Process command lines; Get-Counter Processor(_Total)"
+   },
+   {
+    "what": "VPN path while the host was saturated (own tunnel + Lumen proxy.js, real conf)",
+    "value": "en.wikipedia.org/wiki/Television took 127.6 s and 165.2 s (10.6 / 8.2 KB/s), TLS 4.3-7.6 s; 2 MB from speed.cloudflare.com ran at 3.7-3.9 KB/s (TLS 4.3-16.7 s, 40 s cap hit); generate_204 took 7.3-15 s; tunnel up in 7.9-9.2 s. Direct at the same time: 0.09-1.7 MB/s, DNS up to 9 s",
+    "how": "curl -x http://127.0.0.1:<own proxy> -w timing vars; vpnproxy.mjs"
+   },
+   {
+    "what": "VPN path on the calmer machine (same scripts)",
+    "value": "2 MB at 1.2-2.9 MB/s, TLS 0.10-0.27 s, tunnel up in 0.6-1.0 s. Direct: 6.4 MB/s (2 MB) and 18.2 MB/s (20 MB)",
+    "how": "ab.sh orig / rcvbuf; direct curl"
+   },
+   {
+    "what": "Cost of one shim-style syscall (postMessage + Atomics.wait round trip between two threads)",
+    "value": "Unloaded: 53,938 calls/s, p50 0.016 ms, p99 0.047 ms. At 100% host CPU: 1,842 calls/s, p50 0.043, p90 0.89, p99 11.3, max 34 ms (about 29x lower throughput, 240x worse p99). setTimeout(20) actually takes 31 ms unloaded and 35-94 ms loaded",
+    "how": "rtt.mjs 3000"
+   },
+   {
+    "what": "wg-core engine ceiling (local testpeer, no internet)",
+    "value": "Single stream 42.4 Mbit/s using 1,453 ms CPU per 944 ms (about 1.5 cores); 150 parallel opens in 76 ms (open p50 22 ms, max 31 ms), 0 errors",
+    "how": "tput.mjs 5000000 150 (startTestPeer + createTunnel)"
+   },
+   {
+    "what": "CPU contention model (3 busy threads + VPN process pinned to 2 cores)",
+    "value": "Normal priority: 0.47-0.71 MB/s. Normal priority + 8 MB UDP receive/send buffers: 0.53-0.80 MB/s (no real gain). AboveNormal priority: 2.25-2.51 MB/s, the same as unloaded",
+    "how": "contend.ps1 -label X [-mod 8388608 | -prio AboveNormal], 2 runs each, interleaved"
+   },
+   {
+    "what": "Tunnel DNS concurrency and cache",
+    "value": "Sequential lookups 71-99 ms; lightning.cnn.com, registry.api.cnn.io, cdn.optimizely.com and www.googletagservices.com all resolve. 30 distinct names in parallel: 8 ok, 22 failed instantly (5 ms, vpn-dns-failed). Re-resolving: only 8 names cached (2 ms); the 9th and 10th were re-queried (83-84 ms)",
+    "how": "dnstest.mjs (own tunnel, tunnel.resolve)"
+   },
+   {
+    "what": "Heavy page loads, original VPN (2 runs: pl-vpn, pl-orig3)",
+    "value": "Wikipedia load 3.7 / 2.0 s. CNN 225 requests, 33-35 failed (26 ERR_TUNNEL_CONNECTION_FAILED, 5 of them local DNS-table overflows on real hosts), new connections p50 617-773 ms / p90 928-1338 ms, 13-14 MB. YouTube up to 96-102 requests in flight, 3-11 tunnel failures. vimeo.com/watch: 8 requests, page title 'Just a moment...'. amazon.in 178-199 requests, new connections p50 460-649 ms. Tunnel opens p50 110-158 ms, p90 361-552 ms; 3-4 opens per cycle took 3.07-3.36 s. VPN process CPU about 66-81% of a core while streams were active, peak 120-172%",
+    "how": "pageload.mjs (Lumen's exact Edge flags + proxy flags, CDP Network/lifecycle events, 35 s cap, quiet = at most 2 requests in flight for 2 s) + vpnproxy.mjs per-stream log; plrun.sh"
+   },
+   {
+    "what": "Heavy page loads with the JS DNS limiter/cache prototype (2 runs: jsdns, jsdns2)",
+    "value": "Local dns-failed overflows: 0 (the original had 5 per CNN load); the only refusals left were NetShield blocks (25-37 ad/tracker hosts, plus brunhild.challenges.cloudflare.com). Wikipedia load 1.5 / 1.8 s. Page-level times were otherwise within the noise from other agents' CPU load",
+    "how": "plrun.sh jsdns VPNMOD=1 (scratch vpnmod/proxy.js)"
+   },
+   {
+    "what": "Direct (no proxy) comparison",
+    "value": "CNN 380 requests (104 over h3), new connections p50 91 ms; YouTube new connections p50 81 ms; vimeo.com/watch 445 requests, 8.2 MB, real page; amazon.in new connections p50 41 ms",
+    "how": "pageload.mjs --label direct"
+   },
+   {
+    "what": "Edge socket queueing and proxy limits on real pages",
+    "value": "Time queued before connect/send: p50 1-5 ms, p90 4-263 ms, max 1.1-1.4 s. Peak concurrent tunnel streams 93-107 (no 32-per-proxy cap visible). Proxy busy refusals: 0; idle evictions: 0",
+    "how": "pageload.mjs queueMs from Network timing; vpnproxy.mjs ticks and proxy debug log"
+   },
+   {
+    "what": "proxy.js under 150-340 parallel CONNECTs",
+    "value": "150 CONNECTs: all 200 in 151 ms. 300 + 40 at once: the 250 cap queued the rest, 90 idle tunnels were evicted, and waiters stalled 2.0-2.9 s (idleEvictMs 2000 floor). 200 parallel CONNECTs to one hostname: 1 dns-failed",
+    "how": "connstress.mjs against vpnproxy.mjs --testpeer"
+   },
+   {
+    "what": "Edge CPU cost of the screencast on an animated page (CNN, 20 s cap, direct, 2 runs each)",
+    "value": "Immediate ack (Lumen today): 700-1167 frames generated, Edge browser process 28.3-33.6 CPU-s, GPU 14.4-15.9 s. Ack 66 ms after each frame: 477-491 frames, browser 22.8-24.5 s, GPU 13.2-14.2 s. No screencast: browser 11.1-11.6 s, GPU 8.5-9.2 s",
+    "how": "pageload.mjs --ack-delay 66 / --no-screencast; SystemInfo.getProcessInfo cpuTime deltas"
+   },
+   {
+    "what": "Live Lumen and profile state",
+    "value": "Live process idle at 0.6% of one core (VPN off). browser.session 'error: The browser could not start: Microsoft Edge did not start in time' during the saturation period. data/browser-profile is 226 MB (Cache 101 MB, Code Cache 44 MB, Service Worker 48 MB)",
+    "how": "tools/scratch/live/client.mjs state; Get-Process; du"
+   }
+  ],
+  "rootCauses": [
+   {
+    "cause": "The engine is CPU-bound and every socket call hops between threads (postMessage + Atomics.wait to the I/O worker, about 1.5 cores per 42 Mbit/s), so throughput collapses when the host CPU is contended. The host was saturated by leaked headless Chrome/Edge instances from other agents' runs.",
+    "evidence": "At 100% CPU: VPN 3.7-10 KB/s, TLS 4-16 s, tunnel up in 8-9 s, while the syscall bridge fell from 53.9k to 1.8k calls/s (p99 0.047 to 11.3 ms). After the cleanup: 1.2-2.9 MB/s. Controlled 2-core contention: 0.47-0.71 MB/s at Normal priority vs 2.25-2.51 MB/s at AboveNormal.",
+    "impact": "critical"
+   },
+   {
+    "cause": "wg-core lwIP DNS_TABLE_SIZE is 8 (lwipopts.h). A 9th lookup in flight gets ERR_MEM, which mux.c turns into RST 'dns-failed'; the proxy answers 502 and Edge shows ERR_TUNNEL_CONNECTION_FAILED. The 8-entry cache also forces about 80 ms re-lookups on busy pages.",
+    "evidence": "Burst of 30 distinct names: 22 failed in 5 ms. Every CNN load had 5 instant (<20 ms) dns-failed on hosts that resolve fine one at a time (lightning.cnn.com 95 ms, registry.api.cnn.io 75 ms, cdn.optimizely.com 71 ms). With the JS limiter/cache prototype these overflow failures went to 0.",
+    "impact": "high"
+   },
+   {
+    "cause": "lwIP's initial TCP retry timeout (LWIP_TCP_RTO_TIME default 3000 ms) and its DNS retry timer turn any single lost SYN or DNS packet into a stall of about 3 s.",
+    "evidence": "3-4 tunnel opens per 5-page cycle took 3.07-3.36 s (4 simultaneous opens to upload.wikimedia.org at 3073-3079 ms); tunnel open p99 3.07 s against p50 110-158 ms.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Screencast frames are acked to Edge immediately (browser.js onScreencastFrame), so Edge JPEG-encodes every compositor frame (32-53 fps) while Lumen forwards at most 15 fps. That CPU competes with the page and the VPN engine.",
+    "evidence": "CNN over a 20 s cap: browser process 28-34 CPU-s with immediate ack, 23-24.5 s with acks 66 ms after each frame, 11-11.6 s with no screencast; frames generated 700-1167 vs about 480.",
+    "impact": "medium"
+   },
+   {
+    "cause": "External to Lumen: Proton's NetShield DNS filter blocks ad/tracker hosts, including the Cloudflare challenge host, and the VPN exit IP draws Cloudflare bot challenges, so some pages never render through the VPN.",
+    "evidence": "25-37 NetShield dns-failed answers per CNN load at 50-230 ms (a real round trip), including brunhild.challenges.cloudflare.com. vimeo.com/watch through the VPN: title 'Just a moment...', text 'Verify to continue', 8 requests; direct: 445 requests, the real page.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Each new connection costs much more through the tunnel (CONNECT, then in-tunnel DNS, then lwIP TCP, then TLS), and nothing reuses DNS answers across connections beyond lwIP's 8 names.",
+    "evidence": "Edge new-connection time p50 450-773 ms through the VPN vs 41-100 ms direct; TTFB p50 121-505 ms vs 29-185 ms.",
+    "impact": "medium"
+   },
+   {
+    "cause": "proxy.js only frees a slot by evicting a tunnel that has been idle for at least 2 s, so requests beyond 250 streams wait 2-3 s. Real pages did not get there.",
+    "evidence": "Synthetic 300 + 40 CONNECTs: 90 evictions, waiters 2.0-2.9 s. Real pages peaked at 93-107 streams with 0 evictions or busy refusals.",
+    "impact": "low"
+   },
+   {
+    "cause": "The Edge flags are not the problem: --disable-quic is required (direct loads use h3 for 46-137 requests, the VPN path uses h2 fine), --disable-background-networking does no harm, and the profile and cache are normal. Edge still sends a few of its own calls (edge.microsoft.com, www.bing.com) through the tunnel.",
+    "evidence": "protos h2 148-187 per page over the VPN; queue before connect p90 at most 263 ms; profile 226 MB; edge.microsoft.com and www.bing.com CONNECTs ended in connection-reset (3 per run).",
+    "impact": "low"
+   }
+  ],
+  "plan": [
+   {
+    "change": "Run Lumen at AboveNormal priority: call os.setPriority(0, os.constants.priority.PRIORITY_ABOVE_NORMAL) at startup. Worker threads (the VPN wasm worker and the I/O worker) inherit the process priority class. Optionally also raise Edge's browser process (browserPid) to AboveNormal after launch.",
+    "files": [
+     "server/index.js",
+     "tools/start-hidden.js",
+     "server/features/browser.js"
+    ],
+    "expectedGain": "Under CPU contention VPN throughput goes from 0.47-0.71 to 2.25-2.51 MB/s (3.7x, measured). It prevents the KB/s collapse and the 4-16 s TLS times seen when the PC is busy.",
+    "risk": "Low: other desktop apps get slightly less CPU while Lumen is busy; the idle cost is near zero."
+   },
+   {
+    "change": "Operational: kill the leaked headless browsers (%TEMP%/lumen-review/cdp* Chrome, lumen-shot-* Edge) and make review and screenshot tools kill their browser tree on exit (taskkill /T /F in finally / process.on('exit')).",
+    "files": [
+     "tools/scratch/live/shot-*.mjs",
+     "(other agents' review tooling under %TEMP%/lumen-review)"
+    ],
+    "expectedGain": "Host CPU goes from 100% to 15-40%; the VPN goes from 4-10 KB/s to 1.2-2.9 MB/s; Edge starts again instead of 'did not start in time'.",
+    "risk": "None for Lumen; check first that no other agent still needs those browsers."
+   },
+   {
+    "change": "proxy.js: resolve hostnames in JS through tunnel.resolve() before dialing. Use at most 6 lookups in flight, share lookups for the same name, cache positive answers for about 2 min and dns-failed for 30 s, then call tunnel.connect(ipv4, port). Prototype: %TEMP%/lumen-pageload/vpnmod/proxy.js. Add tests for the >8-concurrent-names case and the negative cache.",
+    "files": [
+     "server/vpn/proxy.js",
+     "test/vpn-proxy.test.js"
+    ],
+    "expectedGain": "Instant dns-failed overflows go from 5 per CNN load (22 of 30 in a burst) to 0, so ERR_TUNNEL_CONNECTION_FAILED stops hitting real content hosts; about 80 ms saved on each new connection to a recently seen host; blocked ad hosts are refused from cache.",
+    "risk": "Low: names are still resolved inside the tunnel, so it stays fail-closed. The resolver returns a single A record, so no fallback to another IP; DNS TTLs are ignored, hence the 2 min cap."
+   },
+   {
+    "change": "Pace screencast acks: in onScreencastFrame, send Page.screencastFrameAck when the frame's fan-out slot comes up, i.e. after max(0, lastSentAt + 1000/maxFps - now), instead of immediately. Edge then produces at most maxFps frames. Server only; no web pointer/touch handlers touched.",
+    "files": [
+     "server/features/browser.js",
+     "test/browser*.test.js"
+    ],
+    "expectedGain": "About 5-10 CPU-s saved per 20 s of an animated page (0.3-0.5 of a core); frames encoded drop from 700-1167 to about 480 on CNN; leaves CPU for page load and the VPN engine.",
+    "risk": "Low: up to one frame interval of extra latency on the first frame after a change; make sure the final frame still arrives when the page goes still."
+   },
+   {
+    "change": "Rebuild wg-core (same Samsung emsdk, git archive of CineHD 3be48659, already shown to reproduce byte for byte) with DNS_TABLE_SIZE 64 and LWIP_TCP_RTO_TIME 1000. Update the NOTICE hashes.",
+    "files": [
+     "server/vpn/third_party/wg-core/src/lwipopts.h",
+     "server/vpn/third_party/wg-core/wg-core.wasm",
+     "server/vpn/third_party/wg-core/wg-core.cjs",
+     "server/vpn/third_party/NOTICE.md"
+    ],
+    "expectedGain": "Removes the 3 s open stalls (3-4 per 5-page cycle) and the DNS limit at its source; the JS DNS fix remains a safety net.",
+    "risk": "Medium: wasm rebuild and re-verification; a shorter first retry may send a few extra SYNs on slow paths, which is harmless."
+   },
+   {
+    "change": "UX and config: when the proxy refuses with dns-failed, say 'blocked by the VPN's DNS filter' in the Browser view or logs. Document that Proton NetShield blocks ad/tracker and Cloudflare challenge hosts and that a config generated with NetShield off or lower avoids it. Cloudflare 'Verify to continue' pages through the VPN need a tap.",
+    "files": [
+     "server/features/browser.js",
+     "docs/build-notes/followup-3-vpn-integrator.md"
+    ],
+    "expectedGain": "Explains the pages that will never fully render through Proton; avoids chasing engine bugs that are DNS-filter policy.",
+    "risk": "None."
+   },
+   {
+    "change": "proxy.js eviction: lower idleEvictMs from 2000 to about 500 ms, or evict the idlest tunnel immediately when a request has to queue.",
+    "files": [
+     "server/vpn/proxy.js",
+     "test/vpn-proxy.test.js"
+    ],
+    "expectedGain": "Removes 2-3 s waits when a long session pushes past 250 streams; not hit on today's pages (peak 107).",
+    "risk": "Low: Edge reopens evicted keep-alive sockets."
+   }
+  ],
+  "benchmark": "All scripts are in C:/Users/pranj/AppData/Local/Temp/lumen-pageload. The private-tunnel scripts check that the live Lumen VPN is off and stop if it turns on. They stop via stop.flag or --max-s and kill their own Edge.\n\n1) Tunnel DNS burst (before: 'parallel 30 distinct names: 8 ok, 22 failed'; after: 30 ok):\n   node C:/Users/pranj/AppData/Local/Temp/lumen-pageload/dnstest.mjs\n\n2) Five heavy pages through your own tunnel + proxy. Without VPNMOD it uses the repo's server/vpn; VPNMOD=1 uses the scratch copy in vpnmod/. Compare ERR_TUNNEL_CONNECTION_FAILED counts, 'instant dns-failed' counts, newConn p50/p90, opens >2.5 s and cpu%:\n   bash C:/Users/pranj/AppData/Local/Temp/lumen-pageload/plrun.sh before\n   bash C:/Users/pranj/AppData/Local/Temp/lumen-pageload/plrun.sh after VPNMOD=1\n   Against the live proxy once the VPN is on (port = vpn.proxyPort from `node tools/scratch/live/client.mjs state vpn.proxyPort`):\n   node C:/Users/pranj/AppData/Local/Temp/lumen-pageload/pageload.mjs --label live --cap-s 35 --proxy http://127.0.0.1:<port> --out live.jsonl https://en.wikipedia.org/wiki/Television https://www.cnn.com https://www.youtube.com https://vimeo.com/watch https://www.amazon.in\n   Same pages with no --proxy for the direct baseline.\n\n3) CPU contention / priority (2 cores, 3 spinners; before about 0.5-0.7 MB/s, AboveNormal about 2.3-2.5 MB/s):\n   powershell -File C:/Users/pranj/AppData/Local/Temp/lumen-pageload/contend.ps1 -label before\n   powershell -File C:/Users/pranj/AppData/Local/Temp/lumen-pageload/contend.ps1 -label after -prio AboveNormal\n\n4) Screencast CPU (edgeCpu.browser and GPU per page, frames):\n   node C:/Users/pranj/AppData/Local/Temp/lumen-pageload/pageload.mjs --label sc-now --cap-s 20 https://www.cnn.com\n   node C:/Users/pranj/AppData/Local/Temp/lumen-pageload/pageload.mjs --label sc-pace --ack-delay 66 --cap-s 20 https://www.cnn.com\n\n5) Engine ceiling and syscall bridge (no internet):\n   node C:/Users/pranj/AppData/Local/Temp/lumen-pageload/tput.mjs 5000000 150\n   node C:/Users/pranj/AppData/Local/Temp/lumen-pageload/rtt.mjs 3000\n\n6) Proxy stress (testpeer):\n   start `node vpnproxy.mjs 0 --testpeer --max-s 150 --log tp.jsonl`, read proxy-port.txt, then\n   node connstress.mjs <port> 300 10.66.0.1:80 1000 & node connstress.mjs <port> 40 10.66.0.1:80 500\n\nRun each A/B interleaved at least twice and record host CPU first with (Get-Counter '\\Processor(_Total)\\% Processor Time'). Other agents' load changed results by more than 100x during this session."
+ },
+ "phoneRender": {
+  "summary": "Phone-side rendering is a real, measurable part of the choppiness, and it is concentrated in the frame path of web/js/views/browser.js (onFrame/draw, lines ~401-445). There are three problems. (1) The base64-to-bytes step `Uint8Array.from(atob(data), (c) => c.charCodeAt(0))` (line 426) costs 36 ms (p50) / 57 ms (p95) of main-thread time for each 1280x720 frame and 11 ms for each phone-sized frame on a 4x-throttled emulated phone. It also creates 4.7 MB / 1.4 MB of garbage per frame, about 33 times the JPEG size. `Uint8Array.fromBase64` does the same work in 1.1 ms / 0.6 ms with almost no garbage. (2) Frames are acked only after decode and draw, and the server allows only UNACKED_LIMIT=2 frames in flight. That puts the phone's processing time inside the flow-control loop: in replay the server skipped 120-183 of roughly 300 frames per 20 s and sent only 4-7 fps. Acking on receipt raised that to 11-13 fps and cut skips to 14-37 on a good link. (3) There is a freeze bug, reproduced. If one frame fails to decode while another is queued, neither is acked and the queued frame is never drawn. The server then has 2 outstanding frames and stops sending to that phone until the view or visibility changes: 0 frames were sent or drawn in the remaining ~10 s, against 111 sent and 93 drawn with the fix. That fits 'heavy pages don't load properly' as a frozen picture. Other parts are fine. Canvas sizing is not oversized: the backing equals the frame (356x466 at DPR 1 for a phone viewport, 1280x720 only while the TV/desktop viewport holds). drawImage takes under 0.5 ms. createImageBitmap decodes off the main thread in Chromium (worst main-thread gap 2.7 ms while decoding). JSON.parse of the frame message takes 0.3 ms. The service worker never touches /live. There is no per-frame DOM work apart from the first frame, frame-size changes, and a once-per-second meta update. Caveat: the host PC was at 100% CPU the whole time (Defender 235%, ~180 msedge and ~120 chrome processes from other agents), and headless rAF stalled for seconds under that load. So treat absolute fps and latency as noisy. The per-frame CPU, allocation and long-task differences are large and consistent in every run. I could not measure WebKit/JSC on a real iPhone; check with Safari Web Inspector Timeline. Scratch harness: C:\\Users\\pranj\\AppData\\Local\\Temp\\lumen-phone-bench (no repo files changed; every Edge I started was killed and its temp profiles deleted).",
+  "measurements": [
+   {
+    "what": "Base64-to-bytes conversion, current code: Uint8Array.from(atob(s), cb)",
+    "value": "1280x720 frame (106 KB JPEG, 142 KB message): 36.3 ms p50 / 57.1 ms p95, 4717 KB garbage per frame at 4x throttle; 14.6 ms p50 at 1x. Phone frame 356x466 (32 KB JPEG): 11.3 / 18.6 ms, 1418 KB per frame at 4x; 4.7 ms at 1x.",
+    "how": "C:\\Users\\pranj\\AppData\\Local\\Temp\\lumen-phone-bench\\micro.mjs: headless Edge 155 emulating 390x844, DPR 3, mobile, Emulation.setCPUThrottlingRate 4; real captured Edge screencast frames (q60); 60 interleaved iterations; gc() and performance.memory (--enable-precise-memory-info) for allocation per op. Results in micro-t4.json and micro-t1.json."
+   },
+   {
+    "what": "Alternative conversions (same frames, 4x)",
+    "value": "Uint8Array.fromBase64: 1.1 ms p50 / 2.1 p95, 144 KB per op (1280x720); 0.6 / 1.4 ms, 44 KB (phone). atob + charCodeAt loop: 10.8 / 17.9 ms, 253 KB (1280x720); 4.0 / 6.8 ms (phone). JSON.parse of the whole frame message: 0.3 ms.",
+    "how": "micro.mjs, same run as above"
+   },
+   {
+    "what": "createImageBitmap(Blob) decode",
+    "value": "Latency 6.3 ms p50 (1280x720) and 4.7 ms (phone) at 4x. Worst main-thread gap during decode 2.7 ms p50, so Chromium decodes off the main thread. drawImage(bitmap) takes under 0.5 ms (sync). The Image + blob: URL + decode() path fails with EncodingError because the CSP img-src is 'self' data: with no blob:.",
+    "how": "micro.mjs (a 1 ms setTimeout heartbeat's worst gap while awaiting decode); bench.mjs micro section"
+   },
+   {
+    "what": "End-to-end replay, 1280x720 frames (TV/desktop viewport), Wi-Fi model 15 ms one-way / 40 Mbit/s, 4x throttle, mean of 2 runs: baseline vs prototype (ack on receipt + fromBase64 + newest-only decode + rAF draw)",
+    "value": "Frames the server sent: 6.1 vs 13.1 fps. Server-side skips (unacked >= 2): 133 vs 14 per 20 s. Arrival-to-ack p50: 54.5 vs 0.9 ms. onmessage sync cost: 32.5 / 62.7 ms vs 3.0 / 10.4 ms (p50/p95). Long tasks: 23.5 (1458 ms) vs 1 (58 ms). Heap allocation: 18.6 vs 2.5 MB/s. GC drops: 2.3 vs 0.7 per second. Produced-to-drawn latency p50: 176 vs 129 ms.",
+    "how": "bench2.mjs: tools/dev-ui.mjs serves the real web/ app on port 8812. A node-side feed on 8813 replays the captured frames into the app's real /live listener, modelling server/features/browser.js (maxFps 15, newest-wins, UNACKED_LIMIT 2, resend-latest on catch-up) plus link latency and bandwidth. --patch serves C:\\Users\\pranj\\AppData\\Local\\Temp\\lumen-phone-bench\\browser.patched.js as /js/views/browser.js via CDP Fetch interception. Results in m-*.json."
+   },
+   {
+    "what": "End-to-end replay, phone-size frames 356x466 (normal phone viewport), good link, 4x, mean of 2 runs",
+    "value": "Sent: 4.9 vs 11.2 fps. Drawn: 4.8 vs 9.3 fps. Skips: 132 vs 37. Arrival-to-ack p50: 328 vs 0.6 ms. Sync p95: 91 vs 10.4 ms. Long tasks: 47.5 (11.9 s, one heavily stalled run) vs 1.5 (77 ms). Produced-to-drawn p50 / p95: 555 / 1171 vs 144 / 226 ms.",
+    "how": "bench2.mjs --corpus corpus-wiki-phone.json, with and without --patch; runall.sh, then summarize.mjs"
+   },
+   {
+    "what": "Poor link (40 ms one-way, 15 Mbit/s), 4x, means",
+    "value": "1280x720: sent 4.0 vs 8.4 fps, skips 183 vs 101, sync p50 31 vs 4 ms, allocation 11.7 vs 2.2 MB/s. Phone size: sent 3.0 vs 7.7 fps, drawn 3.0 vs 5.3 fps, produced-to-drawn p50 335 vs 215 ms, long tasks 53.5 (5.8 s) vs 3 (0.45 s).",
+    "how": "bench2.mjs --oneway 40 --mbps 15"
+   },
+   {
+    "what": "Freeze after a decode failure (stall test)",
+    "value": "Baseline: neither the bad frame nor its follower was acked; 0 frames sent or drawn for the rest of the run (~10 s), i.e. a permanent freeze until presence changes. Prototype: both acked; 111 frames sent and 93 drawn afterwards.",
+    "how": "bench3.mjs --corrupt true: 5 s into the replay it sends an undecodable 600 KB 'JPEG' immediately followed by a good frame (both pass the gate)."
+   },
+   {
+    "what": "Canvas sizing and per-frame DOM work",
+    "value": "Phone viewport: canvas 356x466 backing at 356x466 CSS on a DPR 3 screen (not oversized; upscaled 3x by the compositor). 1280x720 frames: 1280x720 backing at 356x201 CSS. Frame size changes are the only thing that triggers canvas reallocation and fit(). No per-frame DOM writes; paintMeta runs once per second.",
+    "how": "bench.mjs/bench2.mjs read the canvas width/height and clientWidth/clientHeight; code read of browser.js lines 387-455"
+   },
+   {
+    "what": "Real Lumen server plus real Edge renderer on this host (dev stack, own port 8811, no VPN)",
+    "value": "While scrolling en.wikipedia World_War_II the server offered only 0.4 fps of new frames (6 in 15 s); the phone drew all 6. Standalone capture: 4.6 fps on Wikipedia and 1 fps on theverge.com. Opening Edge took 47 s.",
+    "how": "bench.mjs (tools/dev-stack.mjs startDevStack, an observer WS client that drives browser.input wheel, emulated phone); capture.mjs. Host CPU was at 100% (typeperf), so this shows host-side frame production starving, not a phone cost."
+   },
+   {
+    "what": "Service worker",
+    "value": "Not in the frame path: the NEVER regex excludes /live, and WebSocket traffic is never routed through fetch handlers. No measurable effect.",
+    "how": "Code read of web/sw.js; runs used Network.setBypassServiceWorker"
+   }
+  ],
+  "rootCauses": [
+   {
+    "cause": "Per-frame base64 decode through Uint8Array.from(string, mapFn) (web/js/views/browser.js:426) runs on the main thread with a JS callback per byte and huge garbage, so every frame blocks the UI and drives GC.",
+    "evidence": "micro-t4.json: 36.3 / 57.1 ms and 4.7 MB of garbage per 1280x720 frame; 11.3 ms and 1.4 MB per phone frame. fromBase64: 1.1 ms and 144 KB. Replay baseline: 12-25 MB/s allocation, 2-2.7 GC/s, 19-28 long tasks per 20 s on 1280x720 frames, against 1.9-3.1 MB/s and 0-2 long tasks with fromBase64.",
+    "impact": "critical"
+   },
+   {
+    "cause": "Frames are acked only after decode and draw (browser.js:413-414) while the server allows 2 unacked frames (server/features/browser.js:20, 327-333). The phone's decode, draw and main-thread queueing sit inside the flow-control loop, so the server keeps skipping this phone.",
+    "evidence": "Arrival-to-ack p50: 45-55 ms (1280x720) and 28-628 ms (phone frames under contention) in baseline, against 0.3-1 ms with ack on receipt. Skips per 20 s: 120-199 baseline vs 8-56 prototype on a good link. Sent fps 4.9 -> 11.2 (phone) and 6.1 -> 13.1 (1280x720).",
+    "impact": "high"
+   },
+   {
+    "cause": "Freeze: if createImageBitmap rejects (corrupt or truncated data, or iOS memory pressure) while another frame is queued, the catch at browser.js:418 leaves both unacked and the queued frame undrawn. The server then has 2 outstanding frames and never sends to that client again until a view or visibility change resets its watcher (browser.js:394-401 server side).",
+    "evidence": "bench3.mjs stall test: baseline ackedCorrupt=false, ackedFollower=false, 0 frames sent or drawn after the event for ~10 s; prototype keeps going (111 sent, 93 drawn). Code: onFrame's try/catch skips the ack and leaves `queued` set.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Decode and draw are strictly serial, and every received frame is drawn in arrival order. There is no 'newest only' at decode time and no rAF alignment, so a burst queues work and the picture lags.",
+    "evidence": "Baseline produced-to-drawn p50 / p95: 555 / 1171 ms (phone frames, good link, contended host) vs 144 / 226 ms with newest-only plus rAF. The 'queued' slot only collapses frames that arrive mid-decode, after the costly sync conversion has already run in each frame's own message task.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Frames travel as base64 inside JSON text (server/features/browser.js:336, server/http.js:345): 33% more bytes on Wi-Fi plus a string copy per client, which forces the conversion step in the first place.",
+    "evidence": "A 106 KB JPEG becomes a 142 KB message and a 32 KB JPEG a 43 KB message. JSON.parse itself is only 0.2-0.3 ms; the cost is the extra bytes on the link (poor-link runs: 4.0 vs 8.4 fps sent even after the fix, link-bound) and the decode step.",
+    "impact": "low"
+   },
+   {
+    "cause": "While the TV viewport holds (On TV) or on a desktop-sized stage, phones receive full 1280x720 frames for a 356x201 CSS canvas: 3.3x the bytes and conversion work of a phone-size frame.",
+    "evidence": "Corpora: 1280x720 frames are 102 KB p50 JPEG vs 31 KB for 356x466. In baseline the per-frame conversion is 36 ms vs 11 ms.",
+    "impact": "low"
+   }
+  ],
+  "plan": [
+   {
+    "change": "In draw(), replace `Uint8Array.from(atob(data), (c) => c.charCodeAt(0))` with a feature-detected `Uint8Array.fromBase64(data)` (Safari 18.2+, current Edge/Chrome), falling back to a plain atob + charCodeAt for-loop into a preallocated Uint8Array. Frame-decode code only; pointer and touch handlers untouched.",
+    "files": [
+     "web/js/views/browser.js"
+    ],
+    "expectedGain": "Per-frame main-thread conversion 36 -> 1.1 ms (1280x720) and 11 -> 0.6 ms (phone) at 4x; garbage per frame 4.7 MB -> 0.14 MB; the replay's onmessage sync p50 drops about 10x (32 -> 3 ms) and long tasks almost disappear. The fallback loop alone is 3.4x faster than today.",
+    "risk": "Very low. Same bytes out; feature detection covers older iOS. Verify the PNG-from-dev-ui branch (bytes[0] === 0x89) still works."
+   },
+   {
+    "change": "Restructure onFrame/draw (prototype: C:\\Users\\pranj\\AppData\\Local\\Temp\\lumen-phone-bench\\browser.patched.js). Ack every frame as soon as it arrives (before the showing() check), keep only the newest undecoded frame, decode it with createImageBitmap outside the message task, keep only the newest decoded bitmap (close the replaced one), and draw it in a requestAnimationFrame callback. This also guarantees an ack whatever the decode outcome, which removes the freeze.",
+    "files": [
+     "web/js/views/browser.js"
+    ],
+    "expectedGain": "Server-sent fps 4.9 -> 11.2 (phone frames) and 6.1 -> 13.1 (1280x720) on a good link; 3.0 -> 7.7 and 4.0 -> 8.4 on a poor link. Server skips 133 -> 14. Arrival-to-ack 55 -> 0.9 ms. Produced-to-drawn p50 555 -> 144 ms (phone). The permanent freeze after a failed decode is gone (stall test: 0 -> 111 frames afterwards).",
+    "risk": "Low to medium. More frames cross Wi-Fi per second (still capped at 2 in flight by the server, so no unbounded backlog). Decode CPU is bounded by newest-only. If iOS throttles rAF (Low Power Mode at 30 Hz) frames show at up to 30 fps, which is fine. In this contended headless host rAF sometimes stalled for seconds, so drawn fps there trailed sent fps; on a real phone rAF is reliable, but verify drawn fps on the iPhone. Keep hasFrame, fit() and painted bookkeeping exactly as in the prototype."
+   },
+   {
+    "change": "(Coordinate with server owners) Send browser.frame as binary WebSocket messages: a small header (seq, w, h) plus raw JPEG bytes. Set ws.binaryType = 'arraybuffer' in live.js and route binary messages to the Browser view, which builds the Blob straight from the ArrayBuffer. The TV sinks already get raw bytes and are unaffected.",
+    "files": [
+     "server/features/browser.js",
+     "server/hub.js",
+     "server/http.js",
+     "web/js/core/live.js",
+     "web/js/views/browser.js"
+    ],
+    "expectedGain": "25% fewer bytes per frame on Wi-Fi (142 -> 106 KB for 1280x720); removes the base64 step and the large JSON string entirely (about 1 ms per frame left after fix 1, more on JSC); helps most on a poor link, where the fixed client is still link-bound (8.4 fps sent).",
+    "risk": "Medium. Protocol change across server and client; needs a version or capability bump so older cached PWA shells keep working (the service worker caches the shell)."
+   },
+   {
+    "change": "Measure on the real iPhone before investing further: Safari Web Inspector Timeline on the Browser view with a heavy page. If WebKit's createImageBitmap(Blob) decodes on the main thread, move base64 conversion and createImageBitmap into a same-origin module Worker (allowed by CSP default-src 'self') and transfer the ImageBitmap back. Do not use Image + blob: URLs; the CSP img-src blocks blob: (seen as EncodingError).",
+    "files": [
+     "web/js/views/browser.js",
+     "web/js/views/frame-decoder.js (new, optional)"
+    ],
+    "expectedGain": "Unknown until measured on device. Removes any remaining decode stall from the main thread on WebKit.",
+    "risk": "Medium. Worker createImageBitmap support varies by iOS version; needs a feature-detect fallback to the main-thread path."
+   },
+   {
+    "change": "(Optional, server) While the TV viewport holds, give phones a downscaled frame, or keep phones on their own viewport when no TV sink is attached (already the case). Only matters during On TV.",
+    "files": [
+     "server/features/browser.js"
+    ],
+    "expectedGain": "About 3.3x fewer bytes and less decode work per phone frame during On TV.",
+    "risk": "Medium. Needs a second encode or a server-side resize; outside the phone-render scope."
+   }
+  ],
+  "benchmark": "All scripts are in C:\\Users\\pranj\\AppData\\Local\\Temp\\lumen-phone-bench. They use ports 8811-8813 and 9411-9414, start and kill their own Edge (temp profiles lumen-phone-prof-*), never touch port 8790 or the TV, and finish with cleanup.ps1. Run them one at a time.\n\n(1) Decode-path microbenchmark (cleanest A/B signal; writes micro-t4.json / micro-t1.json):\n  cd /c/Users/pranj/AppData/Local/Temp/lumen-phone-bench && node micro.mjs --throttle 4 --n 60 && node micro.mjs --throttle 1 --n 60\n\n(2) End-to-end phone-render replay of real Edge frames through the real web app. Before = the repo's current browser.js; after = the prototype, or, once the fix is in the repo, rerun the 'before' command:\n  node bench2.mjs --corpus corpus-verge-1280.json --seconds 20 --out before-1280.json\n  node bench2.mjs --corpus corpus-verge-1280.json --seconds 20 --patch browser.patched.js --out after-1280.json\n  node bench2.mjs --corpus corpus-wiki-phone.json --seconds 20 --out before-phone.json\n  node bench2.mjs --corpus corpus-wiki-phone.json --seconds 20 --patch browser.patched.js --out after-phone.json\n  Poor-link variant: add --oneway 40 --mbps 15. Key fields: sentFps, drawnFps, skippedAtServer, arrivalToAckMs, onMessageSyncMs, producedToDrawnMs, longTasks, heapAllocMBps.\n\n(3) Freeze regression test (pass = drawnAfterCorrupt > 0):\n  node bench3.mjs --corpus corpus-wiki-phone.json --corrupt true --seconds 15 --out c-before.json\n  node bench3.mjs --corpus corpus-wiki-phone.json --corrupt true --seconds 15 --patch browser.patched.js --out c-after.json\n\n(4) Full 2-rep matrix plus table: ./runall.sh && node summarize.mjs\n\n(5) Regenerate frame corpora (real Edge screencast, q60, same params as the server):\n  node capture.mjs --url https://www.theverge.com/ --w 1280 --h 720 --out corpus-verge-1280.json\n  node capture.mjs --url https://en.wikipedia.org/wiki/World_War_II --w 356 --h 466 --out corpus-wiki-phone.json\n\nRun when the host is quiet (check that typeperf \"\\Processor(_Total)\\% Processor Time\" is well below 100%); during this investigation Defender and other agents' browsers saturated the CPU, which adds noise to the fps and latency numbers."
+ },
+ "screencast": {
+  "summary": "Screencast pipeline investigation, with numbers from my own dev stacks and headless Edges. Nothing in the repo was changed; scratch scripts are in C:/Users/pranj/AppData/Local/Temp/lumen-sc-bench.\n\nWhat Lumen does today (server/features/browser.js, config defaults):\n- Screencast settings: Page.startScreencast format=jpeg, quality=60, maxWidth=1280, maxHeight=800, everyNthFrame=1.\n- Every Edge frame is acked immediately. Fan-out is capped at maxFps=15 (5 fps when the bytes repeat).\n- Phones get the frame as JSON text (base64 inside) on the shared /live socket. Each phone may have at most 2 unacked frames (UNACKED_LIMIT=2), and it acks only after painting.\n- The TV gets raw JPEG bytes with no ack. A frame is skipped only when the socket's bufferedAmount is above 384 KB.\n- While the TV is attached the single stream is 1280x720, and every phone gets that too.\n\nCauses of choppiness, in order of evidence:\n1. The 2-frame ack window serialises on the Wi-Fi round trip. Phone fps is roughly min(15, 2/(RTT+decode)): 14.4 fps falls to 10.8 with 100 ms added ack delay and to 5.8 with 250 ms. Even in perfect conditions the phone never exceeds 15 fps, which looks choppy when scrolling.\n2. With the TV on, phones receive 1280x720 frames: 86-127 KB messages instead of 25-37 KB at their own 358x467 viewport.\n3. The phone turns base64 into bytes with Uint8Array.from(atob(s), fn). That costs 24.6 ms per 63 KB frame at 4x CPU throttle, against 2 ms for a plain loop, 0.5 ms for Uint8Array.fromBase64 and 0 ms for binary frames. With the TV on and a 4x-slower phone CPU this produced roughly 60-90 ms long tasks on most frames (63 of ~64 in the loaded run, 30 of 115 on CNN), 6.4 painted fps and glass-to-glass latency of 301 ms p50 / 1.19 s max on the loaded PC. Those long tasks also delay touch handling.\n4. Immediate acks make Edge encode 92-93 fps (canvas animation) or 30-54 fps (CNN), of which Lumen sends at most 15. That waste costs Edge about 1-2 cores and Node 11-33%. Under CPU contention the capture path is the first thing starved: the page still rendered at 69-90 frames/s while the screencast fell to 0.4-8 fps with 120-2700 ms lag.\n5. The TV path has no flow control. A TV reading at 300 KB/s saw frames 3.0 s old (p50; p90 3.4 s), with 18 frames queued in the 384 KB Node buffer plus kernel buffers.\n\nDoes the slowest consumer throttle everyone? No. Each phone has its own window: an 80 ms decoder got 11.9 fps while the others got 14.4, and a slow TV left the phone at 14.5 fps. The real coupling is the shared 1280x720 stream while the TV is attached.\n\nRanked fixes:\n- (a) Send phone frames as binary, which removes base64 decoding and 33% of the bytes.\n- (b) Pace Edge at the source with held \"token\" acks. Prototype: Edge CPU fell from about 150% to 50-58% and Node from 11-17% to 2-4%, with similar frame freshness.\n- (c) Replace the after-paint 2-frame window with ack-on-receipt plus a byte/time window, a timeout for stuck acks, and per-client fps.\n- (d) Give the TV real flow control (screen-ack, or one frame in flight).\n- (e) Run a second CDP screencast session for phones at phone size (verified: two independent screencasts on one tab, 93 fps each).\n- (f) Adaptive JPEG quality and size caps.\n\nCaveats:\n- This PC was intermittently at 100% CPU from about 17 other agents' headless Chromes. Runs taken while it was idle are marked as such. The loaded runs are noisy but they show how badly the capture path collapses under CPU pressure.\n- Mistake on my side: one cleanup command killed msedge.exe processes matching *lumen-test-* as well as my own *lumen-sc-edge-*. Some of those may have belonged to other agents' test stacks (28 processes in total). After that I only killed Edge by my own exact markers. All my Edge processes and temp profiles are gone.\n- I did not touch the live Lumen server, the TV, or the VPN.",
+  "measurements": [
+   {
+    "what": "Screencast parameters in use",
+    "value": "format=jpeg, quality=60, maxWidth=1280, maxHeight=800, everyNthFrame=1. Every Edge frame is acked at once. Fan-out is capped at maxFps=15 (IDLE_FPS 5 when the bytes repeat). Phones may have 2 unacked frames (UNACKED_LIMIT=2) and ack after painting. The TV gets raw JPEG with no ack and is skipped only when bufferedAmount exceeds 384 KB. The live data/config.json has no browser override, so these defaults are what runs.",
+    "how": "Read server/features/browser.js (lines 241, 643-645, 327-375), server/adapters/agent.js:249-252, server/config.js:45-53, web/js/views/browser.js:406-445, and checked data/config.json (browser: null)."
+   },
+   {
+    "what": "Frames Edge produces with immediate acks (idle PC)",
+    "value": "Canvas animation at 1280x800: 92.7-93.8 fps, 70 KB JPEG p50, swap-to-Node latency 9.8 ms p50. Edge CPU 143-188% (browser process, which does the JPEG encode, 94-124%); Node CPU 11-22% just receiving. Counter page: 34.7 fps, 9 KB. CNN while scrolling: 30-54 fps at 1280x720 (61-90 KB) and 35-37 fps at 390x640 (24-33 KB).",
+    "how": "node %TEMP%/lumen-sc-bench/cdp-probe.mjs --url anim|busy|https://edition.cnn.com/ [--scroll] --configs q60w1280n1ack0 (own headless Edge with a temp profile; Edge CPU from CDP SystemInfo.getProcessInfo)."
+   },
+   {
+    "what": "Share of encoded frames Lumen sends on",
+    "value": "Animation: Edge 91.5-93.6 fps, Lumen sends 14.4-14.6 fps, so about 84% are encoded, parsed and thrown away. CNN with the TV attached: Edge 36 fps, sent 10.3 fps, Edge CPU 235% (browser process 96%).",
+    "how": "node %TEMP%/lumen-sc-bench/e2e-bench.mjs --page anim --secs 10 --phones 0,30,80. This is the real Lumen server via test/helpers.js startStack on its own ports; CDP frames are counted through a wrapped global WebSocket, sends through a wrapped hub.sendToView."
+   },
+   {
+    "what": "Phone fps vs. decode time and ack round trip (2-frame window)",
+    "value": "Decode 0/30/80 ms: 14.4/14.4/11.9 fps (gaps p50 68.6 ms; the 80 ms client p90 138 ms). With 30 ms decode plus 100 ms ack delay: 10.8 fps (gap p90 143 ms). Plus 250 ms: 5.8 fps (gap p50 169 ms, max 366 ms). Frame age on arrival stays 11-16 ms p50, so the frames are fresh but too few.",
+    "how": "e2e-bench.mjs --phones 30 --rtt 100 and --rtt 250. The simulated phone mirrors web/js/views/browser.js: one decode at a time, newest waiting frame replaces older ones, ack after paint."
+   },
+   {
+    "what": "Real web UI as an iPhone (390x844 @3x) in a second headless Edge",
+    "value": "Idle PC, animation, no throttle: 14.4 fps at 358x467, 25 KB messages, base64-to-bytes 1.4 ms, decode 0.9 ms, glass-to-glass 41/44/47 ms (p50/p90/max). 4x throttle: base64 6.1 ms, decode 4.6 ms, 52/59/84 ms. 4x throttle with the TV attached (1280x720 frames, 86 KB): base64 19.6 ms, decode 10.6 ms, 73/84/136 ms. CNN scrolling with TV, 4x: 120 KB messages, base64 33.7/54.7 ms, decode 17.7/38.8 ms, glass-to-glass 139/428/628 ms, long tasks on 30 of 115 frames (p50 60 ms). Loaded PC, animation, TV, 4x: 6.4 painted fps, base64 49 ms, decode 72 ms, glass-to-glass 301/454/1186 ms, about 64 ms long tasks on 63 frames.",
+    "how": "node %TEMP%/lumen-sc-bench/ui-bench.mjs [--throttle 4] [--tv 0] [--page https://edition.cnn.com/ --scroll]. The test page (and real sites, by injection) draws Date.now() as a 48-block strip; a hook on drawImage reads it back from Lumen's canvas. atob, createImageBitmap and drawImage are timed by wrappers, long tasks by PerformanceObserver."
+   },
+   {
+    "what": "Client base64-to-bytes alternatives (4x CPU throttle, real Edge JPEGs)",
+    "value": "1280x720 frame (63 KB): current Uint8Array.from(atob, fn) 24.6 ms; atob plus for-loop 2.0 ms; Uint8Array.fromBase64 0.5 ms; binary 0 ms. createImageBitmap 9.6 ms. 358x467 frame (19 KB): current 10.9 ms vs loop 0.4 ms; decode 3.2 ms. JSON.parse of the message is only 0.1-0.6 ms.",
+    "how": "node %TEMP%/lumen-sc-bench/decode-micro.mjs 4 (median of 15 runs inside a throttled headless Edge page)."
+   },
+   {
+    "what": "Lumen's own per-frame server work",
+    "value": "40 / 120 / 250 KB frames: CDP JSON.parse 0.31/0.91/4.6 ms; base64 decode for jpegSize 0.10/0.30/1.10 ms; a second decode for the TV sink 0.09/0.75/2.1 ms; JSON.stringify per phone 0.53/2.6/9.0 ms. Base64 adds 33% to the bytes.",
+    "how": "node %TEMP%/lumen-sc-bench/server-micro.mjs (imports jpegSize from server/features/browser.js; 300 iterations each)."
+   },
+   {
+    "what": "Source pacing prototype (hold acks, release one per slot 25 ms early)",
+    "value": "Animation at 1280x720, 15 fps target. Today: Edge produces 93 fps, 142-153% CPU (browser process 94-100%), Node 11-17%, frame age at send 17-18 ms. Token pacing: Edge produces 13.1 fps, 50-58% CPU (browser process 15.5%), Node 2-4%, frame age 24 ms. On CNN Edge CPU fell from 149-232% to 99-160%, but the send rate dropped to 9.4-10.4 fps (missed slots), so a burst allowance is needed. everyNthFrame=3 also cuts Edge CPU but gives irregular 11.7-17 fps (gap p90 108-119 ms).",
+    "how": "node %TEMP%/lumen-sc-bench/pacing.mjs anim 15 7 1280 720 and pacing.mjs https://edition.cnn.com/ 15 7 1280 720 scroll (alternating modes on one Edge/page). Edge keeps 3 unacked frames in flight (inflight.mjs)."
+   },
+   {
+    "what": "TV path with a slow consumer",
+    "value": "Unlimited read (loopback): 14.5 fps, 65 KB frames, send-to-receive 0.6 ms p50. At 800 KB/s: 14.2 fps, p90 282 ms, max 606 ms. At 300 KB/s: 4.0-4.3 fps received, 122 frames skipped by the 384 KB cap, send-to-receive 2966/3427/3633 ms (p50/p90/max), 18 frames in flight, bufferedAmount at send up to 372 KB. The phone stayed at 14.5 fps, so a slow TV does not throttle the phone.",
+    "how": "e2e-bench.mjs --phones 30 --tv 300|800|0 (fake agent via helpers.connectAgent with keepalive; its socket is paused/resumed to cap read rate; adapters.agent.sendFrame is wrapped and sends are matched to receipts by index on the in-order TCP stream)."
+   },
+   {
+    "what": "Frame size when the TV is attached",
+    "value": "The phone's own viewport gives 358x467 or 390x640 frames (25-37 KB messages). With the TV attached every phone gets 1280x720 (86-127 KB, 3.4-5x the bytes) shown about 3.6x smaller on a 358 CSS-px stage.",
+    "how": "ui-bench.mjs and e2e-bench.mjs with and without --tv (UI meta text '1280×720 · 14 fps')."
+   },
+   {
+    "what": "Behaviour under CPU contention (PC at 100% from other processes)",
+    "value": "The page's own rendering kept 69-90 rAF/s, but the screencast fell to 0.4-1.6 fps on the animation, 5-8 fps on the counter page, and 0.5-2.1 fps on YouTube/CNN. Swap-to-Node latency was 120-400 ms p50 and up to 2.7-5.4 s. fps did not depend on frame size (320x200 to 1280x800 all 5-8 fps), so the capture path was bound by latency, not bytes.",
+    "how": "raf.mjs (rAF with and without screencast) and cdp-probe.mjs while Get-Counter showed 100% total CPU (about 17 other agents' headless Chrome instances)."
+   },
+   {
+    "what": "Two screencasts on one tab",
+    "value": "Session A at 1280x720 q60: 93 fps, 66 KB. Session B at the same time, 480x270 q50: 92.8 fps, 16 KB. They run independently.",
+    "how": "node %TEMP%/lumen-sc-bench/dual.mjs (two CDP WebSocket connections to the same page target, each with its own Page.startScreencast)."
+   }
+  ],
+  "rootCauses": [
+   {
+    "cause": "Phone flow control is a 2-frame window acked only after decode and paint. Every frame waits for a full Wi-Fi round trip plus decode, so fps is at most 2/(RTT+decode). On top of that, maxFps=15 caps every phone even on a perfect link, which is visibly choppy when scrolling.",
+    "evidence": "14.4 fps falls to 10.8 with 100 ms added ack delay and to 5.8 with 250 ms (gap p50 169 ms). An 80 ms decoder drops to 11.9 fps. Gaps sit at 68 ms (15 fps) at best. iPhone Wi-Fi power save commonly adds 50-200 ms RTT spikes. The code: canReceive() and UNACKED_LIMIT=2 in browser.js:327-333; onFrame acks after draw in web/js/views/browser.js:406-423.",
+    "impact": "critical"
+   },
+   {
+    "cause": "With the TV attached there is one 1280x720 stream for everyone, so phones download, base64-decode and JPEG-decode 3.4-5x more pixels and bytes than they can show. This turns per-frame work into main-thread long tasks that also delay touch input.",
+    "evidence": "Messages 86-127 KB instead of 25-37 KB. At 4x throttle: base64 step 19.6-49 ms, decode 10.6-72 ms, long tasks of about 60-90 ms on most frames, 6.4 painted fps and glass-to-glass 301/454/1186 ms (loaded PC). CNN with TV: 139/428/628 ms. Code: addSink() forces TV_VIEWPORT 1280x720 (browser.js:830-846).",
+    "impact": "critical"
+   },
+   {
+    "cause": "The phone's base64-to-bytes step uses Uint8Array.from(atob(data), c => c.charCodeAt(0)), a JS callback per byte, on the main thread. Frames are also sent as JSON text, which adds 33% for base64 and a JSON.stringify per client on the server.",
+    "evidence": "At 4x throttle, 24.6 ms per 63 KB frame vs 2.0 ms for a loop, 0.5 ms for Uint8Array.fromBase64 and 0 ms for binary. Server JSON.stringify per phone: 2.6 ms at 120 KB, 9 ms at 250 KB (http.js client.send). Code: web/js/views/browser.js:426.",
+    "impact": "high"
+   },
+   {
+    "cause": "Edge's frames are acked the moment they arrive, so Edge captures and JPEG-encodes at display rate (60-93 fps) while Lumen keeps at most 15. The encodes, CDP transfers and Node JSON parsing of the discarded frames burn about 1-2 cores. That competes with heavy page rendering and the VPN worker, and under contention the capture path starves first (0.4-8 fps, 0.1-5 s lag).",
+    "evidence": "Animation: Edge 93 fps vs 14.4 sent; Edge CPU 143-188% (browser process 94-124%), Node 11-33%. Token pacing prototype: Edge 50-58%, browser process 15.5%, Node 2-4%, same freshness. On the loaded PC, pages kept 69-90 rAF/s while the screencast fell to 0.4-8 fps with 120-2700 ms swap-to-Node latency. Code: onScreencastFrame acks first (browser.js:359-367).",
+    "impact": "high"
+   },
+   {
+    "cause": "The TV path has no app-level flow control. Frames are pushed at the fan-out rate and dropped only once ws.bufferedAmount exceeds 384 KB, so up to 384 KB plus kernel buffers of stale video queue up ahead of the newest frame. The TV then shows video seconds late, and pointer and click feedback on the TV lags the same.",
+    "evidence": "TV reading at 300 KB/s: 3.0 s p50 / 3.4 s p90 send-to-receive, 18 frames in flight, 122 skips. At 800 KB/s: p90 282 ms, max 606 ms. Code: agent.js:249-252; the tvscreen sink has no ack (tvscreen.js:238); companion/agent/screen.js only drops frames after they reach JS.",
+    "impact": "high"
+   },
+   {
+    "cause": "Heavy pages are janky at the source. CNN while scrolling keeps Edge's renderer busy, so it produces fewer frames and its timestamps lag even on an idle PC. Encoding 1280x720 at full rate adds to that load.",
+    "evidence": "Idle PC, CNN scroll, phone viewport: Edge 22 fps, sent 8.2 fps, glass-to-glass 57/776/1342 ms. With the TV, Edge CPU was 235%. Partly inherent to the site; reduced by source pacing and smaller encodes.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Robustness gap: a lost ack freezes a phone until it leaves the view. A failed createImageBitmap or draw skips the ack and also drops the queued frame. A RATE_LIMIT rejection also loses an ack, because browser.ack shares the 120/s pointer bucket with trackpad moves and wheels. The server never expires outstanding acks, so with 2 lost acks canReceive() stays false for good.",
+    "evidence": "Code reading: web/js/views/browser.js:409-422 (catch around the whole loop); hub.js:35 STREAMED includes browser.ack; safety.checkRate uses POINTER_RATE 120/s; browser.js canReceive/ack has no timeout. Not reproduced live.",
+    "impact": "medium"
+   },
+   {
+    "cause": "Minor server inefficiencies: when the TV is attached each frame is base64-decoded twice (once for jpegSize, once for the sinks), and the message is JSON.stringified once per phone.",
+    "evidence": "server-micro.mjs: 0.3-1.1 ms plus 0.75-2.1 ms of decode per frame, and 2.6-9 ms of stringify per phone per frame for 120-250 KB frames.",
+    "impact": "low"
+   }
+  ],
+  "plan": [
+   {
+    "change": "Send phone frames as binary WebSocket messages: a small header (seq, w, h) followed by the JPEG bytes, sent with { binary: true } from the hub/http client. Add a client.sendFrame next to client.send, with the same 4 MB bufferedAmount guard. In web/js/core/live.js set binaryType='arraybuffer' and emit 'browser.frame' with the bytes. In web/js/views/browser.js change only draw() and onFrame() to build the Blob directly. As an interim or fallback, replace Uint8Array.from(atob, fn) with Uint8Array.fromBase64 when present, else an atob plus for-loop. Do not touch the pointer, touch or wheel handlers.",
+    "files": [
+     "server/http.js",
+     "server/hub.js",
+     "server/features/browser.js",
+     "web/js/core/live.js",
+     "web/js/views/browser.js",
+     "test/browser.test.js"
+    ],
+    "expectedGain": "On a slow phone, 20-50 ms less main-thread time per frame at TV size (6-11 ms at phone size). 33% fewer bytes on Wi-Fi. 2.6-9 ms less server stringify per phone per frame. Most of the about 60-90 ms long tasks go away. Measured: base64 24.6 ms goes to 0 ms, or 0.5-2 ms with the fallback.",
+    "risk": "Low-medium. It is a protocol change, but the web UI is served by the same server, so both ends ship together. browser.test.js currently reads frames from JSON and needs updating. A JSON fallback can be kept for old cached clients."
+   },
+   {
+    "change": "Pace Edge at the source in onScreencastFrame. Hold Page.screencastFrameAck instead of acking at once. Release one held ack (the oldest) about 20-25 ms before each fan-out slot, so Edge captures a fresh frame just in time. Release an extra token when a slot got no frame (heavy pages). Add a watchdog that acks anything held longer than about 250 ms, so the stream can never stall. Schedule slots from absolute times to avoid Windows timer drift.",
+    "files": [
+     "server/features/browser.js",
+     "test/browser.test.js"
+    ],
+    "expectedGain": "Edge CPU down about 90-100 points (measured 150% to 50-58%; browser process 95% to 15%) and Node down 10-15 points (measured 11-17% to 2-4%), with frame age at send about 24 ms vs 17 ms today. That leaves CPU for heavy pages and the VPN worker, and keeps the capture path from collapsing under contention.",
+    "risk": "Medium. A pacing bug would freeze the stream, so the watchdog and a test with an animated page and a static page are required. The CNN prototype dropped to 9.4-10.4 fps without the burst token, so tune and re-measure with pacing.mjs or e2e-bench.mjs."
+   },
+   {
+    "change": "Rework phone flow control. Ack on receipt rather than after paint: the client already keeps only the newest waiting frame, so stale frames are dropped client-side. Let each client have up to N=3 frames or about 300-400 KB in flight, whichever comes first. Track ack RTT and arrival throughput per client and set its fps target (15-30) from them. Expire outstanding acks after about 1.5 s, also ack frames whose draw failed, and move browser.ack out of the pointer rate bucket (or exempt it).",
+    "files": [
+     "server/features/browser.js",
+     "server/hub.js",
+     "web/js/views/browser.js"
+    ],
+    "expectedGain": "At 100-250 ms RTT, keep about 13-15+ fps instead of 10.8/5.8. On good Wi-Fi with phone-size frames (25-37 KB) allow 24-30 fps, which makes scrolling noticeably smoother. Also removes the permanent-freeze failure mode.",
+    "risk": "Medium. More bytes in flight on weak Wi-Fi, which the byte cap handles. Server and web must change together. Raising fps needs fix 2 first so Edge cost does not grow."
+   },
+   {
+    "change": "TV flow control. Add a 'screen-ack' from companion/agent/screen.js after the img onload, and let the server keep at most 1-2 unacked TV frames, always sending the newest. For agents without ack support, pace with ws.send's write callback (one frame queued at the socket at a time) and lower the bufferedAmount cap from 384 KB to about one frame (about 100 KB).",
+    "files": [
+     "server/adapters/agent.js",
+     "server/features/tvscreen.js",
+     "companion/agent/screen.js"
+    ],
+    "expectedGain": "TV staleness at 300 KB/s from 3.0 s p50 / 3.4 s p90 to about one frame time (about 0.2-0.4 s), and at 800 KB/s from p90 282 ms to under about 100 ms. TV pointer and click feedback becomes immediate. Throughput-bound fps is unchanged.",
+    "risk": "Medium. The ack part needs a TV agent rebuild and redeploy (next build >= 0.17.432 per the version ledger; follow the TV deploy rules). The callback/cap part is server-only and low risk."
+   },
+   {
+    "change": "Separate the streams for TV and phones. While the TV is attached, open a second CDP session on the same tab with its own Page.startScreencast for phones: maxWidth about the phone stage width x DPR, capped at 640-720 px, quality about 50, paced by the phone acks. The TV session stays at 1280x720 q60, paced by the TV. Keep the layout viewport at 1280x720 for the TV, and map phone input coordinates using the phone stream's own frame size (toViewport currently uses lastFrame).",
+    "files": [
+     "server/features/browser.js",
+     "server/features/tvscreen.js"
+    ],
+    "expectedGain": "With the TV on, phone messages go from 86-127 KB to about 25-40 KB, and decode plus base64 time drops about 3x (createImageBitmap 9.6 ms to 3.2 ms; with binary frames base64 is 0). Feasibility measured: two independent screencasts at 93 fps each on one tab.",
+    "risk": "Medium. Two encoders (cheap once pacing is in), input coordinate mapping per stream, and the frameSize() used by the AI click and tvscreen pointer must stay in TV-frame coordinates."
+   },
+   {
+    "change": "Adaptive quality and size caps per stream. Step quality down (60 to 50 to 40) or maxWidth down (1280 to 960) when a consumer's measured throughput falls below the target fps x frame size, and back up when it recovers. Keep the idle 5 fps.",
+    "files": [
+     "server/features/browser.js"
+    ],
+    "expectedGain": "About 45% fewer bytes per step (q60 1280x800 70 KB vs q40 960x600 38 KB), which keeps fps on weak Wi-Fi or a slow TV link.",
+    "risk": "Low. Visible quality changes. Needs hysteresis to avoid flapping."
+   },
+   {
+    "change": "Server micro-cleanups: decode base64 once per frame and share the Buffer between jpegSize and the TV sinks; skip jpegSize when metadata device size and pageScaleFactor are unchanged; build each frame message once rather than per client (moot after the binary change).",
+    "files": [
+     "server/features/browser.js"
+    ],
+    "expectedGain": "0.3-3 ms less Node main-thread time per frame for 120-250 KB frames.",
+    "risk": "Low."
+   }
+  ],
+  "benchmark": "All scripts are in C:/Users/pranj/AppData/Local/Temp/lumen-sc-bench (scratch, not in the repo). They import the repo from file:///C:/Users/pranj/source/lumen-remote/, start their own Lumen via test/helpers.js startStack on port 0 with allowLoopback, start their own headless Edge with a temp profile, and kill it afterwards. They never touch port 8790, the TV or the VPN. Check that the PC is quiet first (powershell \"(Get-Counter '\\Processor(_Total)\\% Processor Time').CounterSamples.CookedValue\"; other agents' Chromes skew results), and run each pair of before/after commands back to back.\n\ncd C:/Users/pranj/AppData/Local/Temp/lumen-sc-bench\n1) Phone fps, server queueing, Edge fps and Edge/Node CPU:\n   node e2e-bench.mjs --page anim --secs 12 --phones 0,30,80 --settle 5000 | node fmt2.mjs\n   Before (idle PC): Edge 93.6 fps, Edge CPU 72-188%, sent 14.4 fps, phones 14.4/14.4/11.9 fps.\n2) Sensitivity to the ack round trip:\n   node e2e-bench.mjs --page anim --secs 12 --phones 30 --rtt 100 | node fmt2.mjs  (before 10.8 fps)\n   node e2e-bench.mjs --page anim --secs 12 --phones 30 --rtt 250 | node fmt2.mjs  (before 5.8 fps)\n3) TV staleness with a slow TV:\n   node e2e-bench.mjs --page anim --secs 12 --phones 30 --tv 300 --settle 5000 | node fmt2.mjs\n   Before: send-to-receive p50 2966 ms, p90 3427 ms, 18 frames in flight.\n   Repeat with --tv 800 (before p90 282 ms) and --tv 0.\n4) Real web UI as a slow iPhone, with the TV attached (main-thread cost, glass-to-glass):\n   node ui-bench.mjs --page anim --secs 10 --throttle 4 --tv 0 | node fmt3.mjs\n   Before (idle PC): 1280x720, base64 19.6 ms, decode 10.6 ms, glass-to-glass 73/84/136 ms.\n   Also run: node ui-bench.mjs --page https://edition.cnn.com/ --scroll --settle 10000 --secs 10 --throttle 4 --tv 0 | node fmt3.mjs\n   Before: base64 33.7/54.7 ms, glass-to-glass 139/428/628 ms, 30 long tasks.\n5) Source pacing (standalone prototype; after fix 2, check the Edge CPU in benchmark 1):\n   node pacing.mjs anim 15 7 1280 720\n   node pacing.mjs https://edition.cnn.com/ 15 7 1280 720 scroll\n6) Micro-benchmarks:\n   node decode-micro.mjs 4\n   node server-micro.mjs\n   node cdp-probe.mjs --url anim --secs 6 --settle 1500 --configs q60w1280n1ack0,q60w1280n2ack0,q40w960n1ack0 | node fmt.mjs"
+ }
+}

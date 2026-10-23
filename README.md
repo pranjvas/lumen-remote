@@ -1,123 +1,70 @@
 # Lumen Remote
 
-A remote control and live dashboard for the Samsung QA55Q95T (2020, Tizen 5.5) at 192.168.1.2. It runs as a small Node server on this PC and is used from a browser at **http://127.0.0.1:8790**.
+A remote control, live dashboard and AI assistant for a Samsung QA55Q95T (2020, Tizen 5.5). Lumen runs as a small Node server on a Windows PC and is used from a browser: on the PC at **http://127.0.0.1:8790**, or on a phone on the same Wi-Fi.
 
-Every value on screen carries a badge saying where it came from:
-
-| Badge | Meaning |
-|---|---|
-| **LIVE** | read from the TV |
-| **TV AGENT** | read by the Lumen app on the TV |
-| **TRACKED** | set by Lumen or entered by you; the TV can't report it |
-| **STALE** | an old reading |
-| **UNAVAILABLE** | nothing can read it |
-
-## Run it
-
-```powershell
-cd C:\Users\pranj\source\lumen-remote
-npm start                     # then open http://127.0.0.1:8790
-```
-
-To start at sign-in, add a hidden Startup-folder shortcut:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-autostart.ps1          # add
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-autostart.ps1 -Remove  # remove
-```
-
-Only one copy runs at a time; a second start says "Lumen is already running". Logs go to `data/logs/`.
-
-### From a phone (same Wi-Fi)
-
-`data/config.json` has `{ "http": { "lanAccess": true } }`, so Lumen also serves **http://192.168.1.7:8790** to the home network.
-
-- There's no login, by the owner's choice: it's a private network.
-- Only the PC's LAN address and localhost are accepted as host names, and other websites can't drive it from a browser.
-- Over plain http on the LAN, phones can't use the voice button or install Lumen as an app. Everything else works.
-- Set `lanAccess` to `false` to go back to this-PC-only.
+Build, install and deploy steps for every part (server, TV agent, Lumen Eyes, VPN core) are in **[docs/BUILD-AND-DEPLOY.md](docs/BUILD-AND-DEPLOY.md)**.
 
 ## What it does
 
-### Views
-
-| View | What it does |
+| Area | What you get |
 |---|---|
-| **Remote** | D-pad ring with the TV's real volume as a glowing halo, which follows changes made with the physical remote. Volume rocker with the exact level and mute, channel rocker, Back / Home / TV Menu, power, an on-screen-now strip and input chips. |
-| **Settings** | Every picture and sound value read live from the TV: Brightness (backlight 0–50), contrast, shadow detail, sharpness, colour, tint, colour tone, local dimming, picture clarity, gamma, white balance, picture/sound mode, speaker, input. Changes are read back from the TV, and values blocked in a picture mode say "locked in this mode". Settings this firmware can't report (Game Mode, Eco, Auto Power Off, …) are tracked: tell Lumen once and it remembers. Device and Connection sections show firmware, inputs, system health and each channel's status. |
-| **Apps & Inputs** | The TV's own app list with its icons (from the TV agent), launch, connected-input dots, and names for your HDMI ports. |
-| **Mouse** | The TV's on-screen cursor. Phone: a trackpad (tap = click, two-finger tap or long press = right-click, two-finger drag = scroll). Desktop: press **U** or "Use this PC's mouse" to drive the TV cursor with your mouse (Esc releases). |
-| **Cast** | Paste a link: YouTube plays the video, Netflix/Prime open their app, media files play over DLNA, other pages open the TV browser. Or drop a file from this PC. Play / pause / seek while casting. |
-| **Keys, Touch & Text** | Number pad, colour keys, media keys, a swipe pad, and a text box that opens when the TV shows its keyboard. |
-| **Scenes** | One-tap bundles such as Night and Cinema, a sleep timer, and a key-macro recorder. |
+| **Remote** | D-pad, volume with the TV's real level, channels, Back / Home / Menu, power and Wake-on-LAN, inputs, number pad, colour and media keys, text entry, a trackpad for the TV pointer. |
+| **Live dashboard** | Every picture and sound setting read live from the TV and changeable; which app is on screen; firmware, inputs, network, Bluetooth; system health with **Free memory** (closes apps idling in the background). |
+| **Screen** | A live picture of what the TV shows, via Lumen Eyes. |
+| **Ask Lumen** | Natural-language control from any screen (header **Ask** button, ask bar, or the Ask view): "play Friends on Netflix", "cinema mode", "free up memory". It can see the TV screen, plays titles in any app using learned *app skills*, and finds which service has a title (JustWatch). Runs on the Claude Agent SDK. |
+| **Browser** | A full Chromium (Edge) on the PC, optionally behind Lumen's own WireGuard VPN, shown on the phone and **On TV**. Taps, swipes, the keyboard and a trackpad drive it; sign-in pop-ups work. On the TV it plays as **live video with sound** (1080p30, stepping down when needed) or as still frames. A page's video can be handed to the TV's own player: YouTube in the YouTube app, other streams through Lumen's relay with AVPlay / hls.js, DRM through the TV's own Widevine / PlayReady. |
+| **Cast** | Links and files from the PC: YouTube, Netflix titles, DLNA media, pages. |
+| **Scenes** | One-tap bundles (Night, Cinema), a sleep timer, key macros. |
 
-### Ask Lumen
+Every value on screen says where it came from: **LIVE** (read from the TV), **TV AGENT** (read by Lumen's app on the TV), **TRACKED** (set by Lumen or you; the TV can't report it), **STALE**, **UNAVAILABLE**.
 
-Natural-language commands from any view (Ctrl+K or `/`): "increase brightness", "cinema mode", "switch to HDMI 1", "sleep in 30 minutes", "play <video> on YouTube". It runs through the Claude Agent SDK on this PC's Claude Code login, with no API key, and uses your Claude plan. Anthropic doesn't allow claude.ai logins in products offered to others, so if Lumen is ever shared it must switch to an API key (`ANTHROPIC_API_KEY`).
+## Quick start
 
-Press **?** in the app for keyboard shortcuts.
+```powershell
+cd C:\Users\pranj\source\lumen-remote
+npm ci
+npm start                     # then open http://127.0.0.1:8790
+```
+
+First run: Settings → Connection → **Pair** (press **Allow** on the TV), then **Connect TV agent**. The TV agent and Lumen Eyes must be installed on the TV first; see [docs/BUILD-AND-DEPLOY.md](docs/BUILD-AND-DEPLOY.md).
+
+Only one copy runs at a time. Logs go to `data/logs/` (`lumen.log`, `stdout.log`).
 
 ## How it talks to the TV
 
 | Channel | Used for |
 |---|---|
 | Remote channel (wss 8002, paired as "Lumen Remote") | keys, text, pointer |
-| REST (8001) | power state, which app is in front, launches |
-| UPnP (9197) | volume/mute with live push, and DLNA cast |
+| REST (8001) | power state, which app is in front, launches, closing apps |
+| UPnP (9197) | volume/mute with live push, DLNA cast |
 | Samsung IP Control (https 1516, paired) | every picture and sound setting, input, power |
-| DIAL (8080) | YouTube/Netflix/Prime launches; needs the app's Origin header |
-| Lumen Agent on the TV (`lumenrmt01.LumenAgent` 0.2.0) | channel, firmware, connected inputs, app list and icons, captions, system health; it connects back to this PC on port 8791 |
+| DIAL (8080) | YouTube / Netflix / Prime launches |
+| **Lumen Agent** on the TV (`lumenrmt01.LumenAgent`) | app list and icons, channel, firmware, inputs, network; app-control launches (Netflix titles); the browser screen, live video and the TV's video player; connects back to the PC on port 8791 |
+| **Lumen Eyes** on the TV (`org.lumen.eyes`, Tizen .NET) | screen capture, Bluetooth, memory; connects back on port 8791 |
 
-Tokens and secrets live in `data/` (git-ignored). With `lanAccess` off, the web server only listens on 127.0.0.1. The port-8791 listener accepts only the TV's address and a secret.
+Tokens and secrets live in `data/` (git-ignored). Port 8791 only accepts the TV's address and a shared secret.
 
-### Pairing
+## Phones
 
-If a pairing is ever lost, Settings › Connection shows a **Pair** button. Press **Allow** on the TV prompt.
-
-### TV agent
-
-Rebuild and reinstall when this PC's address changes. The TV rejects lower versions, so bump the version in `companion/agent/config.xml` first.
-
-```powershell
-npm run agent:build                                              # signs with the Q95T profile
-wsl -d Ubuntu -u pv -- bash /mnt/c/Users/pranj/source/lumen-remote/tools/agent/install.sh
-```
-
-"Connect TV agent" in Settings starts it. Whatever app is in front goes to the background, and the TV returns to live TV when the agent hides. The TV may close the agent when memory runs low; just connect it again.
-
-### Live video of the Lumen browser on the TV
-
-With agent 0.8.1 or later, "On TV" plays Lumen's browser as live video with the page's sound, not still frames. Lumen's own Edge captures the page from a second tab and encodes it on this PC's GPU (H.264 with AAC audio). The TV agent plays the fragmented MP4 through MSE. About six fragments a second go to the TV, and no still frames while the video plays. The Q95T's web engine is slow, so the stream starts at 1080p30 and steps down to 720p30 and then 540p30 when the TV drops frames, stops reporting, or the Wi-Fi can't carry it. The bitrate also adapts within each step. A TV that stops reporting goes back to still frames. If the agent dies during live video, the next "On TV" starts a step lower. After two such deaths the TV stays on still frames until live video is turned on again. The PC stays silent. A sign-in pop-up, the TV's own video player and older agents use the still frames.
-
-- Off for good: set `"liveVideo": { "enabled": false }` in `data/config.json`. Turn it off or on just for now with the hub command `tvscreen.live {on:false|true}`. Turning it on also clears the record of agent deaths.
-- 4K experiment: `"liveVideo": { "maxHeight": 2160 }` lets the stream try 2160p30 (HEVC when the TV takes it) after 90 quiet seconds at 1080p30. It drops back for good at the first trouble.
-- Live state (step, codec, bitrate, sent kbit/s, TV lag): store key `tvscreen.live`.
-- Without the TV: `node tools/live-video-standin.mjs` runs the real agent page in a second headless Edge as a stand-in TV and measures latency and frame rate (`--throttle 6` slows its CPU like a weak TV). `node tools/live-video-check.mjs` writes the stream to an MP4.
-
-## Verified on the TV (21–22 Oct 2026) and known limits
-
-**Works:**
-- Keys and volume
-- Exact volume with live push
-- Every IP Control reading, plus a backlight write with read-back
-- Pointer over CineHD
-- YouTube video by DIAL
-- DLNA cast of a photo and of an H.264+AAC video from this PC
-- The TV agent
-- One real Ask Lumen command
-
-**Limits:**
-- Netflix opens on its home screen even with a title link; three launch formats were tried.
-- Sending a page to the TV browser opens the browser but not the URL.
-- Video-only MP4 clips are refused by the TV's player (`ERR_NOT_SUPPORTED_FORMAT`).
-- KEY_HDMI1–4 do nothing on this model; Lumen switches inputs through IP Control instead.
+With `{ "http": { "lanAccess": true } }` in `data/config.json`, Lumen also serves the UI on the PC's LAN address (e.g. `http://192.168.1.7:8790`). There is no login, by the owner's choice (private home network); only the PC's own addresses are accepted as host names, so other websites can't drive it. Over plain http the phone can't use the voice button or install Lumen as an app.
 
 ## Development
 
 ```powershell
-npm test                   # 147 tests against a mock TV, no real device involved
-npm run dev:stack          # mock TV + real server on http://127.0.0.1:8798
-node tools/screenshot.mjs --base http://127.0.0.1:8798   # headless Edge screenshots of every view
+npm test                    # ~350 tests against a mock TV and fake agents; no real device needed
+npm run dev:stack           # mock TV + real server on http://127.0.0.1:8798
+node tools/dev-ui.mjs       # the UI with fake data on http://127.0.0.1:8799
+node tools/screenshot.mjs --base http://127.0.0.1:8799   # headless Edge screenshots of every view
 ```
 
-Design and research: `docs/superpowers/specs/2026-10-21-lumen-remote-design.md`, `docs/research/`.
+`test/browser-vpn.test.js` can time out when the PC is heavily loaded; it passes on its own.
+
+Design, research and notes: `docs/design/2026-10-23-ux-pass.md`, `docs/superpowers/specs/2026-10-21-lumen-remote-design.md`, `docs/research/`, `docs/build-notes/`.
+
+## Known limits
+
+- The TV agent and Lumen Eyes need the TV in **developer mode** and a Samsung certificate; they rely on partner-level and undocumented TV features, so Lumen is a personal tool, not a store app.
+- Live video of the browser is new: on the Q95T the agent has dropped during long sessions; it falls back to still frames by itself.
+- Cloudflare's "verify you are human" refuses Lumen's headless browser; Google sign-in may do the same.
+- The VPN's DNS (Proton NetShield) blocks ad hosts; a few hosts with very large DNS answers fail inside the tunnel.
+- Ask Lumen uses this PC's Claude Code login. Anthropic doesn't allow claude.ai logins in products offered to others; a shared Lumen must use an API key (`ANTHROPIC_API_KEY`).

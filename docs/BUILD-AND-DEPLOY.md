@@ -1,0 +1,185 @@
+# Building and deploying Lumen
+
+Lumen has four parts. Each builds and deploys on its own:
+
+| Part | Where it runs | Source | Deployed by |
+|---|---|---|---|
+| **Server + web UI** | Windows PC (Node) | `server/`, `web/` | restarting the server |
+| **TV agent** (`lumenrmt01.LumenAgent`, web app) | the TV | `companion/agent/` | `tools/agent/build.ps1` + `tools/agent/install.sh` |
+| **Lumen Eyes** (`org.lumen.eyes`, Tizen .NET) | the TV | `companion/eyes/` | `tools/eyes/build.ps1` + `tools/eyes/install.sh` |
+| **VPN core** (WireGuard in WebAssembly, from CineHD) | the PC, inside the server | `server/vpn/third_party/wg-core/` | rebuilt rarely; ships with the server |
+
+The paths below are this PC's. Adjust them if your tools live elsewhere.
+
+---
+
+## 1. Prerequisites
+
+**On the PC (Windows 11):**
+- **Node.js 22+** and npm.
+- **Microsoft Edge** at `C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe` (Lumen's browser). Set `browser.edgePath` in `data/config.json` if it lives elsewhere.
+- **Claude Code**, logged in, for Ask Lumen. Without it, set `ANTHROPIC_API_KEY` to use the API instead, or Ask Lumen stays unavailable.
+- **ffmpeg** (optional; converts videos the TV can't play). Lumen looks in `data/bin/ffmpeg.exe`, then `PATH`, WinGet, Stremio's folder and Jellyfin's.
+- For the TV parts:
+  - **Tizen Studio CLI**: `C:\Users\pranj\Documents\Codex\Tools\TizenStudio10\tools\ide\bin\tizen.bat`.
+  - **A Samsung certificate profile** named `Q95T`, holding an author and a distributor certificate that includes the TV's DUID. Create it with Tizen Studio's Certificate Manager (Samsung certificate, TV, add the TV's DUID).
+  - **.NET 8 SDK**, for Lumen Eyes.
+  - **WSL Ubuntu** with the Tizen SDK's `sdb` at `/home/pv/cinehd-emulator-tests/linux55-20261008-offline-a/sdk/tools/sdb`. The install scripts use this one, because the Windows `sdb` can hang on a stale relay.
+
+**On the TV:**
+- **Developer mode on.** Open Apps, type `1 2 3 4 5` on the remote, switch Developer mode **On**, enter this PC's IP as the host, then restart the TV.
+- **Same network as the PC.** The TV's address goes in `data/config.json` → `tv.host` (default `192.168.1.2`).
+
+---
+
+## 2. The server and web UI
+
+### First install
+
+```powershell
+cd C:\Users\pranj\source\lumen-remote
+npm ci
+npm start                          # foreground; Ctrl+C stops it
+```
+
+Open http://127.0.0.1:8790, then:
+1. **Settings → Connection → Pair** (remote channel). Press **Allow** on the TV with the physical remote. `node tools/pair.mjs <tv-ip>` does the same from the command line.
+2. **Pair Samsung IP Control** from the same page, if it asks.
+3. **Connect TV agent** once the agent is installed (section 3).
+
+Everything Lumen keeps lives in `data/` (git-ignored): `config.json`, `tv.json` and `ipcontrol.json` (pairing tokens), `secrets.json` (the agent key), `vpn/` (the WireGuard config uploaded in the Browser view), the browser profile, AI threads, learned app skills, and logs.
+
+### `data/config.json`, the useful keys
+
+```json
+{
+  "tv": { "host": "192.168.1.2" },
+  "http": { "lanAccess": true },
+  "liveVideo": { "enabled": true, "maxHeight": 1080 },
+  "browser": { "maxFps": 24 },
+  "ai": { "backend": "auto" }
+}
+```
+
+- **`http.lanAccess`**: also serve the UI to phones on the LAN. There's no login (owner's choice).
+- **`liveVideo.enabled`**: `false` turns the browser's live video on the TV off; still frames are the fallback.
+- **`liveVideo.maxHeight`**: `2160` lets live video try 4K. The default is 1080.
+- All the defaults are in `server/config.js`.
+
+### Run at sign-in
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-autostart.ps1          # add
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-autostart.ps1 -Remove  # remove
+```
+
+The shortcut runs `node tools/start-hidden.js`, which starts the server with no window and appends its output to `data/logs/stdout.log`. The server runs at above-normal priority.
+
+### Deploying server or web changes
+
+The server reads `web/` into memory when it starts, so **any change to `server/` or `web/` needs a restart**:
+
+```powershell
+# stop the running server
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -match 'lumen-remote\\server\\index.js' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+# start it again, hidden
+node tools/start-hidden.js
+# check
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8790/api/health | Select-Object -Expand Content
+```
+
+- **Changes in `web/`:** bump `CACHE` in `web/sw.js` (`'lumen-shell-vN'`). Otherwise phones keep the old app; they pick up the new one after reloading once or twice.
+- **What a restart interrupts:** it closes Lumen's browser and the TV screen. Reopen **On TV** afterwards. The TV agent and Eyes reconnect by themselves.
+
+---
+
+## 3. The TV agent (`companion/agent`)
+
+The agent is a Tizen web app. It reads TV state, runs the browser screen, and plays live video and handed-off streams. It connects back to the PC on port 8791 with the key from `data/secrets.json`.
+
+**Rebuild and reinstall it** when its code changes, or when the PC's LAN address changes (the address is baked into the build).
+
+1. **Bump the version** in `companion/agent/config.xml` (`<widget … version="0.8.2">`). The TV refuses a version that isn't higher than the installed one.
+2. **Build and sign.** This writes `companion/agent/agent-config.json` (PC address, port, key, version) and produces `companion/build/LumenAgent.wgt`:
+   ```powershell
+   npm run agent:build             # = tools/agent/build.ps1, signs with the Q95T profile
+   ```
+3. **Install** through WSL's `sdb`. The script connects to the TV, pushes the package, installs it, and checks the installed version:
+   ```powershell
+   wsl bash /mnt/c/Users/pranj/source/lumen-remote/tools/agent/install.sh
+   ```
+   - It stops if another `sdb` client is busy (the CineHD pipelines share the connection). `LUMEN_SDB_FORCE=1` skips that check.
+   - `LUMEN_TV=<ip>:26101` targets another TV.
+4. **Start it:** Settings → **Connect TV agent**, or the hub command `agent.connect`. `data/logs/lumen.log` should show `agent connected {"version":"0.8.2"}`.
+
+Rules for agent code: the TV's engine is Chromium 69, so **no `?.`, `??` or other ES2020+ syntax** in `companion/agent/*.js`. `test/agent-live.test.js` guards this. Don't leave the agent in debug mode: its DevTools port is reachable from the LAN.
+
+---
+
+## 4. Lumen Eyes (`companion/eyes`)
+
+A windowless Tizen .NET app that captures the screen (through `libdisplay-capture-api`), reads Bluetooth and reports memory. The agent launches it with the PC's address; it connects to `ws://<pc>:8791/eyes`.
+
+1. **Bump the version** in both `companion/eyes/tizen-manifest.xml` and `const string Version` in `companion/eyes/Program.cs`.
+2. **Build and sign.** This runs `dotnet build -c Release` (Tizen.NET.Sdk from NuGet), re-signs with the `Q95T` profile, and produces `companion/build/LumenEyes.tpk`:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\eyes\build.ps1
+   ```
+3. **Install:**
+   ```powershell
+   wsl bash /mnt/c/Users/pranj/source/lumen-remote/tools/eyes/install.sh
+   ```
+4. **Check:** the next screen capture (Screen view, or `GET /api/screen.png`) starts it. The log shows `eyes connected {"version":…}`.
+
+---
+
+## 5. The VPN core (rarely)
+
+`server/vpn/third_party/wg-core/` is CineHD's WireGuard + lwIP core, compiled to WebAssembly. Lumen ships it pre-built; rebuild it only to change its limits (DNS table, TCP timers, stream counts).
+
+1. **Get the sources** into a scratch folder with `git archive` from the CineHD repo, at the commit recorded in `server/vpn/third_party/NOTICE.md`. **Never edit the CineHD checkout itself.**
+2. **Apply Lumen's `lwipopts.h` / mux changes**, all listed in NOTICE.md.
+3. **Build** with the Samsung Emscripten SDK **1.39.4.7 (fastcomp)**:
+   ```
+   node work/wg-tunnel/wasm/build.cjs --target node
+   ```
+4. **Copy the outputs** to `server/vpn/third_party/wg-core/`.
+5. **Re-apply Lumen's glue patch.** It's required after every rebuild: it turns the glue's busy-wait `poll` into a blocking one.
+   ```powershell
+   node tools/vpn/patch-wg-glue.cjs server/vpn/third_party/wg-core/wg-core.cjs
+   ```
+6. **Record the new hashes** in NOTICE.md and run `node --test test/vpn.test.js test/browser-vpn.test.js`.
+
+The VPN configuration itself is uploaded in the Browser view (**Use a config file…**) and stored in `data/vpn/`. Never commit it.
+
+---
+
+## 6. Release checklist
+
+1. `npm test`. Everything should pass. `browser-vpn` and a few Edge-driven tests can time out on a loaded PC; re-run those files on their own.
+2. If `companion/agent` changed: bump the version, build, install (section 3).
+3. If `companion/eyes` changed: bump both version strings, build, install (section 4).
+4. If `web/` changed: bump `CACHE` in `web/sw.js`.
+5. Restart the server (section 2) and check `/api/health`.
+6. On the TV:
+   - **Connect TV agent**, then **On TV** a page.
+   - Check `lumen.log` for `agent connected`, `eyes connected`, and (for live video) `live video playing on the TV`.
+   - Watch the store key `tvscreen.live` for the step, bitrate and lag.
+7. `git push -u origin master`.
+
+---
+
+## 7. Troubleshooting
+
+| Symptom | Likely cause and fix |
+|---|---|
+| "Lumen is already running" | Another server holds port 8790. Stop it (section 2) or use that one. |
+| Browser view: "Microsoft Edge did not start in time" | A leftover Edge still holds `data/browser-profile`, or the PC is overloaded. Lumen kills strays and retries once; otherwise press **Retry**. Check for leftover headless Edge or Chrome from test tools. |
+| TV agent offline | The TV closed it (memory, or another app in front). Use **Connect TV agent**. After reinstalling, it has to be started again. |
+| Eyes "did not connect" | Eyes was reinstalled or the TV restarted. The next capture relaunches it; check that the agent is online first. |
+| Live video falls back to still frames | The TV stopped reporting, or the agent dropped. See the `live video …` lines in `lumen.log`. `tvscreen.live {on:true}` clears the record of agent drops. `liveVideo.enabled:false` turns it off. |
+| Phone shows an old UI | Bump `CACHE` in `web/sw.js`, restart the server, and reload the phone twice. |
+| `install.sh` says another `sdb` client is active | A CineHD pipeline is using the TV. Wait, or set `LUMEN_SDB_FORCE=1`. |
+| High CPU on the PC | Usually leftover headless Edge or Chrome from test or screenshot runs. End the ones whose profile is under `%TEMP%`. |
