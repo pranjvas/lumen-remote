@@ -31,13 +31,19 @@ const SPECIAL_KEYS = {
   ' ': ['Space', 32, ' '],
 };
 
-// Runs in every new top-level document. Popups cannot be shown (there is one screencast), so new
-// windows open in the same page; title changes are reported through a binding (Edge's own
-// Target.targetInfoChanged can lag seconds behind a script-set title).
+// Runs in every new top-level document. New windows open in the same page, except sized pop-ups
+// (sign-in windows such as Google's pass width/height and need their opener): those open for real
+// and Lumen shows the pop-up while it lasts. Title changes are reported through a binding (Edge's
+// own Target.targetInfoChanged can lag seconds behind a script-set title).
 const TITLE_BINDING = '__lumenTitle';
 const PAGE_SCRIPT = `(() => {
   if (window !== top) return;
-  window.open = (url) => { if (url) location.assign(url); return null; };
+  const nativeOpen = window.open;
+  window.open = function (url, name, features) {
+    if (features && /width|height|popup/i.test(String(features))) return nativeOpen.call(window, url, name, features);
+    if (url) location.assign(url);
+    return null;
+  };
   addEventListener('click', (event) => {
     const link = event.target && event.target.closest ? event.target.closest('a[target]') : null;
     if (link && link.target && link.target !== '_self') link.target = '_self';
@@ -286,7 +292,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let devPort = null;
   let browser = null; // CDP connection to the browser target
   let browserPid = null;
-  let page = null; // CDP connection to the one tab
+  let page = null; // CDP connection to the tab on show: the page, or a pop-up while one is open
+  let mainPage = null; // the page itself while a pop-up is on show
+  let popup = null; // { id, cdp } a sized pop-up the page opened (a sign-in window)
+  let mainTargetId = null;
   let lastUserInput = 0;
   let mainFrameId = null;
   let titleFromPage = null; // the current document's title as reported by PAGE_SCRIPT
@@ -499,11 +508,16 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     pressed.clear();
     ready = false;
     const session = { proc: child, conn: browser, port: devPort, pid: browserPid };
-    const cdp = page;
+    const cdp = mainPage ?? page;
+    const popupCdp = popup?.cdp ?? null;
+    popup = null;
+    mainPage = null;
+    mainTargetId = null;
     child = null;
     browser = null;
     browserPid = null;
     page = null;
+    popupCdp?.close();
     devPort = null;
     mainFrameId = null;
     titleFromPage = null;
@@ -516,9 +530,64 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     clearPage();
   }
 
+  // ---------- pop-ups ----------
+
+  // The page opened a sized pop-up (a sign-in window): show it and send input to it until it closes.
+  async function openPopup(targetId, url = null) {
+    if (popup || !devPort || !page) return;
+    const owner = page;
+    const pcdp = await connectCdp(`ws://127.0.0.1:${devPort}/devtools/page/${targetId}`);
+    if (page !== owner || popup) { pcdp.close(); return; }
+    popup = { id: targetId, cdp: pcdp };
+    pcdp.onClose(() => onConnectionLost(pcdp));
+    pcdp.on('Page.screencastFrame', (params) => onScreencastFrame(params, pcdp));
+    pcdp.on('Page.frameNavigated', ({ frame }) => { if (!frame.parentId) refreshHistory(pcdp); });
+    pcdp.on('Page.loadEventFired', () => refreshHistory(pcdp));
+    pcdp.on('Page.javascriptDialogOpening', ({ type }) => {
+      pcdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
+    });
+    try {
+      await pcdp.send('Page.enable');
+      await pcdp.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+      const { userAgent } = await pcdp.send('Browser.getVersion');
+      if (/Headless/.test(userAgent)) await pcdp.send('Emulation.setUserAgentOverride', { userAgent: userAgent.replace(/Headless/g, '') });
+      await pcdp.send('Emulation.setDeviceMetricsOverride', metrics());
+      await pcdp.send('Page.startScreencast', screencastParams());
+    } catch (err) {
+      log.debug('pop-up could not be shown', { message: err.message });
+    }
+    if (popup?.cdp !== pcdp) return;
+    mainPage = owner;
+    page = pcdp;
+    pressed.clear();
+    publish('popup', true);
+    publish('title', 'Sign-in window');
+    if (url && url !== 'about:blank') publish('url', url);
+    refreshHistory(pcdp);
+    log.info('showing a pop-up window');
+  }
+
+  // The pop-up closed (or was closed): back to the page, with a fresh frame of it.
+  function closePopup() {
+    if (!popup) return;
+    const { cdp } = popup;
+    popup = null;
+    if (mainPage) page = mainPage;
+    mainPage = null;
+    pressed.clear();
+    cdp.close();
+    publish('popup', false);
+    if (page && ready) {
+      refreshHistory(page);
+      applyMetrics();
+    }
+    log.info('pop-up closed; back to the page');
+  }
+
   // Either CDP connection dropping while in use means Edge died or was closed from outside.
   function onConnectionLost(cdp) {
-    if (cdp !== page && cdp !== browser) return;
+    if (popup && cdp === popup.cdp) { closePopup(); return; }
+    if (cdp !== page && cdp !== mainPage && cdp !== browser) return;
     log.warn('the browser closed unexpectedly');
     teardown()
       .then(() => setSession(stopped ? 'off' : 'error', stopped ? null : 'The browser closed unexpectedly'))
@@ -615,6 +684,15 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       log.debug('browser process id unknown', { message: err.message });
     }
     const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' })).json();
+    mainTargetId = target.id;
+    // Pop-ups the page opens (sized windows, see PAGE_SCRIPT) are shown while they last.
+    conn.on('Target.targetCreated', ({ targetInfo }) => {
+      if (targetInfo.type === 'page' && targetInfo.openerId && targetInfo.openerId === mainTargetId) {
+        openPopup(targetInfo.targetId, targetInfo.url).catch((err) => log.debug('pop-up attach failed', { message: err.message }));
+      }
+    });
+    conn.on('Target.targetDestroyed', ({ targetId }) => { if (popup?.id === targetId) closePopup(); });
+    await conn.send('Target.setDiscoverTargets', { discover: true }).catch((err) => log.debug('pop-up discovery unavailable', { message: err.message }));
     const cdp = await connectCdp(target.webSocketDebuggerUrl);
     cdp.onClose(() => onConnectionLost(cdp));
     cdp.on('Page.screencastFrame', (params) => onScreencastFrame(params, cdp));
@@ -733,6 +811,11 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   async function open(input) {
     const url = validateUrl(input, { allowLoopback: !!config.browser?.allowLoopback });
+    // A new address goes to the page itself: a pop-up on show is closed first.
+    if (popup) {
+      await browser?.send('Target.closeTarget', { targetId: popup.id }).catch(() => {});
+      closePopup();
+    }
     lastUserInput = Date.now();
     await ensureRunning();
     const cdp = requireReady();
@@ -745,6 +828,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   async function nav(action) {
     lastUserInput = Date.now();
+    // Back (or Home) while a pop-up is on show closes the pop-up, as its window's close button would.
+    if (popup && (action === 'back' || action === 'home')) {
+      const { id } = popup;
+      await browser?.send('Target.closeTarget', { targetId: id }).catch(() => {});
+      closePopup();
+      return {};
+    }
     if (action === 'home') return open(HOME_URL);
     const cdp = requireReady();
     switch (action) {
