@@ -16,6 +16,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Tizen.Applications;
+using Tizen.Network.Bluetooth;
 
 namespace LumenEyes
 {
@@ -28,7 +29,7 @@ namespace LumenEyes
 
     class App : CoreUIApplication
     {
-        const string Version = "0.2.0";
+        const string Version = "0.3.0";
         const int BufSize = 0x7e900;              // the library's own buffer size; frames come back at 720x540
         const int GiveUpAfterMs = 10 * 60 * 1000; // exit when Lumen has been unreachable this long
         static readonly Regex LumenUrl = new Regex(@"^ws://[0-9.]{7,15}:\d{1,5}/eyes\?key=[0-9a-f]{16,128}$");
@@ -95,6 +96,7 @@ namespace LumenEyes
                             string type = Field(msg, "t");
                             if (type == "bye") { Exit(); return; }
                             if (type == "capture") await Capture(ws, Field(msg, "id"), Number(Field(msg, "mode"), 0), token);
+                            if (type == "bluetooth") await SendText(ws, BluetoothJson(Field(msg, "id")), token);
                         }
                     }
                 }
@@ -146,6 +148,41 @@ namespace LumenEyes
             Marshal.Copy(yp == IntPtr.Zero ? ybuf : yp, frame, 4 + header.Length, ySize);
             Marshal.Copy(cp == IntPtr.Zero ? cbuf : cp, frame, 4 + header.Length + ySize, cSize);
             await ws.SendAsync(new ArraySegment<byte>(frame), WebSocketMessageType.Binary, true, token);
+        }
+
+        // The TV's Bluetooth adapter and bonded devices (TV web apps have no Bluetooth API; .NET does).
+        static string BluetoothJson(string id)
+        {
+            var sb = new StringBuilder("{\"t\":\"bluetooth\",\"id\":" + Quote(id ?? "") + ",");
+            try
+            {
+                bool on = BluetoothAdapter.IsBluetoothEnabled;
+                sb.Append("\"ok\":true,\"powered\":" + (on ? "true" : "false"));
+                string name = null;
+                try { name = BluetoothAdapter.Name; } catch (Exception) { }
+                if (name != null) sb.Append(",\"name\":" + Quote(name));
+                sb.Append(",\"devices\":[");
+                if (on)
+                {
+                    int n = 0;
+                    foreach (var d in BluetoothAdapter.GetBondedDevices())
+                    {
+                        if (n++ >= 20) break;
+                        if (n > 1) sb.Append(',');
+                        string kind = "";
+                        try { kind = d.Class.MajorDeviceClassType.ToString(); } catch (Exception) { }
+                        bool connected = false;
+                        try { connected = d.IsConnected; } catch (Exception) { }
+                        sb.Append("{\"name\":" + Quote(d.Name ?? "") + ",\"connected\":" + (connected ? "true" : "false") + ",\"bonded\":true,\"kind\":" + Quote(kind) + "}");
+                    }
+                }
+                sb.Append("]}");
+            }
+            catch (Exception ex)
+            {
+                sb.Append("\"ok\":false,\"error\":" + Quote(ex.GetType().Name + ": " + ex.Message) + "}");
+            }
+            return sb.ToString();
         }
 
         static Task SendText(ClientWebSocket ws, string text, CancellationToken token) =>

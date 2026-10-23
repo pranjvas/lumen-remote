@@ -16,6 +16,8 @@ const GROUPS = [
   { id: 'sound', title: 'Sound', short: 'Sound' },
   { id: 'input', title: 'Input & Source', short: 'Input' },
   { id: 'general', title: 'General', short: 'General', note: 'This firmware has no API for these. Tell Lumen what the TV shows once, and it keeps track.' },
+  { id: 'network', title: 'Network', short: 'Network', note: 'Read from the TV by the Lumen agent.' },
+  { id: 'bluetooth', title: 'Bluetooth', short: 'Bluetooth', note: 'Read by Lumen Eyes (the native helper app on the TV) when you open Settings. Pair or remove devices in the TV menu (Settings → Connection).' },
   { id: 'device', title: 'Device', short: 'Device' },
   { id: 'connection', title: 'Connection', short: 'Connection' },
 ];
@@ -92,6 +94,8 @@ export function mountSettings(root, ctx) {
       let rows;
       if (g.id === 'device') rows = deviceRows(ctx, scope, byGroup.get('device') || []);
       else if (g.id === 'connection') rows = connectionRows(ctx, scope);
+      else if (g.id === 'network') rows = networkRows(ctx, scope);
+      else if (g.id === 'bluetooth') rows = bluetoothRows(ctx, scope);
       else rows = (byGroup.get(g.id) || []).map((s) => settingRow(ctx, s, scope));
       if (g.id === 'sound') rows.unshift(...soundExtras(ctx, scope));
       if (!rows.length) continue;
@@ -583,4 +587,52 @@ function connActions(ctx, key, v) {
     return [b];
   }
   return [];
+}
+
+/* ---------- Network and Bluetooth (agent 0.6.3+), read-only ---------- */
+
+function infoRow(ctx, scope, key, label, hint, format) {
+  const text = h('span', { class: 'row-text' });
+  const row = rowShell({ key, label, hint, type: 'readonly' }, text);
+  scope.watch([key], () => {
+    const v = ctx.state.value(key, null);
+    const shown = v == null ? null : format(v);
+    fill(text, shown == null || shown === '' ? h('span', { class: 'muted', text: '—' }) : shown);
+  });
+  return row;
+}
+
+function networkRows(ctx, scope) {
+  const typeName = { WIFI: 'Wi-Fi', ETHERNET: 'Ethernet (cable)', NONE: 'Not connected' };
+  const signal = (s) => (typeof s === 'number' ? `${Math.round(s * 100)}%` : null);
+  return [
+    infoRow(ctx, scope, 'network.type', 'Connection', 'How the TV reaches your network', (v) => typeName[v] || v),
+    infoRow(ctx, scope, 'network.wifi', 'Wi-Fi', 'Network name and signal', (w) => (w.status === 'ON' || w.ssid
+      ? [statusDot(w.ssid ? 'good' : 'warn'), w.ssid || 'On, not joined', signal(w.signal) ? h('span', { class: 'mono muted', text: ` · signal ${signal(w.signal)}` }) : null]
+      : [statusDot('off'), 'Off'])),
+    infoRow(ctx, scope, 'network.wifi', 'IP address', 'Wi-Fi', (w) => (w.ip ? h('span', { class: 'mono', text: w.ip }) : null)),
+    infoRow(ctx, scope, 'network.wifi', 'Gateway · DNS', 'Wi-Fi', (w) => (w.gateway || w.dns ? h('span', { class: 'mono', text: [w.gateway, w.dns].filter(Boolean).join(' · ') }) : null)),
+    infoRow(ctx, scope, 'network.wifi', 'Wi-Fi MAC', null, (w) => (w.mac ? h('span', { class: 'mono', text: w.mac }) : null)),
+    infoRow(ctx, scope, 'network.ethernet', 'Ethernet', 'Cable and address', (e) => [statusDot(e.cable === 'ATTACHED' ? 'good' : 'off'),
+      e.cable === 'ATTACHED' ? 'Cable connected' : 'No cable', e.ip ? h('span', { class: 'mono muted', text: ` · ${e.ip}` }) : null]),
+  ];
+}
+
+function bluetoothRows(ctx, scope) {
+  const KIND = { AudioVideo: 'Audio', Peripheral: 'Remote or input device', Phone: 'Phone', Computer: 'Computer', Wearable: 'Wearable', Toy: 'Toy', Health: 'Health', Imaging: 'Camera or printer' };
+  const adapter = infoRow(ctx, scope, 'bluetooth.state', 'Bluetooth', 'The TV’s adapter', (b) => [statusDot(b.powered ? 'good' : 'off'),
+    b.powered === false ? 'Off' : 'On', b.name ? h('span', { class: 'muted', text: ` · ${b.name}` }) : null]);
+  const list = h('div', { class: 'bt-devices' });
+  const devices = h('div', { class: 'row row-readonly' },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Paired devices' }), h('span', { class: 'hint', text: 'Connected ones first' })),
+    h('div', { class: 'row-control' }, list), h('div', { class: 'row-badge' }, badge('bluetooth.state', { compact: true })));
+  scope.watch(['bluetooth.state'], () => {
+    const b = ctx.state.value('bluetooth.state', null);
+    const items = (b?.devices ?? []).slice().sort((x, y) => (y.connected - x.connected) || x.name.localeCompare(y.name));
+    fill(list, ...(items.length ? items.map((d) => h('div', { class: 'bt-device' },
+      statusDot(d.connected ? 'good' : 'off'), h('span', { text: d.name }),
+      h('span', { class: 'muted', text: ` · ${d.connected ? 'Connected' : 'Paired'}${KIND[d.kind] ? ` · ${KIND[d.kind]}` : ''}` })))
+      : [h('span', { class: 'muted', text: b ? 'No paired devices' : '—' })]));
+  });
+  return [adapter, devices];
 }

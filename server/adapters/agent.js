@@ -307,6 +307,23 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
       store.set('device.panel', `${snap.panel.w}x${snap.panel.h}`, { src: 'agent', via: 'agent:panel' });
     }
 
+    // Network and Bluetooth (agent 0.6.3+): read-only facts for Settings.
+    if (snap.network && typeof snap.network === 'object') {
+      const n = snap.network;
+      const pick = (o, fields) => (o && typeof o === 'object' ? Object.fromEntries(fields.map((f) => [f, typeof o[f] === 'number' ? o[f] : str(o[f], 80)])) : null);
+      put('network.type', str(n.type, 20), 'network');
+      store.set('network.wifi', pick(n.wifi, ['status', 'ssid', 'ip', 'signal', 'gateway', 'dns', 'mac']), meta('network'));
+      store.set('network.ethernet', pick(n.ethernet, ['status', 'cable', 'ip', 'gateway', 'dns', 'mac']), meta('network'));
+    }
+    // TV web apps get no Bluetooth API on this firmware (null); Lumen Eyes (.NET) reports it instead.
+    if (snap.bluetooth && typeof snap.bluetooth === 'object') {
+      const bt = snap.bluetooth;
+      store.set('bluetooth.state', bt && typeof bt === 'object' ? {
+        name: str(bt.name, 60), powered: typeof bt.powered === 'boolean' ? bt.powered : null,
+        devices: Array.isArray(bt.devices) ? bt.devices.slice(0, 20).map((d) => ({ name: str(d?.name, 60) ?? 'Unnamed device', bonded: d?.bonded === true, connected: d?.connected === true, kind: str(d?.kind, 30) })) : null,
+      } : null, meta('bluetooth'));
+    }
+
     const system = snap.system && typeof snap.system === 'object' ? snap.system : {};
     const cpuLoad = num(system.cpuLoad);
     if (cpuLoad !== null) put('system.cpuLoad', Math.min(1, Math.max(0, cpuLoad)), 'system.cpuLoad', { range: [0, 1] });

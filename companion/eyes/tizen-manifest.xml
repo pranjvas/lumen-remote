@@ -1,10 +1,11 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<manifest package="org.lumen.eyes" version="0.2.0" api-version="5.5" xmlns="http://tizen.org/ns/packages">
+<manifest package="org.lumen.eyes" version="0.3.0" api-version="5.5" xmlns="http://tizen.org/ns/packages">
   <profile name="tv" />
   <ui-application appid="org.lumen.eyes" exec="LumenEyes.dll" multiple="false" nodisplay="true" taskmanage="false" type="dotnet" launch_mode="single">
     <label>Lumen Eyes</label>
   </ui-application>
   <privileges>
     <privilege>http://tizen.org/privilege/internet</privilege>
+    <privilege>http://tizen.org/privilege/bluetooth</privilege>
   </privileges>
 </manifest>

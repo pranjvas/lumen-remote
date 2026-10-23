@@ -736,6 +736,11 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return { value: res.value ?? res };
     },
 
+    'bluetooth.refresh': async () => {
+      requireTvOn();
+      return { value: await call('eyes', 'bluetooth') };
+    },
+
     // One still of the TV screen via Lumen Eyes; the PNG is served at /api/screen.png.
     'screen.capture': async ({ mode }) => {
       requireTvOn();

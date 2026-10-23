@@ -960,3 +960,7 @@
 @media (max-width: 700px) {
   .browser-vpn-text { white-space: normal; overflow-wrap: anywhere; }
 }
+
+/* Settings: Bluetooth devices */
+.bt-devices { display: flex; flex-direction: column; gap: 6px; }
+.bt-device { display: flex; align-items: center; gap: 6px; }

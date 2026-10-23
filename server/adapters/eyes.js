@@ -33,6 +33,8 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   let watchEveryMs = 0; // the Screen view's cadence (hub setDemand); 0 = nobody is watching
   let watchTimer = null;
   let watchBusy = false;
+  const btPending = new Map(); // id → { resolve, timer }
+  let btAt = 0;
 
   function setConn(state) {
     store.set('conn.eyes', state, { src: 'derived', via: 'eyes:link' });
@@ -98,6 +100,9 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
       log.info('eyes connected', { version });
       for (const resolve of waiters) resolve();
       waiters.clear();
+    } else if (msg?.t === 'bluetooth') {
+      const entry = btPending.get(String(msg.id));
+      if (entry) { btPending.delete(String(msg.id)); clearTimeout(entry.timer); entry.resolve(msg); }
     } else if (msg?.t === 'frame' && msg.ok === false) {
       settle(String(msg.id), null, new LumenError('FAILED', `The TV could not capture the screen: ${String(msg.error ?? 'unknown').slice(0, 120)}`));
     }
@@ -212,6 +217,35 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     return queue.push(() => captureOnce(mode, timeoutMs));
   }
 
+  // ---- Bluetooth (TV web apps have no Bluetooth API; Eyes reads it through Tizen .NET) ----
+
+  /** Reads the TV's Bluetooth adapter and paired devices into bluetooth.state. */
+  async function bluetooth() {
+    await ensureOnline();
+    const id = randomUUID();
+    const msg = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', 'Lumen Eyes did not answer about Bluetooth')); }, 8000);
+      btPending.set(id, { resolve, timer });
+      active.send(JSON.stringify({ t: 'bluetooth', id }));
+    });
+    btAt = Date.now();
+    if (msg.ok === false) {
+      log.info('bluetooth read failed', { error: String(msg.error ?? '').slice(0, 120) });
+      throw new LumenError('UNAVAILABLE', `The TV did not report Bluetooth: ${String(msg.error ?? '').slice(0, 80)}`);
+    }
+    const value = {
+      name: typeof msg.name === 'string' ? msg.name.slice(0, 60) : null,
+      powered: msg.powered === true,
+      devices: Array.isArray(msg.devices) ? msg.devices.slice(0, 20).map((d) => ({
+        name: typeof d?.name === 'string' && d.name ? d.name.slice(0, 60) : 'Unnamed device',
+        connected: d?.connected === true, bonded: d?.bonded !== false,
+        kind: typeof d?.kind === 'string' ? d.kind.replace(/[^A-Za-z_]/g, '').slice(0, 30) : null,
+      })) : [],
+    };
+    store.set('bluetooth.state', value, { src: 'live', via: 'eyes:bluetooth', ttlMs: 10 * 60 * 1000 });
+    return value;
+  }
+
   // ---- watching (the Screen view) ----
 
   function setError(err) {
@@ -245,7 +279,12 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   }
 
   // hub presence: screenEveryMs > 0 while a visible client shows the Screen view.
-  function setDemand({ screenEveryMs = 0 } = {}) {
+  function setDemand({ screenEveryMs = 0, views } = {}) {
+    // Settings shows Bluetooth: refresh it when someone opens Settings, at most once a minute.
+    if (views?.has?.('settings') && Date.now() - btAt > 60000) {
+      btAt = Date.now();
+      bluetooth().catch((err) => log.debug('bluetooth refresh failed', { message: err.message }));
+    }
     const next = Number.isInteger(screenEveryMs) && screenEveryMs > 0 ? screenEveryMs : 0;
     if (next === watchEveryMs) return;
     watchEveryMs = next;
@@ -281,6 +320,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
       for (const client of wss.clients) client.terminate();
     },
     capture,
+    bluetooth,
     latest: () => latest,
     status: () => ({ online: online(), version, lastCaptureAt: latest?.at ?? null }),
   };

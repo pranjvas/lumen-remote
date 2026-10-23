@@ -150,8 +150,10 @@
 
   // The asynchronous systeminfo part, refreshed with every periodic state.
   async function readSlow() {
-    const values = await Promise.all(['BUILD', 'PANEL', 'CPU', 'STORAGE', 'VIDEOSOURCE'].map(property));
+    const values = await Promise.all(['BUILD', 'PANEL', 'CPU', 'STORAGE', 'VIDEOSOURCE', 'NETWORK', 'WIFI_NETWORK', 'ETHERNET_NETWORK'].map(property));
     const build = values[0], panel = values[1], cpu = values[2], storage = values[3], video = values[4];
+    const net = values[5], wifi = values[6], eth = values[7];
+    const bt = await readBluetooth();
     const units = storage && Array.isArray(storage.units)
       ? storage.units.filter(function (u) { return u.type === 'INTERNAL'; })
       : [];
@@ -169,8 +171,38 @@
         memTotal: read(function () { return tizen.systeminfo.getTotalMemory(); }, null),
         storageFree: sum('availableCapacity'),
         storageTotal: sum('capacity')
-      }
+      },
+      network: {
+        type: (net && net.networkType) || null,
+        wifi: wifi ? { status: wifi.status || null, ssid: wifi.ssid || null, ip: wifi.ipAddress || null, signal: typeof wifi.signalStrength === 'number' ? wifi.signalStrength : null,
+          gateway: wifi.gateway || null, dns: wifi.dns || null, mac: wifi.macAddress || null } : null,
+        ethernet: eth ? { status: eth.status || null, cable: eth.cable || null, ip: eth.ipAddress || null, gateway: eth.gateway || null, dns: eth.dns || null, mac: eth.macAddress || null } : null
+      },
+      bluetooth: bt
     };
+  }
+
+  // The TV's Bluetooth adapter and its paired devices (headphones, soundbars, remotes).
+  function readBluetooth() {
+    return new Promise(function (resolve) {
+      const adapter = read(function () { return tizen.bluetooth.getDefaultAdapter(); }, null);
+      if (!adapter) return resolve(null);
+      const base = { name: read(function () { return adapter.name; }, null), powered: read(function () { return adapter.powered; }, null), devices: null };
+      const timer = setTimeout(function () { resolve(base); }, PROPERTY_TIMEOUT_MS);
+      try {
+        adapter.getKnownDevices(function (devices) {
+          clearTimeout(timer);
+          base.devices = (devices || []).slice(0, 20).map(function (d) {
+            return { name: String(d.name || '').slice(0, 60), bonded: d.isBonded === true, connected: d.isConnected === true,
+              kind: read(function () { return d.deviceClass.major; }, null) };
+          });
+          resolve(base);
+        }, function () { clearTimeout(timer); resolve(base); });
+      } catch (e) {
+        clearTimeout(timer);
+        resolve(base);
+      }
+    });
   }
 
   function snapshotWith(fast) {
