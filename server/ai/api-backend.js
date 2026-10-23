@@ -8,8 +8,8 @@ import { SYSTEM_PROMPT } from './prompt.js';
 import { TOOL_DEFINITIONS, callTool, describeInput, describeResult } from './tools.js';
 
 const MAX_TOKENS = 16000;
-const TIMEOUT_MS = 60_000;
-const MAX_ITERATIONS = 10;
+const TIMEOUT_MS = 360_000; // room for a look-press-look loop inside an app
+const MAX_ITERATIONS = 60;
 const WEB_SEARCH = { type: 'web_search_20260209', name: 'web_search', max_uses: 3 };
 const BETAS = ['server-side-fallback-2026-07-01'];
 
@@ -96,7 +96,11 @@ export function createApiBackend({ config, log, client }) {
         tools.push({ name: definition.name, ok });
         emit({ kind: 'tool', name: definition.name, input: describeInput(input), ok, result: describeResult(out.result) });
         if (!ok) throw new ToolError(out.text);
-        return out.text;
+        if (!out.images?.length) return out.text;
+        return [
+          { type: 'text', text: out.text },
+          ...out.images.map(({ data, mimeType }) => ({ type: 'image', source: { type: 'base64', media_type: mimeType, data } })),
+        ];
       },
     }));
 

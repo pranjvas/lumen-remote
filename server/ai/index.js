@@ -17,9 +17,9 @@ const SDK_NOTE = 'Uses your Claude Code login (personal use)';
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 // backends: { api?, agentSdk? } replaces the real ones (tests).
-export function createAi({ config, data, log, store, hub, backends }) {
+export function createAi({ config, data, log, store, hub, adapters, backends }) {
   const logger = log.child('ai');
-  const toolContext = { hub, store, catalog: { settings: SETTINGS, keys: KEYS, apps: APPS, isAllowedKey } };
+  const toolContext = { hub, store, eyes: adapters?.eyes, catalog: { settings: SETTINGS, keys: KEYS, apps: APPS, isAllowedKey } };
   const api = backends?.api ?? createApiBackend({ config, log });
   const agentSdk = backends?.agentSdk ?? createAgentSdkBackend({ config, log, dataDir: config.dataDir ?? data.dir });
   const runs = new Map();

@@ -351,6 +351,7 @@ export function connectAgent({
     sendState: (snap) => send({ t: 'state', snapshot: snap }),
     sendEvent: (kind, value) => send({ t: 'event', kind, value }),
     waitForRequest: (type, timeout = 5000) => waitFor(() => requests.find((r) => r.type === type), { timeout, message: `agent request ${type}` }),
+    onRequest: (fn) => listeners.add(fn),
     close: () => ws.terminate(),
   };
 }

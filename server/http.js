@@ -1,5 +1,5 @@
 // Browser-facing server on 127.0.0.1 (spec §3.3): static UI from an in-memory map, /api/health,
-// /api/icon/<appId>, POST /api/cast/upload, /mcp (loopback only) and the WebSocket /live.
+// /api/icon/<appId>, /api/screen.png, POST /api/cast/upload, /mcp (loopback only) and the WebSocket /live.
 // Host and Origin allowlists (built from the bound port) guard every request and upgrade.
 import http from 'node:http';
 import { discoverLanAddress } from './lan.js';
@@ -176,6 +176,7 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
     }
     if (pathname === '/api/health') return health(req, res);
     if (pathname.startsWith('/api/icon/')) return icon(req, res, pathname.slice('/api/icon/'.length));
+    if (pathname === '/api/screen.png') return screen(req, res);
     if (pathname === '/api/cast/upload') return upload(req, res);
     if (pathname === '/api/vpn/config') return vpnConfig(req, res);
     if (pathname === '/mcp') return mcp(req, res);
@@ -218,6 +219,20 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
       'Cache-Control': 'private, max-age=86400',
     });
     res.end(req.method === 'HEAD' ? undefined : found.buffer);
+  }
+
+  // The latest still of the TV screen from Lumen Eyes (taken by the screen.capture command or the AI).
+  function screen(req, res) {
+    if (!readOnly(req, res)) return;
+    const latest = adapters.eyes?.latest?.();
+    if (!latest?.png) return reply(res, 404, 'Not found');
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'Content-Type': 'image/png',
+      'Content-Length': latest.png.length,
+      'Cache-Control': 'no-store',
+    });
+    res.end(req.method === 'HEAD' ? undefined : latest.png);
   }
 
   // "Use a config file" for the VPN: the .conf text in the body (same-origin, CSRF header, 8 KB max).

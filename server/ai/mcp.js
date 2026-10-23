@@ -62,7 +62,8 @@ export function createMcpHandler({ getToken, toolContext, log }) {
         if (typeof name !== 'string' || !hasTool(name)) return rpcError(id, -32602, `Unknown tool: ${name}`);
         const out = await callTool(name, params.arguments ?? {}, toolContext);
         log.info(`tool ${name}`, { ok: !out.isError, summary: describeResult(out.result) });
-        return result(id, { content: [{ type: 'text', text: out.text }], ...(out.isError && { isError: true }) });
+        const images = (out.images ?? []).map(({ data, mimeType }) => ({ type: 'image', data, mimeType }));
+        return result(id, { content: [{ type: 'text', text: out.text }, ...images], ...(out.isError && { isError: true }) });
       }
       default:
         return rpcError(id, -32601, `Method not found: ${method}`);

@@ -12,6 +12,7 @@ import { createRemote } from './adapters/remote.js';
 import { createUpnp } from './adapters/upnp.js';
 import { createIpControl } from './adapters/ipcontrol.js';
 import { createAgent } from './adapters/agent.js';
+import { createEyes } from './adapters/eyes.js';
 import { createWol } from './adapters/wol.js';
 import { createAvTransport } from './adapters/avtransport.js';
 import { createDial } from './adapters/dial.js';
@@ -85,7 +86,8 @@ export async function startServer(overrides = {}, seams = {}) {
     const wol = createWol(ctx);
     const avtransport = createAvTransport(ctx);
     const dial = createDial(ctx);
-    const adapters = { rest, remote, upnp, ipc, agent, wol, avtransport, dial };
+    const eyes = createEyes({ ...ctx, agent: () => agent });
+    const adapters = { rest, remote, upnp, ipc, agent, eyes, wol, avtransport, dial };
 
     const features = {
       vpn: createVpn(ctx),
@@ -130,6 +132,7 @@ export async function startServer(overrides = {}, seams = {}) {
       agentKey: config.secrets.agentKey,
       store,
       hub,
+      adapters, // tests reach adapters.eyes (look_at_screen) through this
       features, // tests reach features.browser.evaluate (spec §11.3) through this
       config,
       log,

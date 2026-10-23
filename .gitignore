@@ -11,3 +11,6 @@ docs/screenshots/stack/
 docs/screenshots/mouse/
 # Go WireGuard test peer (14 MB build output; source in test/fixtures/vpn/testpeer-src)
 test/fixtures/vpn/bin/
+# Lumen Eyes (.NET) build output
+companion/eyes/bin/
+companion/eyes/obj/

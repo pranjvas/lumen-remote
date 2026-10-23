@@ -14,10 +14,10 @@ import { VERSION } from '../config.js';
 import { SYSTEM_PROMPT } from './prompt.js';
 import { TOOL_DEFINITIONS, callTool, describeInput, describeResult } from './tools.js';
 
-const TIMEOUT_MS = 90_000;
+const TIMEOUT_MS = 360_000; // room for a look-press-look loop inside an app
 const AUTH_STATUS_TIMEOUT_MS = 10_000;
 const LOGIN_CACHE_MS = 10 * 60_000;
-const MAX_TURNS = 12;
+const MAX_TURNS = 60;
 const SERVER_NAME = 'lumen';
 const MCP_PREFIX = `mcp__${SERVER_NAME}__`;
 const BUILTIN_TOOLS = ['WebSearch', 'WebFetch'];
@@ -269,7 +269,8 @@ export function createAgentSdkBackend({ config, log, dataDir, query = sdkQuery, 
       toZodShape(definition.inputSchema),
       async (args) => {
         const out = await callTool(definition.name, args, { ...toolContext, signal });
-        return { content: [{ type: 'text', text: out.text }], ...(out.isError && { isError: true }) };
+        const images = (out.images ?? []).map(({ data, mimeType }) => ({ type: 'image', data, mimeType }));
+        return { content: [{ type: 'text', text: out.text }, ...images], ...(out.isError && { isError: true }) };
       },
     ));
   }

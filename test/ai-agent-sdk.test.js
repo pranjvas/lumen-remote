@@ -187,7 +187,7 @@ describe('agent-sdk: query options and event mapping (fake query, no Claude)', (
     assert.equal(options.persistSession, false);
     assert.equal(options.strictMcpConfig, true);
     assert.equal(options.verbatimPrompts, true);
-    assert.equal(options.maxTurns, 12);
+    assert.equal(options.maxTurns, 60);
     assert.equal(options.model, 'claude-opus-5-5');
     assert.equal(options.effort, 'low');
     assert.ok(options.abortController instanceof AbortController);

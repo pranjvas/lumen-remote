@@ -624,6 +624,29 @@ const TOOLS = [
       return { ok: true, summary: `Typed ${clean.length} characters${submit ? ' and submitted' : ''}` };
     },
   },
+  {
+    name: 'look_at_screen',
+    description: 'See the TV screen right now: returns a picture of it (video plus any menus, apps and on-screen keyboards, 16:9, about 960x540). Use it to learn where you are in an app, read lists and buttons, find what is focused, and check that your last action worked. Screens animate, so after pressing keys pass waitMs (about 800) before looking.',
+    inputSchema: object({
+      waitMs: { type: 'integer', minimum: 0, maximum: 5000, description: 'Wait this long before capturing (let the screen settle)' },
+    }),
+    async run({ waitMs = 0 }, { hub, store, eyes, signal }) {
+      if (isCineHd(foregroundApp(store))) fail('CineHD is open. Lumen does not look inside CineHD.', 'UNAVAILABLE');
+      if (!eyes?.latest) fail('Seeing the screen is not available', 'UNAVAILABLE');
+      if (waitMs) await sleep(waitMs);
+      if (signal?.aborted) fail('Cancelled', 'CANCELLED');
+      const shot = await send(hub, { cmd: 'screen.capture' });
+      const latest = eyes.latest();
+      if (!latest?.png || latest.at !== shot.at) fail('The screen capture went missing');
+      const app = foregroundApp(store);
+      return {
+        ok: true,
+        summary: `Looked at the screen (${shot.width}x${shot.height})`,
+        foregroundApp: app ? { id: app.id ?? null, name: app.name ?? null } : null,
+        image: { data: latest.png.toString('base64'), mimeType: 'image/png' },
+      };
+    },
+  },
 ];
 
 const BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
@@ -634,7 +657,8 @@ export const TOOL_DEFINITIONS = Object.freeze(TOOLS.map(({ name, description, in
 export const hasTool = (name) => BY_NAME.has(name);
 
 // ctx = { hub, store, catalog: { settings, keys, apps, isAllowedKey }, signal? }
-// → { isError, result, text } where text is the JSON sent back to the model.
+// → { isError, result, text, images } where text is the JSON sent back to the model and images are
+// [{ data: base64, mimeType }] sent with it.
 export async function callTool(name, input, ctx) {
   const tool = BY_NAME.get(name);
   let result;
@@ -647,7 +671,10 @@ export async function callTool(name, input, ctx) {
   } catch (err) {
     result = { ok: false, error: { code: err.code ?? 'FAILED', message: err.message } };
   }
-  return { isError: !result.ok, result, text: JSON.stringify(result) };
+  // Pictures (look_at_screen) travel beside the JSON text as image content, never inside it.
+  const { image, ...rest } = result ?? {};
+  const images = image?.data && image?.mimeType ? [image] : [];
+  return { isError: !rest.ok, result: rest, text: JSON.stringify(rest), images };
 }
 
 // One short line for UI events: "key=picture.backlight, delta=5".

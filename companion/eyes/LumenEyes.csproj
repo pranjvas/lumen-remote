@@ -1,0 +1,11 @@
+﻿<Project Sdk="Tizen.NET.Sdk/1.1.9">
+  <!-- Lumen Eyes: a windowless Tizen .NET app the TV agent launches to take one still of the screen
+       with the TV's display-capture library (see docs/research/re-eyes-dcapture.md). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>tizen50</TargetFramework>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+</Project>

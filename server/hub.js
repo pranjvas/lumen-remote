@@ -46,7 +46,7 @@ const KEY_TOUCHES = {
 };
 
 const NAMES = {
-  rest: 'The TV', remote: 'The remote channel', upnp: 'UPnP', ipc: 'IP Control', agent: 'The TV agent',
+  rest: 'The TV', remote: 'The remote channel', upnp: 'UPnP', ipc: 'IP Control', agent: 'The TV agent', eyes: 'Lumen Eyes',
   wol: 'Wake-on-LAN', avtransport: 'Media casting', dial: 'App casting', sleep: 'The sleep timer', scenes: 'Scenes',
   tracked: 'Tracked settings', macros: 'Macros', cast: 'Cast', ai: 'Ask Lumen', browser: 'The browser', vpn: 'The VPN',
 };
@@ -699,6 +699,13 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       }
       const res = await call('agent', 'request', 'launch', { appId, operation, data });
       return { value: res.value ?? res };
+    },
+
+    // One still of the TV screen via Lumen Eyes; the PNG is served at /api/screen.png.
+    'screen.capture': async ({ mode }) => {
+      requireTvOn();
+      const shot = await call('eyes', 'capture', { mode: mode === undefined ? 0 : integer(mode, 'mode', 0, 2) });
+      return { value: { at: shot.at, width: shot.width, height: shot.height, ms: shot.ms, url: `/api/screen.png?at=${shot.at}` } };
     },
 
     'pair.remote': async () => {
