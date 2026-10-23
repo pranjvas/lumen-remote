@@ -618,6 +618,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   // for memory): the next offer starts a step lower, and after two the TV stays on frames until live
   // video is turned on again (tvscreen.live).
   let liveStrikes = 0;
+  let liveHidden = false; // the TV's agent is in the background (the owner switched to another app)
   const MAX_LIVE_STRIKES = 2;
 
   // Asks the TV agent whether it has the live player (older agents do not answer).
@@ -633,6 +634,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
 
   function onLive(msg) {
     const state = typeof msg.state === 'string' ? msg.state : '';
+    if (state === 'visible') {
+      liveHidden = false;
+      if (on && !live) offerLive();
+      return;
+    }
     if (state === 'ready') {
       const feature = liveVideo();
       if (!liveWanted || !feature?.enabled?.() || live) return;
@@ -671,6 +677,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       live.playing = false;
       live.handle.refused();
       if (lastJpeg && !videoActive()) agent()?.sendFrame?.(lastJpeg);
+    } else if (state === 'hidden') {
+      // Another app in front on the TV: not a failure. Live video stops and comes back with the page.
+      liveHidden = true;
+      log.info('the TV switched away from Lumen; live video paused');
+      stopLive(null);
     } else if (state === 'unsupported' || state === 'error') {
       stopLive(`TV: ${String(msg.reason ?? state).slice(0, 120)}`);
     }
@@ -732,7 +743,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
           heldFrame = null;
           setVideo(null);
         }
-        if ('conn.agent' in patch && patch['conn.agent']?.v !== 'online' && live) {
+        if ('conn.agent' in patch && patch['conn.agent']?.v !== 'online' && live && !liveHidden) {
           liveStrikes += 1;
           log.warn('the TV agent went away during live video', { strikes: liveStrikes });
           stopLive(null);

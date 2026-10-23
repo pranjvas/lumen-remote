@@ -568,7 +568,13 @@
   // ---- start ----
 
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) return;
+    // Another app in front (the TV pauses this page in the background): the live player stops cleanly
+    // and the PC is told, instead of the PC taking the silence for a crash.
+    if (document.hidden) {
+      if (window.LumenLive && window.LumenLive.hidden) window.LumenLive.hidden();
+      return;
+    }
+    if (window.LumenLive && window.LumenLive.visible) window.LumenLive.visible();
     // Opened again from the Apps screen or relaunched by the PC: retry at once, then step aside
     // (unless the PC asked for the browser screen, which stays in front).
     if (config) connectNow();

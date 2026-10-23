@@ -291,6 +291,14 @@
       }
       return true;
     },
+    // This page went into the background (another app in front) or came back.
+    hidden: function () {
+      teardown();
+      if (send) report('hidden');
+    },
+    visible: function () {
+      if (send) report('visible');
+    },
     message: function (msg) {
       if (msg.t === 'screen-live-offer') {
         if (!window.MediaSource || !el) report('unsupported', { reason: 'no MediaSource' });

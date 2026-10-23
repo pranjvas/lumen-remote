@@ -135,6 +135,21 @@ describe('tvscreen: live video on the TV', { skip }, () => {
     assert.ok(!agent.screen.some((m) => m.t === 'screen-live-offer'), 'no offer after the agent went away twice');
   });
 
+  test('switching the TV to another app pauses live video without counting it as a failure; coming back offers it again', async () => {
+    assert.equal((await b.send('tvscreen.live', { on: true })).ok, true);
+    await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer' });
+    ready();
+    await b.waitForState('tvscreen.live', (r) => r?.v?.state && r.v.state !== 'off', { timeout: 5000 });
+    agent.screen.length = 0;
+    agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'hidden' }));
+    await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-stop'), { timeout: 5000, what: 'live stopped while hidden' });
+    await b.waitForState('tvscreen.live', (r) => r?.v?.state === 'off', { timeout: 5000 });
+    agent.screen.length = 0;
+    agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'visible' }));
+    const offer = await waitFor(() => agent.screen.find((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer on return' });
+    assert.ok(offer, 're-offered after coming back');
+  });
+
   test('closing the screen stops live video', async () => {
     assert.equal((await b.send('tvscreen.live', { on: true })).ok, true);
     await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer' });
