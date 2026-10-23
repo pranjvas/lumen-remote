@@ -38,6 +38,7 @@ const IPV4_LITERAL = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 // Worker side.
 const POLL_MS = 20;
 const STATUS_INTERVAL_MS = 1000;
+const STATUS_READ_MS = 50; // wg_status at most this often (state changes still reach the hub within it)
 const REDIAL_MS = 500;
 const STATUS_BUFFER = 2048;
 
@@ -703,6 +704,7 @@ async function runWorker() {
   post({ t: 'started' });
 
   let lastPost = 0;
+  let lastRead = 0;
   let lastKey = '';
   let lastDial = Date.now();
   const postStatus = (status) => {
@@ -732,6 +734,13 @@ async function runWorker() {
     }
     if (!running) return;
     const now = Date.now();
+    // wg_status costs a malloc, a JSON snprintf in the wasm and a JSON.parse; under load wg_poll
+    // returns hundreds of times a second, so read it at most every STATUS_READ_MS.
+    if (now - lastRead < STATUS_READ_MS) {
+      setImmediate(loop);
+      return;
+    }
+    lastRead = now;
     const status = readStatus();
     if (status) {
       const key = `${status.state}|${status.handshake}|${status.mux?.linked}`;

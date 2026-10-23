@@ -13,6 +13,8 @@ const control = new Int32Array(workerData.control);
 const data = new Uint8Array(workerData.data);
 const E = workerData.errorCodes;
 const WRITE_HIGH_WATER = 4 * 1024 * 1024;
+const UDP_RECV_BUFFER = 8 * 1024 * 1024;
+const UDP_SEND_BUFFER = 1024 * 1024;
 const DEBUG = !!process.env.WG_SHIM_DEBUG;
 function dbg() { if (DEBUG) require('node:fs').appendFileSync(process.env.WG_SHIM_DEBUG, '[io-worker ' + (Date.now() % 100000) + '] ' + Array.from(arguments).join(' ') + String.fromCharCode(10)); }
 
@@ -30,8 +32,8 @@ function reply(rc, payload, aux) {
   let len = 0;
   if (payload && payload.length) { len = Math.min(payload.length, data.length); data.set(payload.subarray(0, len), 0); }
   control[1] = rc; control[2] = len;
-  for (let i = 3; i < control.length; i++) control[i] = 0;
-  if (aux) aux.slice(0, control.length - 3).forEach((v, i) => { control[3 + i] = v | 0; });
+  control.fill(0, 3);
+  if (aux) { const n = Math.min(aux.length, control.length - 3); for (let i = 0; i < n; i++) control[3 + i] = aux[i] | 0; }
   Atomics.store(control, 0, 1);
   Atomics.notify(control, 0);
 }
@@ -60,7 +62,12 @@ function ensureUdp(s, cb) {
   s.udp = socket;
   socket.on('message', (msg, rinfo) => { dbg('udp message', s.fd, msg.length, rinfo.address, rinfo.port); s.rx.push({ buf: msg, ip: rinfo.address, port: rinfo.port }); s.rxBytes += msg.length; wake(s); });
   socket.on('error', error => { s.err = errnoOf(error); wake(s); });
-  socket.once('listening', () => cb(null));
+  // Lumen: the 64 KB default receive buffer fills in ~3 ms at 160-210 Mbit/s while lwIP's 706 KB
+  // window lets ~500 datagrams arrive in one burst; drops there make TCP back off.
+  socket.once('listening', () => {
+    try { socket.setRecvBufferSize(UDP_RECV_BUFFER); socket.setSendBufferSize(UDP_SEND_BUFFER); } catch (e) { dbg('udp buffer sizes', e.message); }
+    cb(null);
+  });
   socket.once('error', error => cb(error));
   const b = s.bound || { ip: '0.0.0.0', port: 0 };
   try { socket.bind(b.port, b.ip); } catch (error) { cb(error); }
@@ -232,8 +239,8 @@ const ops = {
 };
 
 parentPort.on('message', m => {
-  dbg('op', JSON.stringify(m));
-  const payload = m.len ? Buffer.from(data.slice(0, m.len)) : null;
+  if (DEBUG) dbg('op', JSON.stringify(m)); // Lumen: no JSON.stringify per call unless debugging
+  const payload = m.len ? Buffer.from(data.slice(0, m.len).buffer) : null; // one copy, not two
   try {
     if (m.op === 'create' || m.op === 'poll' || m.op === 'resolve') return ops[m.op](m, null, payload);
     const s = sockets.get(m.fd);

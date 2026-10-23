@@ -46,6 +46,14 @@ class IpMreq { constructor(multiaddr, address) { this.multiaddr = multiaddr; thi
 class IpMreqSource { constructor(multiaddr, source, address) { this.multiaddr = multiaddr; this.source = source; this.address = address; } }
 class Ipv6Mreq { constructor(multiaddr) { this.multiaddr = multiaddr; } }
 class SockError extends Error { constructor(errno) { super('tizentvwasm shim errno ' + errno); this.errno = errno; } }
+// Lumen: one cached instance per errno. The glue only catches the throw and asks getErrorCode(),
+// and an EAGAIN on every empty nonblocking recv made stack capture 2-4.5% of the worker's time.
+const SOCK_ERRORS = new Map();
+function sockError(errno) {
+  let err = SOCK_ERRORS.get(errno);
+  if (!err) { err = new SockError(errno); SOCK_ERRORS.set(errno, err); }
+  return err;
+}
 
 function ipToBytes(ip) { return Uint8Array.from(ip.split('.').map(Number)); }
 function bytesToIp(bytes) { return Array.from(bytes.subarray(0, 4)).join('.'); }
@@ -64,15 +72,15 @@ class Bridge {
   call(op, args, payload) {
     if (this.failure) throw this.failure;
     const len = payload ? payload.length : 0;
-    if (len > DATA_BYTES) throw new SockError(ErrorCodes.EMSGSIZE);
+    if (len > DATA_BYTES) throw sockError(ErrorCodes.EMSGSIZE);
     if (len) this.data.set(payload, 0);
     Atomics.store(this.control, 0, 0);
     this.worker.postMessage(Object.assign({ op, len }, args));
     while (Atomics.load(this.control, 0) === 0) Atomics.wait(this.control, 0, 0, 1000);
     if (Atomics.load(this.control, 0) === 2) throw this.failure || new Error('io worker died');
     const rc = Atomics.load(this.control, 1);
-    const out = { rc, len: Atomics.load(this.control, 2), aux: Array.from(this.control.subarray(3, 3 + 60)) };
-    if (rc < 0) { this.lastErrno = -rc; if (args && typeof args.fd === 'number') this.perFd.set(args.fd, -rc); throw new SockError(-rc); }
+    const out = { rc, len: Atomics.load(this.control, 2), aux: this.control.slice(3, 3 + 60) };
+    if (rc < 0) { this.lastErrno = -rc; if (args && typeof args.fd === 'number') this.perFd.set(args.fd, -rc); throw sockError(-rc); }
     if (args && typeof args.fd === 'number') this.perFd.set(args.fd, 0);
     return out;
   }
