@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { LumenError } from '../errors.js';
-import { CAPTURE_TITLE } from './browser.js';
+import { CAPTURE_TITLE, TV_VIEWPORT } from './browser.js';
 import {
   initSegment, fragmentBatch, mimeType, avcCodecString, hevcCodecString, buildHvcC, splitAnnexB, lengthPrefixed,
   hevcNalType, HEVC_PARAMETER_SETS, VIDEO_TRACK, AUDIO_TRACK, VIDEO_TIMESCALE,
@@ -80,6 +80,17 @@ export function usableLadder({ caps = {}, encoders = null, maxHeight = 1080, max
     if (codec) out.push({ ...step, codec });
   }
   return out;
+}
+
+/**
+ * The size a capture is started at (getDisplayMedia): the step's, but never below the page's CSS
+ * size. Edge lays a captured tab that goes full screen out at the size the capture started with
+ * (limited to the screen, see browser.js screenArg); a smaller one showed only part of the page,
+ * blown up. The step's own size follows at once (its config message applies it).
+ */
+export function captureRequest(step) {
+  const small = step.width < TV_VIEWPORT.w || step.height < TV_VIEWPORT.h;
+  return small ? { width: TV_VIEWPORT.w, height: TV_VIEWPORT.h, fps: step.fps } : { width: step.width, height: step.height, fps: step.fps };
 }
 
 /** Where a ladder starts: the first step that is not a probe, `lower` steps further down. */
@@ -632,7 +643,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
       let pickTimer = null;
       try {
         started = await Promise.race([
-          evaluate(cdp, `lumenStart(${JSON.stringify({ width: step.width, height: step.height, fps: step.fps })})`, { gesture: true }),
+          evaluate(cdp, `lumenStart(${JSON.stringify(captureRequest(step))})`, { gesture: true }),
           new Promise((_, reject) => { pickTimer = setTimeout(() => reject(new Error('the tab capture did not start')), PICK_TIMEOUT_MS); }),
         ]);
       } finally {

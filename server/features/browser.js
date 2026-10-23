@@ -13,6 +13,22 @@ import { LumenError } from '../errors.js';
 const PROFILE_DIR = 'browser-profile';
 const HOME_URL = 'https://duckduckgo.com/';
 const VIEWPORT = Object.freeze({ minW: 320, maxW: 1280, minH: 320, maxH: 800 });
+/** The page's CSS size while the TV shows it (frames, live video). */
+export const TV_VIEWPORT = Object.freeze({ w: 1280, h: 720 });
+
+/**
+ * Edge's --screen-info: a screen of the largest viewport (CSS px) at `scale`.
+ *
+ * Headless Edge's own screen is 800×600, and --force-device-scale-factor divides it again (pages saw
+ * 89×66). The screen matters when the page is captured for live video and goes full screen: Edge
+ * then sizes the tab's view to the capture size limited to the screen (800×450, or 89×50 at scale 3),
+ * while the emulated viewport stays 1280×720, so the phone and the TV got the top-left corner of the
+ * page blown up. A screen exactly as wide as the TV viewport limits every 16:9 capture of 1280 px or
+ * more to 1280×720, the viewport itself, and full screen changes nothing.
+ */
+export function screenArg(scale = 1) {
+  return `--screen-info={${VIEWPORT.maxW * scale}x${VIEWPORT.maxH * scale} devicePixelRatio=${scale}}`;
+}
 const START_TIMEOUT_MS = 45_000; // a busy PC can take a while to bring Edge up
 const POLL_MS = 150;
 const BROWSER_CLOSE_MS = 1500; // Browser.close is given this long before the port check
@@ -410,15 +426,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   const liveArgs = () => (live ? [
     `--auto-select-tab-capture-source-by-title=${CAPTURE_TITLE}`, '--disable-audio-output',
     '--enable-features=PlatformHEVCEncoderSupport',
-    // A 4K stream needs a device scale of 3 behind the TV's 1280×720 CSS viewport; an emulated scale
-    // above 2 is captured at 2.
-    ...((config.liveVideo?.maxHeight ?? 0) >= 2160 ? ['--force-device-scale-factor=3'] : []),
   ] : ['--mute-audio']);
+  // A 4K stream needs a device scale of 3 behind the TV's 1280×720 CSS viewport (an emulated scale
+  // above 2 is captured at 2). The scale belongs to the screen, see screenArg.
+  const screenScale = live && (config.liveVideo?.maxHeight ?? 0) >= 2160 ? 3 : 1;
   let tvScale = 1; // device scale of the TV's viewport (1.5 renders 1280×720 CSS px as 1920×1080)
   // Lumen browser on TV (features/tvscreen.js): extra receivers of every frame as JPEG bytes. While one
   // is attached the viewport is the TV's 16:9 and phones see a scaled copy.
   const sinks = new Set();
-  const TV_VIEWPORT = Object.freeze({ w: 1280, h: 720 });
   let requestedViewport = null;
   // Video streams the page loaded (HLS/DASH manifests, whole files), newest first, with the request
   // headers that fetched them (cookies, referer) so the TV can be handed the same stream.
@@ -938,7 +953,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`,
       // The largest viewport, so no later size (the TV's 1280×720 after a phone's 358×411) is bigger
       // than the window: the screencast then sent squeezed frames or none at all.
-      `--window-size=${VIEWPORT.maxW},${VIEWPORT.maxH}`,
+      `--window-size=${VIEWPORT.maxW},${VIEWPORT.maxH}`, screenArg(screenScale),
       '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
       '--disable-background-networking', '--disable-component-update', ...liveArgs(), '--force-color-profile=srgb',
       // A fresh headless profile has no media engagement, so a page's video with sound never starts by
