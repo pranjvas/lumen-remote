@@ -268,6 +268,8 @@
     // What happened before the last cut-off (black box), handed to the PC once.
     const box = window.LumenBox ? window.LumenBox.take() : [];
     greeted = send({ t: 'hello', agent: config.version, pcHost: config.pcHost, snapshot: snapshotWith(readFast()), box: box });
+    // From now on each note also goes to the PC at once: a page the TV kills cannot always save it.
+    if (window.LumenBox && window.LumenBox.setSink) window.LumenBox.setSink(function (entry) { if (greeted) send({ t: 'box', e: entry }); });
   }
 
   function scheduleRetry() {

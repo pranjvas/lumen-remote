@@ -231,6 +231,10 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
       if (msg.kind === 'volume' && volume !== null && volume >= 0 && volume <= 100) {
         store.set('audio.volume', volume, meta('event', { range: [0, 100] }));
       }
+    } else if (msg.t === 'box') {
+      // A black-box note as it happens (agent 0.8.6+), so the log has it even if the TV kills the page.
+      const e = msg.e && typeof msg.e === 'object' ? msg.e : {};
+      log.info('agent note', { k: String(e.k ?? '').slice(0, 24), d: JSON.stringify(e.d ?? null).slice(0, 300) });
     } else if (msg.t === 'reply') {
       onReply(msg);
     } else if (typeof msg.t === 'string' && msg.t.startsWith('screen-')) {

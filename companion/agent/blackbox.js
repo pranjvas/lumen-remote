@@ -17,9 +17,12 @@
   }
 
   let ring = load();
+  let sink = null; // agent.js: sends each note to the PC as it happens (localStorage can be lost in a kill)
 
   function note(kind, data) {
-    ring.push({ t: Date.now(), k: String(kind).slice(0, 24), d: data === undefined ? null : data });
+    const entry = { t: Date.now(), k: String(kind).slice(0, 24), d: data === undefined ? null : data };
+    ring.push(entry);
+    if (sink) { try { sink(entry); } catch (e) { /* the PC is gone: the ring keeps it */ } }
     if (ring.length > MAX) ring = ring.slice(ring.length - MAX);
     try { localStorage.setItem(KEY, JSON.stringify(ring)); } catch (e) { /* storage full: keep in memory */ }
   }
@@ -63,5 +66,5 @@
   }, MEM_EVERY_MS);
 
   note('start', { at: new Date().toISOString() });
-  window.LumenBox = { note: note, take: take };
+  window.LumenBox = { note: note, take: take, setSink: function (fn) { sink = typeof fn === 'function' ? fn : null; } };
 })();
