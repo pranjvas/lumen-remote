@@ -863,11 +863,15 @@ const TOOLS = [
   },
   {
     name: 'browser_play_video_on_tv',
-    description: 'Play the video of the page open in Lumen\'s browser on the TV\'s own player (full screen, full quality, with sound, through the VPN when it is on). Start the video on the page first (click its play button) so Lumen can see its stream. Works for normal web video; protected (DRM) streams cannot be handed over.',
+    description: 'Play the video of the page open in Lumen\'s browser on the TV\'s own player (full screen, full quality, with sound, through the VPN when it is on). Start the video on the page first (click its play button) so Lumen can see its stream. Works for normal web video; protected (DRM) streams cannot be handed over. A YouTube video (a watch, Shorts or embed page, or a YouTube embed on the page) opens in the TV\'s YouTube app at the same position instead; it need not be started first.',
     inputSchema: object(),
     async run(_, { hub }) {
       const res = await send(hub, { cmd: 'tvscreen.playVideo' });
-      return { ok: true, summary: `Playing ${res?.title ? `"${res.title}"` : 'the video'} on the TV` };
+      const what = res?.title ? `"${res.title}"` : 'the video';
+      if (res?.app === 'youtube') {
+        return { ok: true, app: 'youtube', videoId: res.videoId, t: res.t, summary: `Playing ${what} in the TV's YouTube app${res.t ? ` from ${res.t} s` : ''}` };
+      }
+      return { ok: true, summary: `Playing ${what} on the TV` };
     },
   },
   {

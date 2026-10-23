@@ -2,8 +2,11 @@
 // when it is on) and shown full screen by the TV agent (companion/agent/screen.js). The TV remote
 // drives it — arrows move a pointer, OK clicks, Back goes back, CH ▲▼ scroll, Red closes, Green
 // reloads, Yellow hands the page's video to the TV's own player through the relay (full quality,
-// with sound). Phones keep controlling the same page in the Browser view.
+// with sound). Phones keep controlling the same page in the Browser view. YouTube is the exception:
+// its web player streams separate audio and video over MSE (UMP POSTs to googlevideo.com), so there
+// is no single stream to relay; its videos open in the TV's own YouTube app at the same position.
 import { LumenError } from '../errors.js';
+import { matchUrl } from './cast.js';
 
 const STEP = 0.014; // pointer step (fraction of the screen) for a single press
 const STEP_MAX = 0.09;
@@ -15,14 +18,51 @@ const EDGE = 0.002;
 // and its headless browser cannot play DRM video at all.
 const AUTO_POLL_MS = 1500;
 const AUTO_MIN_AREA = 0.3; // fraction of the page: muted previews and thumbnails stay on the page
+const AUTO_MIN_AREA_YOUTUBE = 0.15; // a YouTube video page: Shorts' portrait player is about a third of a 16:9 page
 const TV_VIDEO_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
-const PAGE_VIDEO_SCRIPT = `(() => {
+const pageVideoScript = (minArea) => `(() => {
   const area = innerWidth * innerHeight;
-  return [...document.querySelectorAll('video')].some((v) => !v.paused && !v.ended && v.clientWidth * v.clientHeight >= area * ${AUTO_MIN_AREA});
+  return [...document.querySelectorAll('video')].some((v) => !v.paused && !v.ended && v.clientWidth * v.clientHeight >= area * ${minArea});
 })()`;
-const PAUSE_PAGE_SCRIPT = `[...document.querySelectorAll('video')].forEach((v) => { try { v.pause(); } catch (e) {} })`;
+// YouTube's player is paused through its own API too: a bare <video>.pause() while it is still
+// buffering the start is undone by the player a moment later.
+const PAUSE_PAGE_SCRIPT = `(() => {
+  document.querySelectorAll('.html5-video-player').forEach((p) => { try { if (p.pauseVideo) p.pauseVideo(); } catch (e) {} });
+  document.querySelectorAll('video').forEach((v) => { try { v.pause(); } catch (e) {} });
+})()`;
+const YOUTUBE_REPEAT_MS = 15000; // the same video started again this soon after a hand-off is only paused
+const YOUTUBE_MIN_EMBED_AREA = 40000; // CSS px²: a YouTube embed smaller than ~200×200 is not "the page's video"
 
-export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay, transcoder = () => null }) {
+/** The YouTube video a link points at → { id, t? } (t in whole seconds), or null. Covers watch?v=,
+ *  youtu.be/, /shorts/, /embed/ (start=), /live/, m. and music. hosts, youtube-nocookie.com. */
+export function youtubeVideo(raw) {
+  let url;
+  try { url = new URL(String(raw ?? '')); } catch { return null; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  const match = matchUrl(url);
+  if (match?.kind !== 'youtube') return null;
+  const start = Number.parseInt(url.searchParams.get('start') ?? '', 10);
+  const t = match.t ?? (start > 0 ? start : undefined);
+  return { id: match.id, ...(t && { t: Math.floor(t) }) };
+}
+
+/** Page script: where YouTube's own player is in video `id` → { found, t, ad, live }. During an ad the
+ *  <video> element plays the ad, so the player API's getCurrentTime() (the video's own position) wins. */
+export function youtubeStateScript(id) {
+  return `(() => {
+  const want = ${JSON.stringify(String(id))};
+  const data = (p) => { try { return (p.getVideoData && p.getVideoData()) || null; } catch (e) { return null; } };
+  const p = [...document.querySelectorAll('.html5-video-player')].find((x) => (data(x) || {}).video_id === want);
+  if (!p) return { found: false, t: null, ad: false, live: false };
+  const ad = p.classList.contains('ad-showing');
+  let t = null;
+  try { if (p.getCurrentTime) t = p.getCurrentTime(); } catch (e) {}
+  if (!(typeof t === 'number' && isFinite(t)) && !ad) { const v = p.querySelector('video'); t = v ? v.currentTime : null; }
+  return { found: true, t: typeof t === 'number' && isFinite(t) ? t : null, ad, live: !!(data(p) || {}).isLive };
+})()`;
+}
+
+export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay, transcoder = () => null, cast = () => null }) {
   const log = rootLog.child('tvscreen');
   const appId = config.agent?.appId;
   let on = false;
@@ -35,6 +75,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let current = null; // { pick, title, stage: 'direct' | 'copy' | 'encode', job }
   let autoTimer = null;
   let handing = false;
+  let lastYoutube = null; // { id, at } of the last video opened in the TV's YouTube app
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
   const b = () => {
@@ -177,10 +218,13 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (!on || handing || TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v)) return;
     const feature = browser();
     if (!feature) return;
-    if (await feature.evaluate(PAGE_VIDEO_SCRIPT).catch(() => false) !== true) return;
+    const yt = youtubeVideo(store.get('browser.url')?.v);
+    if (await feature.evaluate(pageVideoScript(yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA)).catch(() => false) !== true) return;
     handing = true;
     try {
-      toast('Playing on the TV’s player…');
+      // The same YouTube video starting again on the page right after it went to the app: just pause it.
+      if (yt && lastYoutube?.id === yt.id && Date.now() - lastYoutube.at < YOUTUBE_REPEAT_MS) return;
+      toast(yt ? 'Opening in YouTube on the TV…' : 'Playing on the TV’s player…');
       const result = await playVideo().catch((err) => { toast(err.message); return null; });
       if (result) log.info('page video handed to the TV automatically');
     } finally {
@@ -189,8 +233,13 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     }
   }
 
-  // The page's own video first: the biggest (or playing) <video> with a real URL, then streams the page
-  // loaded from its own site, then any stream; ad players are what usually loads from other sites.
+  // The page's own video first: a playing <video> with a real URL, then a YouTube embed (the biggest),
+  // then the biggest <video>, then streams the page loaded from its own site, then any stream; ad
+  // players are what usually loads from other sites.
+  const PAGE_MEDIA_SCRIPT = `({
+    videos: [...document.querySelectorAll('video')].map((v) => ({ src: v.currentSrc || v.src || '', area: v.clientWidth * v.clientHeight, playing: !v.paused })),
+    frames: [...document.querySelectorAll('iframe')].map((f) => ({ src: f.src || '', area: f.clientWidth * f.clientHeight })),
+  })`;
   async function pickMedia(explicit) {
     const feature = b();
     const media = feature.media();
@@ -198,19 +247,54 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const site = (u) => { try { return new URL(u).hostname.split('.').slice(-2).join('.'); } catch { return ''; } };
     const headersFor = (url) => media.find((m) => m.url === url)?.headers ?? { referer: pageUrl };
     if (explicit) return { url: explicit, kind: /\.m3u8/i.test(explicit) ? 'hls' : 'file', headers: headersFor(explicit) };
-    const videos = await feature.evaluate(`[...document.querySelectorAll('video')].map((v) => ({ src: v.currentSrc || v.src || '', area: v.clientWidth * v.clientHeight, playing: !v.paused }))`).catch(() => []);
-    const direct = (videos ?? []).filter((v) => /^https?:/.test(v.src)).sort((x, y) => (y.playing - x.playing) || (y.area - x.area))[0];
-    if (direct) return { url: direct.src, kind: /\.m3u8/i.test(direct.src) ? 'hls' : 'file', headers: headersFor(direct.src) };
+    const found = await feature.evaluate(PAGE_MEDIA_SCRIPT).catch(() => null);
+    const videos = (found?.videos ?? []).filter((v) => /^https?:/.test(v.src)).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
+    const asFile = (v) => ({ url: v.src, kind: /\.m3u8/i.test(v.src) ? 'hls' : 'file', headers: headersFor(v.src) });
+    if (videos[0]?.playing) return asFile(videos[0]);
+    const embed = (found?.frames ?? []).filter((f) => f.area >= YOUTUBE_MIN_EMBED_AREA)
+      .map((f) => ({ area: f.area, video: youtubeVideo(f.src) })).filter((f) => f.video).sort((x, y) => y.area - x.area)[0];
+    if (embed) return { kind: 'youtube', video: embed.video };
+    if (videos[0]) return asFile(videos[0]);
     const own = media.filter((m) => site(m.url) === site(pageUrl));
     const rank = (list) => list.find((m) => m.kind === 'hls') ?? list.find((m) => m.kind === 'file') ?? list.find((m) => m.kind === 'dash');
     return rank(own) ?? rank(media) ?? null;
   }
 
+  // A YouTube video plays in the TV's own YouTube app (DIAL, as Cast does), at the position the page's
+  // player is at; the page's video is paused so it does not keep playing behind the app.
+  async function playOnYoutube(video, { fromPage = false, onPage = false } = {}) {
+    const launcher = cast();
+    if (!launcher?.castUrl) throw new LumenError('UNAVAILABLE', 'Lumen cannot start YouTube on the TV right now');
+    const feature = browser();
+    let t = video.t;
+    if (fromPage && feature?.evaluate) {
+      const player = await feature.evaluate(youtubeStateScript(video.id)).catch(() => null);
+      if (player?.found) t = player.live ? undefined : player.t >= 1 ? Math.floor(player.t) : video.t;
+    }
+    const watch = `https://www.youtube.com/watch?v=${video.id}${t >= 1 ? `&t=${t}` : ''}`;
+    await launcher.castUrl(watch);
+    lastYoutube = { id: video.id, at: Date.now() };
+    if (feature?.evaluate) await feature.evaluate(PAUSE_PAGE_SCRIPT).catch(() => {});
+    // The page's title names the video only when the page is that video's own page.
+    const title = onPage ? String(store.get('browser.title')?.v ?? '').replace(/ - YouTube$/, '') || null : null;
+    log.info('YouTube video opened in the TV’s YouTube app', { at: t >= 1 ? t : 0 });
+    return { value: { kind: 'youtube', app: 'youtube', videoId: video.id, t: t >= 1 ? t : 0, title } };
+  }
+
   /** Plays the page's video (or `url`) on the TV's own player, through the relay; convert: true
-   *  skips the direct attempt and converts on this PC straight away. */
+   *  skips the direct attempt and converts on this PC straight away. A YouTube page (or link, or a
+   *  YouTube embed on the page) opens in the TV's YouTube app instead. */
   async function playVideo({ url: explicit, convert = false } = {}) {
-    const adapter = a();
+    const pageUrl = store.get('browser.url')?.v ?? '';
+    const yt = youtubeVideo(explicit ?? pageUrl);
+    if (yt) {
+      const onPage = youtubeVideo(pageUrl)?.id === yt.id;
+      // An explicit link's own t= wins over where the page's player is.
+      return playOnYoutube(yt, { fromPage: onPage && !(explicit && yt.t), onPage });
+    }
     const pick = await pickMedia(explicit);
+    if (pick?.kind === 'youtube') return playOnYoutube(pick.video);
+    const adapter = a();
     if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
     const { url, token } = relay().register(pick.url, pick.headers);

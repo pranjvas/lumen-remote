@@ -110,7 +110,7 @@ export async function startServer(overrides = {}, seams = {}) {
     // The MCP URL handed to the Claude Code CLI must use the bound port (port 0 in tests).
     features.ai = createAi({ ...ctx, hub, adapters, browser: () => features.browser, httpPort: () => http?.port ?? config.http.port, backends: seams.aiBackends });
     features.browser = createBrowser({ ...ctx, hub, vpn: () => features.vpn });
-    features.tvscreen = createTvScreen({ ...ctx, agent: () => agent, rest, browser: () => features.browser, relay: () => features.relay, transcoder: () => features.transcode });
+    features.tvscreen = createTvScreen({ ...ctx, agent: () => agent, rest, browser: () => features.browser, relay: () => features.relay, transcoder: () => features.transcode, cast: () => features.cast });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);

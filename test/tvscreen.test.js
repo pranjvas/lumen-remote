@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import { startStack, waitFor } from './helpers.js';
 import { callTool } from '../server/ai/tools.js';
+import { youtubeStateScript } from '../server/features/tvscreen.js';
 
 const EDGE = process.env.LUMEN_EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const skip = !fs.existsSync(EDGE) && `headless Edge is not installed at ${EDGE}`;
@@ -26,6 +27,12 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
       if (req.url.startsWith('/video')) {
         res.end('<title>Video</title><video id="v" src="/clip.m3u8" style="width:100vw;height:80vh"></video>'
           + '<script>let p = true; Object.defineProperty(v, "paused", { get: () => p }); v.pause = () => { p = true; }; window.startIt = () => { p = false; };</script>');
+        return;
+      }
+      // YouTube's player as its page script sees it: an .html5-video-player element with the player API.
+      if (req.url.startsWith('/ytplayer')) {
+        res.end('<title>Clip - YouTube</title><div class="html5-video-player" id="movie_player"><video style="width:100vw;height:80vh"></video></div>'
+          + '<script>const p = document.getElementById("movie_player"); p.getVideoData = () => ({ video_id: "dQw4w9WgXcQ", isLive: false }); p.getCurrentTime = () => 75.5;</script>');
         return;
       }
       if (req.url.startsWith('/second')) res.end(`<title>Second</title><p>Search: ${new URL(req.url, 'http://x').searchParams.get('q') ?? ''}</p>`);
@@ -85,6 +92,22 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     await waitFor(async () => (await callTool('browser_read', {}, ctx)).result.title === 'Second', { timeout: 15000, what: 'the linked page' });
     const look = await callTool('browser_look', {}, ctx);
     assert.equal(look.images[0].mimeType, 'image/jpeg');
+  });
+
+  test('YouTube\'s player position is read through its API: the video\'s own time during an ad, nothing for another video', async () => {
+    const page = stack.server.features.browser;
+    await page.open(`http://127.0.0.1:${web.address().port}/ytplayer`);
+    await waitFor(async () => (await page.evaluate('document.title').catch(() => '')) === 'Clip - YouTube', { timeout: 15000, what: 'the player page' });
+    const state = (id) => page.evaluate(youtubeStateScript(id));
+    assert.deepEqual(await state('dQw4w9WgXcQ'), { found: true, t: 75.5, ad: false, live: false });
+    assert.deepEqual(await state('aaaaaaaaaaa'), { found: false, t: null, ad: false, live: false });
+    await page.evaluate('p.classList.add("ad-showing")');
+    assert.deepEqual(await state('dQw4w9WgXcQ'), { found: true, t: 75.5, ad: true, live: false });
+    // Without the API's time, the <video>'s own time counts, but never an ad's.
+    await page.evaluate('p.getCurrentTime = undefined');
+    assert.equal((await state('dQw4w9WgXcQ')).t, null);
+    await page.evaluate('p.classList.remove("ad-showing")');
+    assert.equal((await state('dQw4w9WgXcQ')).t, 0);
   });
 
   test('a big video started on the page goes to the TV player by itself, and is paused on the page', async () => {

@@ -531,6 +531,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       `--window-size=${viewport.w},${viewport.h}`,
       '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
       '--disable-background-networking', '--disable-component-update', '--mute-audio', '--force-color-profile=srgb',
+      // A fresh headless profile has no media engagement, so a page's video with sound never starts by
+      // itself (YouTube sat at 0:00 until clicked). The PC plays no sound anyway (--mute-audio), and a
+      // video page opened on the TV should start (and be handed to the TV) as it would in a desktop browser.
+      '--autoplay-policy=no-user-gesture-required',
       // A locked or sleeping desktop must not make the page "hidden" (Windows occlusion tracking).
       '--disable-features=CalculateNativeWinOcclusion', '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
