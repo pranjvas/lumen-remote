@@ -81,7 +81,9 @@ export function makeDataDir({ remoteToken, ipcToken, secrets = {}, files = {} } 
     secrets: all,
     read: (name) => JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')),
     exists: (name) => fs.existsSync(path.join(dir, name)),
-    cleanup: () => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
+    // Edge's helper processes can hold its profile (under the data dir) a few seconds after it closed
+    // on a busy PC: retried for about 5 s.
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
   };
 }
 
