@@ -65,6 +65,32 @@ export function mountNow(root, ctx) {
   }
   ctx.state.watch(['app.*', 'channel.current', 'input.*', 'conn.tv'], renderHero);
 
+  // The mini TV shows the latest still from Lumen Eyes while it is recent (taken by the Screen view
+  // or the AI looking); clicking it opens the Screen view.
+  const STILL_FRESH_MS = 2 * 60 * 1000;
+  function paintStill() {
+    const screenEl = hero.querySelector('.tv-screen');
+    const frameEl = hero.querySelector('.tv-frame');
+    if (!screenEl || !frameEl) return;
+    const at = ctx.state.value('screen.at', 0);
+    const tv = ctx.state.value('conn.tv', 'unknown');
+    const fresh = at && Date.now() - at < STILL_FRESH_MS && tv !== 'standby' && tv !== 'off';
+    let img = screenEl.querySelector('.tv-still');
+    if (!fresh) { img?.remove(); return; }
+    if (!img) {
+      img = h('img', { class: 'tv-still', alt: '', decoding: 'async' });
+      screenEl.append(img);
+    }
+    const src = `/api/screen.png?at=${at}`;
+    if (img.getAttribute('src') !== src) img.setAttribute('src', src);
+    if (!frameEl.classList.contains('is-link')) {
+      frameEl.classList.add('is-link');
+      frameEl.addEventListener('click', () => ctx.navigate('screen'));
+    }
+  }
+  ctx.state.watch(['screen.at', 'conn.tv', 'app.*', 'channel.current', 'input.*'], paintStill);
+  setInterval(paintStill, 30000);
+
   // ---- readouts ----
   for (const r of READOUTS) {
     const value = h('span', { class: 'readout-value num', text: '—' });

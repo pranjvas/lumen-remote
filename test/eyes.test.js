@@ -136,6 +136,29 @@ describe('eyes: screen capture through the TV agent', () => {
     assert.ok(out.text.length < 500, 'no base64 in the text');
   });
 
+  test('the Screen view drives a capture loop: on while watched, off when paused or left', async () => {
+    const live = eyes.at(-1);
+    const count = () => live.captures.length;
+    await b.send('view', { name: 'screen', visible: true });
+    await b.waitForState('screen.watching', (r) => r?.v === 1000, { timeout: 5000 });
+    const start = count();
+    await waitFor(() => count() >= start + 2, { timeout: 5000, what: 'two looped captures' });
+
+    const paused = await b.send('screen.watch', { everyMs: 0 });
+    assert.equal(paused.ok, true, JSON.stringify(paused.error));
+    await b.waitForState('screen.watching', (r) => r?.v === 0, { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 300));
+    const atPause = count();
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(count(), atPause, 'no captures while paused');
+
+    assert.equal((await b.send('screen.watch', { everyMs: 100 })).error.code, 'INVALID');
+    assert.equal((await b.send('screen.watch', { everyMs: 5000 })).ok, true);
+    await b.waitForState('screen.watching', (r) => r?.v === 5000, { timeout: 5000 });
+    await b.send('view', { name: 'remote', visible: true });
+    await b.waitForState('screen.watching', (r) => r?.v === 0, { timeout: 5000 });
+  });
+
   test('a capture the TV refuses is reported as FAILED', async () => {
     eyes.at(-1).close();
     await b.waitForState('conn.eyes', (r) => r?.v === 'offline', { timeout: 5000 });

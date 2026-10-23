@@ -11,6 +11,7 @@ const SHELL = [
   '/css/components.css',
   '/css/remote.css',
   '/css/views.css',
+  '/css/screen.css',
   '/js/boot-theme.js',
   '/js/main.js',
   '/icons/lumen.svg',

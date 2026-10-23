@@ -1,0 +1,137 @@
+/* Screen view (Lumen Eyes): the TV as Lumen sees it, plus the Now card's mini-TV still. */
+
+.screen-stage {
+  position: relative;
+  margin: 4px 0 26px;
+}
+.screen-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 14px;
+  background:
+    radial-gradient(70% 90% at 50% 50%, color-mix(in oklab, var(--tint) 22%, transparent), transparent 72%),
+    #050607;
+  box-shadow:
+    0 0 0 6px #14171c,
+    0 0 0 7px rgba(255, 255, 255, 0.06),
+    0 30px 80px -30px color-mix(in oklab, var(--tint) 60%, transparent),
+    var(--shadow-deep);
+  transition: --tint var(--dur-tint) var(--ease-io);
+}
+[data-theme="gallery"] .screen-frame { box-shadow: 0 0 0 6px #2a2e36, 0 0 0 7px rgba(0, 0, 0, 0.2), var(--shadow-deep); }
+.screen-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.06), transparent 38%);
+  pointer-events: none;
+}
+.screen-frame:fullscreen { border-radius: 0; box-shadow: none; background: #000; }
+.screen-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 180ms var(--ease-out), filter var(--dur-panel);
+  user-select: none;
+}
+.screen-layer.is-front { opacity: 1; }
+.screen-frame.is-stale .screen-layer { filter: saturate(0.55) brightness(0.8); }
+.screen-frame.is-off .screen-layer { opacity: 0; }
+.screen-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 18px;
+  padding: 24px;
+  text-align: center;
+  color: var(--ink-2);
+  font-size: 14px;
+}
+.screen-empty[hidden] { display: none; }
+.screen-empty .tv-line { width: 46%; }
+.screen-frame:not(.has-frame):not(.is-off) .tv-line { animation: blink 1.6s var(--ease-io) infinite; }
+.screen-overlay {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  pointer-events: none;
+}
+.screen-pill {
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  font-size: 12px;
+  color: #f2efe8;
+  background: rgba(7, 8, 10, 0.62);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+.screen-pill[hidden] { display: none; }
+.screen-meta { margin-left: auto; color: #b4b9c2; }
+.screen-stand {
+  position: absolute;
+  left: 50%;
+  bottom: -18px;
+  width: 30%;
+  height: 5px;
+  margin-left: -15%;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #2a2e36, #15171b);
+}
+.screen-status[data-tone="bad"] { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, transparent); }
+.screen-status[data-tone="wait"] .dot { background: var(--warn); animation: blink 1.2s var(--ease-io) infinite; }
+.screen-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.screen-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.screen-actions [hidden] { display: none; }
+.screen-actions .is-pending { opacity: 0.7; }
+.screen-save { text-decoration: none; }
+.screen-save.is-disabled { opacity: 0.45; pointer-events: none; }
+.screen-hint { margin: 12px 0 0; font-size: 13px; }
+.screen-lower {
+  display: grid;
+  grid-template-columns: minmax(0, 240px) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.screen-steer {
+  display: grid;
+  grid-template-columns: repeat(3, 56px);
+  grid-template-rows: repeat(3, 56px);
+  gap: 8px;
+}
+.steer-key { width: 56px; height: 56px; border-radius: 16px; }
+.steer-ok { font-weight: 600; letter-spacing: 0.04em; }
+.steer-back { grid-area: 1 / 1; }
+.steer-up { grid-area: 1 / 2; }
+.steer-home { grid-area: 1 / 3; }
+.steer-left { grid-area: 2 / 1; }
+.steer-ok { grid-area: 2 / 2; }
+.steer-right { grid-area: 2 / 3; }
+.steer-down { grid-area: 3 / 2; }
+.screen-readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.screen-readout { cursor: default; }
+@media (max-width: 720px) {
+  .screen-lower { grid-template-columns: 1fr; }
+  .screen-steer { justify-content: center; }
+  .screen-controls { justify-content: center; }
+}
+
+/* The Now card's mini TV shows the latest still while it is recent. */
+.tv-screen .tv-still { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.now-card .tv-frame.is-link { cursor: pointer; }

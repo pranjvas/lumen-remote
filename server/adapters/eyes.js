@@ -13,6 +13,7 @@ const CONNECT_TIMEOUT_MS = 15000;
 const CAPTURE_TIMEOUT_MS = 6000;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES = 1024;
+const WATCH_RETRY_MS = 5000;
 
 const digest = (s) => createHash('sha256').update(s).digest();
 
@@ -29,6 +30,9 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   let version = null;
   let unroute = null;
   let latest = null; // { png, width, height, at, ms }
+  let watchEveryMs = 0; // the Screen view's cadence (hub setDemand); 0 = nobody is watching
+  let watchTimer = null;
+  let watchBusy = false;
 
   function setConn(state) {
     store.set('conn.eyes', state, { src: 'derived', via: 'eyes:link' });
@@ -197,6 +201,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
       });
     });
     latest = { ...frame, at: Date.now(), ms: Date.now() - t0 };
+    store.set('screen.meta', { width: latest.width, height: latest.height, ms: latest.ms, captureMs: latest.captureMs }, { src: 'derived', via: 'eyes:capture' });
     store.set('screen.at', latest.at, { src: 'derived', via: 'eyes:capture' });
     return latest;
   }
@@ -205,6 +210,52 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   function capture({ mode = 0, timeoutMs = CAPTURE_TIMEOUT_MS } = {}) {
     if (!Number.isInteger(mode) || mode < 0 || mode > 2) return Promise.reject(new LumenError('INVALID', 'mode is 0, 1 or 2'));
     return queue.push(() => captureOnce(mode, timeoutMs));
+  }
+
+  // ---- watching (the Screen view) ----
+
+  function setError(err) {
+    const value = err ? { code: err.code ?? 'FAILED', message: String(err.message ?? err).slice(0, 200) } : null;
+    if (JSON.stringify(store.get('screen.error')?.v ?? null) !== JSON.stringify(value)) {
+      store.set('screen.error', value, { src: 'derived', via: 'eyes:watch' });
+    }
+  }
+
+  function schedule(ms) {
+    clearTimeout(watchTimer);
+    watchTimer = setTimeout(watchTick, ms);
+  }
+
+  async function watchTick() {
+    if (!watchEveryMs || stopped || watchBusy) return;
+    watchBusy = true;
+    const t0 = Date.now();
+    let failed = false;
+    try {
+      await capture({ mode: 0 });
+      setError(null);
+    } catch (err) {
+      failed = true;
+      setError(err);
+    } finally {
+      watchBusy = false;
+    }
+    if (!watchEveryMs || stopped) return;
+    schedule(failed ? Math.max(watchEveryMs, WATCH_RETRY_MS) : Math.max(0, watchEveryMs - (Date.now() - t0)));
+  }
+
+  // hub presence: screenEveryMs > 0 while a visible client shows the Screen view.
+  function setDemand({ screenEveryMs = 0 } = {}) {
+    const next = Number.isInteger(screenEveryMs) && screenEveryMs > 0 ? screenEveryMs : 0;
+    if (next === watchEveryMs) return;
+    watchEveryMs = next;
+    store.set('screen.watching', next, { src: 'derived', via: 'eyes:watch' });
+    if (!next) {
+      clearTimeout(watchTimer);
+      setError(null);
+    } else if (!watchBusy) {
+      schedule(0); // a new or faster cadence starts with a fresh still
+    }
   }
 
   // ---- lifecycle ----
@@ -216,8 +267,10 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
       if (lan) unroute = lan.route('/eyes', { upgrade: onUpgrade });
       setConn('offline');
     },
+    setDemand,
     async stop() {
       stopped = true;
+      clearTimeout(watchTimer);
       unroute?.();
       queue.clear(new LumenError('UNAVAILABLE', 'Lumen is stopping'));
       failPending('Lumen is stopping');

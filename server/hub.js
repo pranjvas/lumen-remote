@@ -20,6 +20,8 @@ const TOUCH_WINDOW_MS = 3000; // a command "owns" the keys it touched for this l
 const CHANGE_DEBOUNCE_MS = 1000;
 const HOLD_CHECK_MS = 250;
 const MAX_VOLUME_KEY_STEPS = 25;
+const SCREEN_DEFAULT_EVERY_MS = 1000;
+const SCREEN_MIN_EVERY_MS = 500;
 const AI_STATUS_TIMEOUT_MS = 1500;
 const OPEN_ON_TV_TIMEOUT_MS = 10_000;
 const MAX_URL_LENGTH = 2048;
@@ -509,18 +511,22 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     updateBrowserViewers();
     const views = new Set();
     let visible = false;
+    // The Screen view's capture cadence: the fastest any visible viewer asked for (0 = all paused).
+    let screenEveryMs = 0;
     for (const presence of clients.values()) {
       if (!presence.visible) continue;
       visible = true;
       if (presence.view) views.add(presence.view);
+      const every = presence.screenEveryMs ?? SCREEN_DEFAULT_EVERY_MS;
+      if (presence.view === 'screen' && every > 0) screenEveryMs = screenEveryMs ? Math.min(screenEveryMs, every) : every;
     }
-    const signature = `${clients.size}|${visible}|${[...views].sort().join(',')}`;
+    const signature = `${clients.size}|${visible}|${[...views].sort().join(',')}|${screenEveryMs}`;
     if (signature === lastDemand) return;
     lastDemand = signature;
     for (const target of [...Object.values(adapters), ...Object.values(features)]) {
       if (typeof target?.setDemand !== 'function') continue;
       try {
-        target.setDemand({ clients: clients.size, visible, views: new Set(views) });
+        target.setDemand({ clients: clients.size, visible, views: new Set(views), screenEveryMs });
       } catch (err) {
         log.warn('setDemand failed', err);
       }
@@ -706,6 +712,16 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       requireTvOn();
       const shot = await call('eyes', 'capture', { mode: mode === undefined ? 0 : integer(mode, 'mode', 0, 2) });
       return { value: { at: shot.at, width: shot.width, height: shot.height, ms: shot.ms, url: `/api/screen.png?at=${shot.at}` } };
+    },
+
+    // How often this client's Screen view wants a fresh still: 0 pauses it.
+    'screen.watch': async ({ everyMs }, client) => {
+      const presence = clients.get(client);
+      const every = integer(everyMs, 'everyMs', 0, 60000);
+      if (every !== 0 && every < SCREEN_MIN_EVERY_MS) throw invalid(`everyMs is 0 or at least ${SCREEN_MIN_EVERY_MS}`);
+      if (presence) presence.screenEveryMs = every;
+      updateDemand();
+      return { value: { everyMs: every } };
     },
 
     'pair.remote': async () => {

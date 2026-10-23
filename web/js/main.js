@@ -20,6 +20,7 @@ import { mountMouse } from './views/mouse.js';
 import { mountCast } from './views/cast.js';
 import { mountBrowser } from './views/browser.js';
 import { mountScenes } from './views/scenes.js';
+import { mountScreen } from './views/screen.js';
 import { createAsk } from './views/ask.js';
 import { watchIme } from './views/text.js';
 import { mountShortcuts, openHelp } from './views/shortcuts.js';
@@ -62,6 +63,7 @@ state.watch('device.name', () => {
 mountRemote($('#instrument'), ctx);
 const panels = {
   now: mountInto('now', mountNow),
+  screen: mountInto('screen', mountScreen),
   apps: mountInto('apps', mountApps),
   settings: mountInto('settings', mountSettings),
   keys: mountInto('keys', mountKeys),

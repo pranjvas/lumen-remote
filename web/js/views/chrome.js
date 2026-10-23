@@ -11,6 +11,7 @@ import { pairButton, agentButton } from './settings.js';
 
 export const VIEWS = [
   { id: 'remote', label: 'Remote', icon: 'remote', rank: 1 },
+  { id: 'screen', label: 'Screen', icon: 'eye', rank: 1 },
   { id: 'apps', label: 'Apps', icon: 'apps', rank: 1 },
   { id: 'cast', label: 'Cast', icon: 'cast', rank: 1 },
   { id: 'browser', label: 'Browser', icon: 'globe', rank: 1 },
