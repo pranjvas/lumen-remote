@@ -12,7 +12,7 @@ import { LumenError } from '../errors.js';
 const PROFILE_DIR = 'browser-profile';
 const HOME_URL = 'https://duckduckgo.com/';
 const VIEWPORT = Object.freeze({ minW: 320, maxW: 1280, minH: 320, maxH: 800 });
-const START_TIMEOUT_MS = 20_000;
+const START_TIMEOUT_MS = 45_000; // a busy PC can take a while to bring Edge up
 const POLL_MS = 150;
 const BROWSER_CLOSE_MS = 1500; // Browser.close is given this long before the port check
 const EXIT_WAIT_MS = 3000; // then the DevTools port must be gone within this
