@@ -653,6 +653,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (ready && page) return Promise.resolve();
     starting ??= launch()
       .catch(async (err) => {
+        // Right after a Lumen restart the old Edge can still be letting go of the profile: try once more.
+        if (!/did not start in time/.test(err.message) || stopped) throw err;
+        log.info('browser start retry', { message: err.message });
+        await teardown();
+        await sleep(2000);
+        return launch();
+      })
+      .catch(async (err) => {
         const message = err instanceof LumenError ? err.message : `The browser could not start: ${err.message}`;
         log.warn('browser start failed', { message: err.message });
         await teardown();
