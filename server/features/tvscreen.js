@@ -473,16 +473,33 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const adapter = a();
     if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
-    const { url, token } = relay().register(pick.url, pick.headers);
     // HLS with fragmented-MP4 segments never plays in the TV's own player (CineHD found the same), so
-    // the agent goes straight to its in-page hls.js player for it.
-    let probeTimer = null;
-    const probe = pick.kind === 'hls' && relay().probeHls
-      ? await Promise.race([
-        relay().probeHls(token).catch(() => null),
+    // the agent goes straight to its in-page hls.js player for it. A playlist the server refuses (a
+    // one-time link the page's player already used: Dailymotion's cdndirector answers 403 the second
+    // time) is passed over for the next stream the page loaded.
+    const probeOnce = async (token) => {
+      let probeTimer = null;
+      return Promise.race([
+        relay().probeHls(token).catch((err) => ({ refused: /answered (4\d\d)/.test(err.message), error: err.message })),
         new Promise((r) => { probeTimer = setTimeout(r, PROBE_MS, null); }),
-      ]).finally(() => clearTimeout(probeTimer))
-      : null;
+      ]).finally(() => clearTimeout(probeTimer));
+    };
+    let { url, token } = relay().register(pick.url, pick.headers);
+    let probe = pick.kind === 'hls' && relay().probeHls ? await probeOnce(token) : null;
+    if (probe?.refused && !explicit) {
+      const others = (b().media?.() ?? []).filter((m) => m.kind === 'hls' && m.url !== pick.url).slice(0, 4);
+      for (const other of others) {
+        const next = relay().register(other.url, other.headers);
+        const tried = await probeOnce(next.token);
+        if (tried?.refused) continue;
+        log.info('playlist refused; using another stream the page loaded', { from: new URL(pick.url).hostname, to: new URL(other.url).hostname });
+        Object.assign(pick, other);
+        ({ url, token } = next);
+        probe = tried;
+        break;
+      }
+    }
+    if (probe?.refused || probe?.error) probe = null;
     if (probe?.drm) return playProtected(pick, ctx);
     const engine = probe?.fmp4 ? 'hls' : 'avplay';
     checkLive(ctx);
