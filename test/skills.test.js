@@ -184,3 +184,26 @@ describe('tools: play_title and save_app_skill', () => {
     assert.equal(cine.isError, true);
   });
 });
+
+describe('tools: typing on an app keyboard and the Agent SDK schema', () => {
+  test('type_on_keyboard types in one call and can leave the keyboard to the right', async () => {
+    const keys = [];
+    const hub = { async handle(cmd) { if (cmd.cmd === 'key') keys.push(cmd.key); return { ok: true, value: {} }; } };
+    const ctx = { hub, store: { get: () => undefined }, sleepFn: async () => {} };
+    const out = await callTool('type_on_keyboard', { rows: HOTSTAR_ROWS, start: 'A', text: 'Harold!', exitRight: true }, ctx);
+    assert.equal(out.isError, false, out.text);
+    assert.equal(out.result.typed, 'Harold');
+    assert.deepEqual(keys.slice(-4), ['KEY_RIGHT', 'KEY_RIGHT', 'KEY_RIGHT', 'KEY_RIGHT']);
+    const bad = await callTool('type_on_keyboard', { rows: HOTSTAR_ROWS, start: 'Q9', text: 'a' }, ctx);
+    assert.equal(bad.isError, true);
+  });
+
+  test('save_app_skill flows survive the Agent SDK schema (a free-form object keeps its keys)', async () => {
+    const { toZodShape } = await import('../server/ai/agent-sdk-backend.js');
+    const { TOOL_DEFINITIONS } = await import('../server/ai/tools.js');
+    const { z } = await import('zod');
+    const def = TOOL_DEFINITIONS.find((t) => t.name === 'save_app_skill');
+    const parsed = z.object(toZodShape(def.inputSchema)).parse({ app: 'X', flows: { open: [{ launch: true }] } });
+    assert.deepEqual(parsed.flows, { open: [{ launch: true }] });
+  });
+});

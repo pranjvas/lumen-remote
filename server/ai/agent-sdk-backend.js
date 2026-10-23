@@ -55,7 +55,11 @@ function zodType(schema) {
       type = bounded(z.array(zodType(schema.items)), schema.minItems, schema.maxItems);
       break;
     case 'object':
-      type = z.object(toZodShape(schema));
+      // A free-form object (no properties, e.g. save_app_skill flows) keeps its keys; tools.js validates it.
+      type = schema.properties ? z.object(toZodShape(schema)) : z.record(z.string(), z.any());
+      break;
+    case 'null':
+      type = z.null();
       break;
     default:
       throw new Error(`Unsupported schema type "${types[0]}"`);

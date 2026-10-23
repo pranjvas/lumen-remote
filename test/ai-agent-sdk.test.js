@@ -160,7 +160,7 @@ describe('agent-sdk: zod shapes from the tool definitions', () => {
   });
 
   test('a schema type outside the subset the tools use is rejected loudly', () => {
-    assert.throws(() => toZodShape({ properties: { x: { type: 'null' } }, required: [] }), /Unsupported schema type "null"/);
+    assert.throws(() => toZodShape({ properties: { x: { type: 'date' } }, required: [] }), /Unsupported schema type "date"/);
   });
 });
 

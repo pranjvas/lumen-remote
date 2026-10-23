@@ -3,7 +3,7 @@
 // checked semantically; actions go through hub.handle so the hub's safety rules and read-back
 // apply exactly as they do for a browser command.
 import { matchUrl, parseCastUrl } from '../features/cast.js';
-import { runFlow } from './skills.js';
+import { gridPath, runFlow } from './skills.js';
 
 // The synthetic hub client for AI-issued commands; acks go nowhere (handle() returns them).
 const AI_CLIENT = Object.freeze({ id: 'lumen-ai', ai: true, send() {} });
@@ -259,6 +259,7 @@ const TYPE_CHECKS = {
   integer: Number.isInteger,
   number: (v) => typeof v === 'number' && Number.isFinite(v),
   boolean: (v) => typeof v === 'boolean',
+  null: (v) => v === null,
 };
 
 function validate(schema, value, path = 'input') {
@@ -747,6 +748,32 @@ const TOOLS = [
         summary: `Opened ${choice.service} for ${label}. Lumen has no complete ${choice.service} skill yet: find and play it by sight (search, open the title, play), then save the steps with save_app_skill so next time is automatic.`,
         image: await io.look(),
       };
+    },
+  },
+  {
+    name: 'type_on_keyboard',
+    description: 'Type text on an app\'s own on-screen keyboard in one call, without looking between letters. Look at the keyboard once, then give its keys row by row exactly as shown (null for an empty spot; repeat a label across columns for a wide key such as "Space") and the key that is focused now. Lumen works out the arrow presses. Use exitRight to move off the keyboard to the results on its right afterwards. Save the layout in the app skill (typeGrid) when it worked.',
+    inputSchema: object({
+      rows: { type: 'array', minItems: 1, maxItems: 10, items: { type: 'array', minItems: 1, maxItems: 16, items: { type: ['string', 'null'], maxLength: 12 } }, description: 'Keyboard rows, left to right' },
+      start: { type: 'string', minLength: 1, maxLength: 12, description: 'The key that has focus now' },
+      text: { type: 'string', minLength: 1, maxLength: 60, description: 'What to type' },
+      exitRight: { type: 'boolean', description: 'Afterwards, press Right until focus leaves the keyboard' },
+    }, ['rows', 'start', 'text']),
+    async run({ rows, start, text, exitRight = false }, ctx) {
+      const { hub, store } = ctx;
+      if (isCineHd(foregroundApp(store))) fail('Lumen does not type inside CineHD.', 'UNAVAILABLE');
+      if (!rows.some((r) => r.some((k) => k != null && String(k).toLowerCase() === start.toLowerCase()))) fail(`"${start}" is not one of the keys you listed`);
+      const plan = gridPath({ rows, start, maxChars: 40 }, cleanSearchText(text));
+      if (!plan.typed) fail('None of those characters are on that keyboard');
+      const keys = [...plan.keys];
+      if (exitRight) for (let i = 0; i < Math.max(1, plan.cols - plan.end.col); i++) keys.push('KEY_RIGHT');
+      const pause = ctx.sleepFn ?? sleep;
+      for (const [i, key] of keys.entries()) {
+        if (ctx.signal?.aborted) fail('Cancelled', 'CANCELLED');
+        await send(hub, { cmd: 'key', key });
+        if (i < keys.length - 1) await pause(260);
+      }
+      return { ok: true, typed: plan.typed, presses: keys.length, summary: `Typed "${plan.typed}" on the app keyboard (${keys.length} presses)` };
     },
   },
   {

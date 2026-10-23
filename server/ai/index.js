@@ -163,6 +163,7 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
         text: clip(request, 300),
         tools: (outcome.tools ?? []).map((tool) => (tool.ok ? tool.name : `${tool.name} (failed)`)),
         ok: outcome.ok,
+        ...(outcome.text && { reply: clip(outcome.text, 400) }),
         ...(outcome.error && { error: `${outcome.error.code}: ${outcome.error.message}` }),
         ...(outcome.model && { model: outcome.model }),
         ...cost,
