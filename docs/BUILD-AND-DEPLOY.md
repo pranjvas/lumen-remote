@@ -122,6 +122,24 @@ The agent is a Tizen web app. It reads TV state, runs the browser screen, and pl
 
 Rules for agent code: the TV's engine is Chromium 69, so **no `?.`, `??` or other ES2020+ syntax** in `companion/agent/*.js`. `test/agent-live.test.js` guards this. Don't leave the agent in debug mode: its DevTools port is reachable from the LAN.
 
+### Installing with Apps2Samsung (no Tizen Studio, no certificate profile)
+
+[Apps2Samsung](https://github.com/Apps2Samsung/Apps2Samsung) (MIT, Windows/macOS/Linux/Android) installs any `.wgt` on a Samsung TV. It re-signs the package itself: on Tizen 4.x–6.x (the Q95T is 5.5) with a bundled Tizen developer certificate and no sign-in; on Tizen 7+ with a Samsung certificate it creates after a Samsung-account sign-in. The TV still needs **Developer mode on, pointing at the machine that runs Apps2Samsung**.
+
+1. **Package** (unsigned; no Tizen Studio needed). Writes `companion/build/LumenAgent-<version>-apps2samsung.wgt`:
+   ```powershell
+   npm run agent:package:a2s       # = tools/agent/package-apps2samsung.ps1 [-DataDir <data folder>]
+   ```
+   It bakes in this PC's address and the agent key from `data/secrets.json` (read only, never created), like `build.ps1`. **The file is a personal build: don't publish it.**
+2. **Install:** open Apps2Samsung, pick the TV, choose **Custom WGT / TPK**, select the `.wgt`, and install. Leave the certificate on its default.
+3. **Start it** as in step 4 above.
+
+Things to know:
+- **The first install replaces the `Q95T`-signed copy.** The certificates differ, so the TV refuses to overwrite; Apps2Samsung uninstalls the old copy and installs again (if it can't, delete Lumen Agent from the TV's Apps screen first). The agent's local storage goes with it. Afterwards, `install.sh` builds (signed with `Q95T`) hit the same mismatch the other way: delete the Apps2Samsung copy first, or keep using Apps2Samsung.
+- **One sdb host at a time.** Apps2Samsung talks to the TV's sdbd itself and stops a Tizen Studio `sdb` server it finds on the same PC. Don't run it while `install.sh` or a CineHD pipeline is using the TV.
+- The version rule still applies: bump `config.xml` before each new build.
+- If the agent is ever given a Partner privilege (`vpnservice`, `drminfo`, `*.partner`) or `on-boot="true"`, Apps2Samsung needs a Partner certificate. The script refuses such a `config.xml`.
+
 ---
 
 ## 4. Lumen Eyes (`companion/eyes`)
