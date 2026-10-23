@@ -46,8 +46,10 @@
     #frame { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; object-fit: contain; }
     #av { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; }
     #mse { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; background: #000; display: none; }
-    #cursor { position: absolute; top: 0; left: 0; width: 34px; height: 34px; margin: -4px 0 0 -4px; display: none; pointer-events: none;
-      background: no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4 2l15 11-7 1-4 7z' fill='%23fff' stroke='%23000' stroke-width='1.5'/%3E%3C/svg%3E"); background-size: 34px 34px; }
+    /* Big enough to find from the sofa on any page: amber arrow, dark outline, soft glow; the tip is the point. */
+    #cursor { position: absolute; top: 0; left: 0; width: 64px; height: 64px; margin: -5px 0 0 -11px; display: none; pointer-events: none;
+      background: no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4 2l15 11-7 1-4 7z' fill='%23ffb547' stroke='%23140d02' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E"); background-size: 64px 64px;
+      -webkit-filter: drop-shadow(0 0 10px rgba(255, 181, 71, .65)) drop-shadow(0 2px 4px rgba(0, 0, 0, .8)); filter: drop-shadow(0 0 10px rgba(255, 181, 71, .65)) drop-shadow(0 2px 4px rgba(0, 0, 0, .8)); }
     .hint { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); padding: 14px 26px; border-radius: 999px;
       background: rgba(10, 10, 14, .82); color: #ece6da; font-size: 22px; letter-spacing: .02em; opacity: 0; transition: opacity .4s; white-space: nowrap; }
     .hint.show, .toast.show { opacity: 1; }
