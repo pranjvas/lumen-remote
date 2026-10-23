@@ -290,6 +290,7 @@
   #view-settings .view-head { margin-top: var(--sp-3); }
   .chips.settings-index {
     width: auto;
+    max-width: none;
     margin: 0 calc(-1 * var(--gutter)) var(--sp-4);
     padding: var(--sp-2) var(--gutter);
     gap: 6px;
@@ -1096,7 +1097,8 @@
   .browser-vpn-row .btn.sm { flex: none; height: 28px; padding: 0 10px; font-size: 12px; }
   .browser-vpn-row .btn.sm .icon { width: 15px; height: 15px; }
   .browser-overlay:has(> .browser-welcome) { padding: 0; }
-  .browser-welcome { justify-content: center; width: 100%; max-width: none; height: 100%; padding: var(--sp-5) var(--sp-4); border: 0; border-radius: inherit; box-shadow: none; overflow-y: auto; }
+  .browser-stage:has(.browser-welcome) { background: var(--panel); }
+  .browser-welcome { justify-content: center; width: 100%; max-width: none; height: 100%; padding: var(--sp-5) var(--sp-4); border: 0; border-radius: 0; background: var(--panel); box-shadow: none; overflow-y: auto; animation: none; }
   .browser-orb { width: 56px; height: 56px; margin-bottom: var(--sp-3); }
   .browser-lead { font-size: var(--fs-xl); }
   .browser-copy { margin-bottom: var(--sp-4); font-size: 13px; color: var(--ink-3); }

@@ -51,7 +51,7 @@
   gap: 18px;
   padding: 24px;
   text-align: center;
-  color: var(--ink-2);
+  color: rgba(236, 232, 224, 0.78); /* the frame is a dark screen in both themes */
   font-size: 14px;
 }
 .screen-empty[hidden] { display: none; }
