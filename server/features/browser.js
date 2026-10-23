@@ -2,7 +2,8 @@
 // Protocol. Its screen streams to the Lumen clients on the Browser view as JPEG frames
 // (Page.startScreencast) and their pointer and keyboard input goes back (Input.*). Edge starts on
 // first use, keeps its profile under data/browser-profile, listens on 127.0.0.1 only and closes
-// after idleMs without a viewer. The process-handling follows tools/screenshot.mjs.
+// after idleMs without a viewer. The process-handling follows tools/screenshot.mjs. Clear history
+// (clearHistory, removeProfileData) closes Edge and deletes the chosen kinds of data from the profile.
 import { spawn, execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -171,6 +172,104 @@ export function adDestination(raw) {
   return null;
 }
 
+// ---------- clear history (the Browser view's Clear history; hub browser.clearHistory) ----------
+
+// What each choice removes from the Edge profile while Edge is closed: paths under the profile, a
+// trailing * matches every name with that prefix (a database and its -journal/-wal files). Edge makes
+// fresh empty ones on its next start. Bookmarks, saved passwords, autofill, site permissions and
+// Edge's own settings are kept; so is everything outside the profile (the VPN is in data/vpn).
+//
+// History: visits, typed addresses, search terms and the downloads list (History), visited-link
+// colouring, top sites, address-bar shortcuts and predictions, favicons of visited pages, open and
+// closed tabs (Sessions, Session Storage), bounce tracking, per-site load and media statistics, and the
+// hosts the network stack remembers (HSTS, HTTP/2 and alt-svc, reporting endpoints), plus crash reports.
+export const PROFILE_HISTORY = Object.freeze([
+  'Default/History*', 'Default/Visited Links', 'Default/Top Sites*', 'Default/Shortcuts*', 'Default/Favicons*',
+  'Default/Network Action Predictor*', 'Default/Session Storage', 'Default/Sessions', 'Default/Sessions_Encrypted',
+  'Default/EdgeSessions', 'Default/Current Session', 'Default/Current Tabs', 'Default/Last Session', 'Default/Last Tabs',
+  'Default/DIPS*', 'Default/Media History*', 'Default/JumpListIconsRecentClosed', 'Default/Site Characteristics Database',
+  'Default/VideoDecodeStats', 'Default/optimization_guide_hint_cache_store', 'Default/load_statistics.db*',
+  'Default/Network/Network Persistent State', 'Default/Network/TransportSecurity', 'Default/Network/Reporting and NEL*',
+  'Crashpad/reports', 'Crashpad/attachments',
+]);
+// Cached images and files: the HTTP cache, compiled scripts, GPU and shared-dictionary caches.
+export const PROFILE_CACHE = Object.freeze([
+  'Default/Cache', 'Default/Code Cache', 'Default/GPUCache', 'Default/DawnGraphiteCache', 'Default/DawnWebGPUCache', 'Default/Shared Dictionary',
+]);
+// Cookies and site data (signs out of sites): cookies and every kind of site storage.
+export const PROFILE_SITE_DATA = Object.freeze([
+  'Default/Cookies*', 'Default/Network/Cookies*', 'Default/Network/Trust Tokens*', 'Default/Network/Device Bound Sessions*',
+  'Default/Network/SCT Auditing Pending Reports', 'Default/Local Storage', 'Default/IndexedDB', 'Default/Service Worker',
+  'Default/WebStorage', 'Default/blob_storage', 'Default/File System', 'Default/databases', 'Default/Shared Storage*',
+  'Default/Platform Notifications', 'Default/BudgetDatabase', 'Default/PersistentOriginTrials', 'Default/MediaDeviceSalts*',
+  'Default/MediaFoundationCdmStore',
+]);
+// Per-site lists in Default/Preferences (keyed by the sites visited), removed with the same choices.
+const SITE_SETTINGS = ['profile', 'content_settings', 'exceptions'];
+const PREFS_HISTORY = [
+  [...SITE_SETTINGS, 'site_engagement'], [...SITE_SETTINGS, 'media_engagement'], [...SITE_SETTINGS, 'app_banner'],
+  [...SITE_SETTINGS, 'important_site_info'], ['web_apps', 'daily_metrics'],
+];
+const PREFS_SITE_DATA = [
+  [...SITE_SETTINGS, 'client_hints'], [...SITE_SETTINGS, 'fedcm_idp_signin'], [...SITE_SETTINGS, 'cookie_controls_metadata'],
+  [...SITE_SETTINGS, 'storage_access'], [...SITE_SETTINGS, 'top_level_storage_access'], ['login_detection', 'oauth_signed_in_origins'],
+];
+
+function profileMatches(profileDir, pattern) {
+  const dir = path.join(profileDir, path.dirname(pattern));
+  const base = path.basename(pattern);
+  if (!base.endsWith('*')) return fs.existsSync(path.join(dir, base)) ? [path.join(dir, base)] : [];
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names.filter((name) => name.startsWith(base.slice(0, -1))).map((name) => path.join(dir, name));
+}
+
+/**
+ * Removes the chosen kinds of browsing data from a closed Edge profile (see PROFILE_HISTORY and the
+ * lists after it). → { removed, left }: how many files and folders went, and the profile-relative
+ * names that could not be removed (in use).
+ */
+export function removeProfileData(profileDir, { history = true, cache = true, cookies = false } = {}) {
+  const patterns = [...(history ? PROFILE_HISTORY : []), ...(cache ? PROFILE_CACHE : []), ...(cookies ? PROFILE_SITE_DATA : [])];
+  let removed = 0;
+  const left = [];
+  for (const pattern of patterns) {
+    for (const target of profileMatches(profileDir, pattern)) {
+      try {
+        fs.rmSync(target, { recursive: true, force: true, maxRetries: 4, retryDelay: 150 });
+        removed += 1;
+      } catch {
+        left.push(path.relative(profileDir, target).split(path.sep).join('/'));
+      }
+    }
+  }
+  const prefs = [...(history ? PREFS_HISTORY : []), ...(cookies ? PREFS_SITE_DATA : [])];
+  const prefsFile = path.join(profileDir, 'Default', 'Preferences');
+  if (prefs.length && fs.existsSync(prefsFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(prefsFile, 'utf8'));
+      let changed = false;
+      for (const keyPath of prefs) {
+        const parent = keyPath.slice(0, -1).reduce((obj, key) => (obj && typeof obj === 'object' ? obj[key] : undefined), data);
+        const last = keyPath.at(-1);
+        if (parent && typeof parent === 'object' && Object.hasOwn(parent, last)) {
+          delete parent[last];
+          changed = true;
+        }
+      }
+      if (changed) {
+        const tmp = `${prefsFile}.lumen-tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(data));
+        fs.renameSync(tmp, prefsFile);
+        removed += 1;
+      }
+    } catch {
+      left.push('Default/Preferences');
+    }
+  }
+  return { removed, left };
+}
+
 export function clampViewport(w, h) {
   return {
     w: clamp(Math.round(Number(w) || VIEWPORT.maxW), VIEWPORT.minW, VIEWPORT.maxW),
@@ -327,6 +426,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   const mediaRequests = new Map(); // requestId → { url, type, headers }
   const MEDIA_KEEP = 20;
   const { edgePath } = settings;
+  const homeUrl = settings.homeUrl ?? HOME_URL; // Home, and the TV's page after Clear history (tests use a loopback one)
   const profileDir = path.join(config.dataDir, PROFILE_DIR);
 
   let viewport = { w: VIEWPORT.maxW, h: VIEWPORT.maxH };
@@ -348,6 +448,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let titleFromPage = null; // the current document's title as reported by PAGE_SCRIPT
   let ready = false;
   let starting = null; // the in-flight launch, so concurrent opens share it
+  let wiping = null; // clear history closing Edge and deleting profile files; launches wait for it
   let stopped = false;
   const pressed = new Set(); // mouse buttons currently held
 
@@ -972,6 +1073,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   function ensureRunning() {
+    // Clear history is deleting the profile's files: Edge starts again once they are gone.
+    if (wiping) return wiping.catch(() => {}).then(() => ensureRunning());
     if (ready && page) return Promise.resolve();
     starting ??= launch()
       .catch(async (err) => {
@@ -1033,7 +1136,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       closePopup();
       return {};
     }
-    if (action === 'home') return open(HOME_URL);
+    if (action === 'home') return open(homeUrl);
     const cdp = requireReady();
     switch (action) {
       case 'reload':
@@ -1202,6 +1305,75 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return {};
   }
 
+  // ---------- clear history ----------
+
+  // While Edge runs: what DevTools can clear in place (the tab's back/forward list, the HTTP cache,
+  // cookies and the current site's storage). Each step is best-effort; the file removal after Edge
+  // closes is what makes the clearing complete.
+  async function clearLive({ history, cache, cookies }) {
+    const cdp = mainPage ?? page;
+    if (!ready || !cdp) return;
+    const step = (method, params) => Promise.race([
+      cdp.send(method, params).catch((err) => log.debug('clear step failed', { method, message: err.message })),
+      sleep(3000),
+    ]);
+    if (history) await step('Page.resetNavigationHistory');
+    if (cache) await step('Network.clearBrowserCache');
+    if (cookies) {
+      await step('Network.clearBrowserCookies');
+      let origin = null;
+      try { origin = new URL(store.get('browser.url')?.v).origin; } catch { /* no page */ }
+      if (origin && origin !== 'null') await step('Storage.clearDataForOrigin', { origin, storageTypes: 'all' });
+    }
+  }
+
+  /**
+   * Clears what the browser kept (Clear history): `history` (pages, back/forward, address-bar data,
+   * tabs, per-site statistics), `cache`, `cookies` (cookies and site data: signs out of sites). Edge
+   * closes, the profile's files go, and Lumen forgets the page, its title and the videos it saw.
+   * Edge starts again right away only when it must show something: on the TV (the home page), or
+   * the same page when history was kept. → { removed, left, restarted }.
+   */
+  async function clearHistory({ history = true, cache = true, cookies = false } = {}) {
+    if (stopped) throw new LumenError('UNAVAILABLE', 'Lumen is stopping');
+    while (wiping) await wiping.catch(() => {});
+    const wasRunning = !!(child || page || starting);
+    const reopen = history ? null : store.get('browser.url')?.v ?? null;
+    const wipe = (async () => {
+      if (starting) await starting.catch(() => {});
+      await clearLive({ history, cache, cookies });
+      if (child || page) await close();
+      else await killStrays(); // an Edge left behind by an earlier run would keep the files locked
+      mediaSeen = [];
+      mediaRequests.clear();
+      lastSnapshot = null;
+      if (history) {
+        lastUserInput = 0;
+        titleFromPage = null;
+        clearPage();
+        if (store.get('browser.media')) publish('media', 0);
+      }
+      return removeProfileData(profileDir, { history, cache, cookies });
+    })();
+    wiping = wipe;
+    let result;
+    try {
+      result = await wipe;
+    } finally {
+      wiping = null;
+    }
+    if (result.left.length) log.warn('some browsing data was in use and stayed', { count: result.left.length });
+    let restarted = false;
+    if (wasRunning && !stopped && (reopen || sinks.size)) {
+      restarted = await open(reopen ?? homeUrl).then(() => true, (err) => {
+        log.warn('the browser did not start again after clearing', { message: err.message });
+        return false;
+      });
+    }
+    log.debug('browsing data cleared', { history, cache, cookies, removed: result.removed, restarted });
+    return { ...result, restarted };
+  }
+
   /** Adds a frame receiver (bytes, frame) and locks the TV viewport; → a function that removes it. */
   function addSink(fn) {
     sinks.add(fn);
@@ -1342,6 +1514,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     viewers,
     ack,
     close,
+    clearHistory,
     evaluate,
     evaluateFrames,
 

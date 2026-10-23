@@ -5,6 +5,7 @@
 
 import { h, icon, fill } from '../ui/dom.js';
 import { toast } from '../ui/toast.js';
+import { openSheet } from '../ui/sheet.js';
 import { haptic } from '../ui/haptics.js';
 import { accelerate, bindTrackpad, readGain } from '../ui/trackpad.js';
 
@@ -24,6 +25,12 @@ const SUGGESTIONS = [['DuckDuckGo', 'https://duckduckgo.com/'], ['Wikipedia', 'h
 const BUTTONS = ['left', 'middle', 'right'];
 const SPECIAL_KEYS = new Set(['Enter', 'Backspace', 'Delete', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
 const SESSION = { off: ['off', 'Browser off'], starting: ['warn', 'Starting…'], ready: ['good', 'Live'], error: ['bad', 'Error'] };
+// Clear history: what each choice removes (server/features/browser.js PROFILE_* and features/history.js).
+const CLEAR_CHOICES = [
+  ['history', 'Browsing history', 'Pages opened, back and forward, recent sites and suggestions, open tabs, and the page addresses in Lumen’s logs', true],
+  ['cache', 'Cached images and files', 'Copies of pages and pictures kept so they load faster', true],
+  ['cookies', 'Cookies and site data', 'Signs you out of most sites and removes what sites stored', false],
+];
 
 // Address-bar text → URL: schemes pass through (the server refuses anything but http/https),
 // host-like text gets https://, anything else becomes a DuckDuckGo search.
@@ -159,6 +166,10 @@ export function mountBrowser(root, ctx) {
     return b;
   };
   const closeButtons = [closeButton(''), closeButton('sm')];
+  const clearButton = h('button', {
+    class: 'btn ghost sm browser-clear', type: 'button', 'aria-label': 'Clear history', title: 'Clear the browser’s history, cache or cookies',
+  }, icon('trash', 'sm'), h('span', { text: 'Clear history' }));
+  clearButton.addEventListener('click', () => { haptic('key'); openClear(); });
   const keyboardBtn = h('button', { class: 'btn ghost', type: 'button', 'aria-label': 'Keyboard', 'aria-pressed': 'false' }, icon('keyboard'), h('span', { text: 'Keyboard' }));
   keyboardBtn.addEventListener('click', () => setKeyboard(!keyboardOn));
   const padButtons = [
@@ -263,7 +274,7 @@ export function mountBrowser(root, ctx) {
     h('div', { class: 'browser-bar' },
       h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload, padButtons[0]),
       form, vpnButtons[0], tvButton('primary'), tvExtra('browser-tvx', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('browser-tvx', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
-    h('div', { class: 'browser-status' }, dot, statusText, meta, closeButtons[1]),
+    h('div', { class: 'browser-status' }, dot, statusText, meta, clearButton, closeButtons[1]),
     vpnRow,
     stage,
     pad,
@@ -304,6 +315,64 @@ export function mountBrowser(root, ctx) {
 
   function retry() {
     open(lastUrl || url() || toUrl(address.value) || SUGGESTIONS[0][1]);
+  }
+
+  /* ---------- clear history ---------- */
+
+  // This phone's own copy: the last address, the page picture and any browser keys it saved (only
+  // the trackpad switch is a setting, and it stays). Every client does this on browser.cleared.
+  function forgetLocal() {
+    lastUrl = null;
+    queued = null;
+    hasFrame = false;
+    paint.fillStyle = '#000';
+    paint.fillRect(0, 0, canvas.width, canvas.height);
+    if (document.activeElement !== address) address.value = url() || '';
+    try {
+      for (const key of Object.keys(localStorage)) if (key.startsWith('lumen.browser.') && key !== PAD_KEY) localStorage.removeItem(key);
+    } catch { /* storage unavailable */ }
+    shape = '';
+    paintState();
+  }
+  ctx.live.on('browser.cleared', forgetLocal);
+
+  const listOf = (words) => (words.length > 1 ? `${words.slice(0, -1).join(', ')} and ${words.at(-1)}` : words[0]);
+
+  function openClear() {
+    openSheet({
+      title: 'Clear browsing data',
+      className: 'clear-sheet',
+      build(body, sheet) {
+        const choices = CLEAR_CHOICES.map(([key, label, detail, on]) => {
+          const box = h('input', { type: 'checkbox', checked: on ? true : null });
+          return { key, box, el: h('label', { class: 'capture-row clear-row' }, box, h('span', { class: 'clear-text' }, h('b', { text: label }), h('small', { text: detail }))) };
+        });
+        const cancel = h('button', { class: 'btn ghost', type: 'button', text: 'Cancel' });
+        const confirm = h('button', { class: 'btn primary', type: 'button' }, icon('trash'), 'Clear data');
+        const sync = () => { confirm.disabled = !choices.some((c) => c.box.checked); };
+        for (const c of choices) c.box.addEventListener('change', sync);
+        cancel.addEventListener('click', () => sheet.close());
+        confirm.addEventListener('click', async () => {
+          const args = Object.fromEntries(choices.map((c) => [c.key, c.box.checked]));
+          confirm.classList.add('is-busy');
+          confirm.disabled = true;
+          // Edge closes and its files are deleted, which can take a while on a busy PC.
+          const ack = await ctx.cmd('browser.clearHistory', args, { el: confirm, timeoutMs: 120000 });
+          confirm.classList.remove('is-busy');
+          if (!ack.ok) { sync(); return; }
+          sheet.close();
+          forgetLocal();
+          const what = listOf([args.history && 'history', args.cache && 'cached files', args.cookies && 'cookies'].filter(Boolean));
+          if (ack.value?.left?.length) toast(`Cleared ${what}, but some browser files were in use · try again`, { level: 'warn', timeout: 6000 });
+          else toast(`Cleared ${what}${args.cookies ? ' · signed out of sites' : ''}`, { level: 'ok' });
+        });
+        body.append(
+          h('p', { class: 'sheet-lead', text: 'Removes what Lumen’s browser on this PC has kept. Everyone using Lumen shares this browser, so it clears for them too.' }),
+          h('div', { class: 'capture-list' }, choices.map((c) => c.el)),
+          h('p', { class: 'clear-note', text: 'Kept: bookmarks, saved passwords, site permissions, the VPN and Lumen’s settings. The browser closes while it clears; Ask Lumen chats are not touched.' }),
+          h('div', { class: 'sheet-actions' }, cancel, confirm));
+      },
+    });
   }
 
   form.addEventListener('submit', (e) => { e.preventDefault(); open(toUrl(address.value)); });

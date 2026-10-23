@@ -553,6 +553,13 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     },
     register,
     registerBlob,
+    /** Clear history: drops every registered stream and file (their addresses, the page's cookies). → how many. */
+    forget() {
+      const count = sessions.size + blobs.size;
+      sessions.clear();
+      blobs.clear();
+      return count;
+    },
     probeHls,
     convertedUrl: (job) => `${base()}/x/${job}/index.m3u8`,
     proxyUrl: () => vpn()?.proxyUrl?.() ?? null,

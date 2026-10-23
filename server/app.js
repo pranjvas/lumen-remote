@@ -28,6 +28,7 @@ import { createTvScreen } from './features/tvscreen.js';
 import { createTranscoder } from './features/transcode.js';
 import { createLiveVideo } from './features/livevideo.js';
 import { createMemory } from './features/memory.js';
+import { createHistory } from './features/history.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -113,6 +114,9 @@ export async function startServer(overrides = {}, seams = {}) {
     features.browser = createBrowser({ ...ctx, hub, vpn: () => features.vpn });
     features.livevideo = createLiveVideo({ ...ctx, browser: () => features.browser });
     features.tvscreen = createTvScreen({ ...ctx, agent: () => agent, rest, browser: () => features.browser, relay: () => features.relay, transcoder: () => features.transcode, cast: () => features.cast, liveVideo: () => features.livevideo });
+    // Clear history (hub browser.clearHistory) reaches the browser, the TV screen, the relay, the
+    // converter and the log files.
+    features.history = createHistory({ ...ctx, features });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);

@@ -144,10 +144,36 @@ export function createTranscoder({ config, log: rootLog }) {
     return fs.existsSync(p) ? p : null;
   }
 
+  /** Clear history: removes converted videos (this run's jobs and the folders earlier runs left in
+   *  <dataDir>/transcode) except the jobs in `keep` (the one the TV is playing). → how many went. */
+  function clearSaved({ keep = [] } = {}) {
+    const removed = new Set();
+    for (const id of [...jobs.keys()]) {
+      if (keep.includes(id)) continue;
+      const { dir } = jobs.get(id);
+      cleanup(id);
+      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* cleanup's rm finishes it */ }
+      removed.add(id);
+    }
+    let names = [];
+    try { names = fs.readdirSync(root); } catch { /* nothing converted yet */ }
+    for (const name of names) {
+      if (jobs.has(name) || removed.has(name) || !/^[0-9a-f]{16}$/.test(name)) continue;
+      try {
+        fs.rmSync(path.join(root, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        removed.add(name);
+      } catch (err) {
+        log.warn('a converted video could not be removed', { code: err.code });
+      }
+    }
+    return removed.size;
+  }
+
   return {
     convert,
     existing,
     file,
+    clearSaved,
     stopJob: (id) => cleanup(id),
     available: () => Boolean(findFfmpeg({ config })),
     async stop() { for (const id of [...jobs.keys()]) cleanup(id); },
