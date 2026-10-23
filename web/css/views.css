@@ -873,6 +873,7 @@
   color: transparent;
   caret-color: transparent;
   pointer-events: none;
+  font-size: 16px; /* iOS zooms the whole page into a focused field smaller than 16 px */
 }
 .browser-overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; pointer-events: none; }
 .browser-overlay:empty { display: none; }

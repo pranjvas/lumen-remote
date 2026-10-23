@@ -124,7 +124,15 @@ function browserInput(cmd) {
   if (kind !== 'key' && kind !== 'text') {
     event.x = number(cmd.x, 'x', 0, 8192);
     event.y = number(cmd.y, 'y', 0, 8192);
+    // The size of the frame the client measured x,y on (it can lag the newest frame by a few,
+    // and frames change size when the TV locks the viewport); without it the newest frame is used.
+    if (cmd.fw !== undefined || cmd.fh !== undefined) {
+      event.fw = number(cmd.fw, 'fw', 1, 8192);
+      event.fh = number(cmd.fh, 'fh', 1, 8192);
+    }
   }
+  // A finger tap: the contact radius in frame pixels, so a tap just beside a small target still hits it.
+  if (kind === 'click' && cmd.touch !== undefined) event.touch = number(cmd.touch, 'touch', 0, 400);
   if (kind === 'down' || kind === 'up' || kind === 'click') event.button = oneOf(cmd.button ?? 'left', 'button', MOUSE_BUTTONS);
   if (kind === 'wheel') {
     event.deltaX = number(cmd.deltaX ?? 0, 'deltaX', -10000, 10000);

@@ -65,6 +65,32 @@ const PAGE_SCRIPT = `(() => {
   addEventListener('load', report);
 })();`;
 
+// Touch adjustment for a finger tap at (x, y) CSS px with contact radius r: null keeps the point
+// (it is already on something clickable, an iframe, a custom element, or nothing is near); else the
+// point inside the nearest clickable element within r that is really on top there.
+const TOUCH_TARGET_SCRIPT = `(x, y, r) => {
+  const SEL = 'a[href],button,input:not([type=hidden]),select,textarea,label,summary,iframe,[role=button],[role=link],[role=checkbox],[role=radio],[role=switch],[role=tab],[role=menuitem],[role=option],[onclick],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"])';
+  const hit = document.elementFromPoint(x, y);
+  if (!hit || hit.closest(SEL) || hit.shadowRoot || hit.tagName.includes('-') || getComputedStyle(hit).cursor === 'pointer') return null;
+  let best = null;
+  for (const el of document.querySelectorAll(SEL)) {
+    const b = el.getBoundingClientRect();
+    if (b.width < 1 || b.height < 1 || b.right < x - r || b.left > x + r || b.bottom < y - r || b.top > y + r) continue;
+    const nx = Math.min(Math.max(x, b.left), b.right);
+    const ny = Math.min(Math.max(y, b.top), b.bottom);
+    const d = Math.hypot(nx - x, ny - y);
+    if (d > r || (best && d >= best.d)) continue;
+    // Aim a little inside the edge, and only where the element is really what is on top.
+    const px = Math.min(Math.max(x, b.left + Math.min(3, b.width / 2)), b.right - Math.min(3, b.width / 2));
+    const py = Math.min(Math.max(y, b.top + Math.min(3, b.height / 2)), b.bottom - Math.min(3, b.height / 2));
+    if (px < 0 || py < 0 || px >= innerWidth || py >= innerHeight) continue;
+    const top = document.elementFromPoint(px, py);
+    if (!top || (top !== el && !el.contains(top) && !(el.tagName === 'LABEL' && el.control === top))) continue;
+    best = { d, x: px, y: py };
+  }
+  return best && { x: best.x, y: best.y };
+}`;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 const isBlank = (entry) => !entry || entry.url === 'about:blank';
@@ -500,6 +526,25 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   const metrics = () => ({ width: viewport.w, height: viewport.h, deviceScaleFactor: 1, mobile: false });
+  const screencastParams = () => ({ format: 'jpeg', quality: settings.quality, maxWidth: settings.maxWidth, maxHeight: settings.maxHeight, everyNthFrame: 1 });
+
+  // A new viewport size. Afterwards Edge could keep streaming the old layout (or the new one squeezed
+  // into the old size) until something on the page repainted, so a phone or the TV showed a picture
+  // that no longer matched where things were and taps landed on the wrong element. Restarting the
+  // screencast makes the next frame the new layout at its own size. Changes apply one at a time.
+  let resizing = Promise.resolve();
+  function applyMetrics() {
+    const cdp = page;
+    if (!ready || !cdp) return resizing;
+    resizing = resizing.then(async () => {
+      if (cdp !== page) return;
+      await cdp.send('Emulation.setDeviceMetricsOverride', metrics());
+      await cdp.send('Page.stopScreencast');
+      if (cdp !== page) return;
+      await cdp.send('Page.startScreencast', screencastParams());
+    }).catch((err) => log.debug('viewport change failed', { message: err.message }));
+    return resizing;
+  }
 
   async function waitForDevtools(port, spawnFailed) {
     const deadline = Date.now() + START_TIMEOUT_MS;
@@ -529,7 +574,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     fs.mkdirSync(profileDir, { recursive: true });
     const proc = spawn(edgePath, [
       '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`,
-      `--window-size=${viewport.w},${viewport.h}`,
+      // The largest viewport, so no later size (the TV's 1280×720 after a phone's 358×411) is bigger
+      // than the window: the screencast then sent squeezed frames or none at all.
+      `--window-size=${VIEWPORT.maxW},${VIEWPORT.maxH}`,
       '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
       '--disable-background-networking', '--disable-component-update', '--mute-audio', '--force-color-profile=srgb',
       // A fresh headless profile has no media engagement, so a page's video with sound never starts by
@@ -640,9 +687,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     const { userAgent } = await cdp.send('Browser.getVersion');
     if (/Headless/.test(userAgent)) await cdp.send('Emulation.setUserAgentOverride', { userAgent: userAgent.replace(/Headless/g, '') });
     await cdp.send('Emulation.setDeviceMetricsOverride', metrics());
-    await cdp.send('Page.startScreencast', {
-      format: 'jpeg', quality: settings.quality, maxWidth: settings.maxWidth, maxHeight: settings.maxHeight, everyNthFrame: 1,
-    });
+    await cdp.send('Page.startScreencast', screencastParams());
     page = cdp;
     ready = true;
     setSession('ready');
@@ -726,8 +771,11 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   // Frame pixels → viewport pixels (the frame may be a scaled copy of the viewport).
-  function toViewport({ x = 0, y = 0 }) {
-    const frame = lastFrame ?? viewport;
+  // The client says which frame size it measured on (fw×fh); a phone can be a few frames behind the
+  // newest one, and the frame size changes when the TV locks the viewport, so that is the size to
+  // undo, not lastFrame's.
+  function toViewport({ x = 0, y = 0, fw, fh }) {
+    const frame = fw > 0 && fh > 0 ? { w: fw, h: fh } : lastFrame ?? viewport;
     const sx = viewport.w / (frame.w || viewport.w);
     const sy = viewport.h / (frame.h || viewport.h);
     return {
@@ -736,9 +784,28 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     };
   }
 
-  function mouse(cdp, type, event, extra = {}) {
+  function mouse(cdp, type, event, extra = {}, at = toViewport(event)) {
     const buttons = [...pressed].reduce((bits, name) => bits | BUTTON_BITS[name], 0);
-    return cdp.send('Input.dispatchMouseEvent', { type, ...toViewport(event), modifiers: modifierBits(event.modifiers), buttons, ...extra });
+    return cdp.send('Input.dispatchMouseEvent', { type, ...at, modifiers: modifierBits(event.modifiers), buttons, ...extra });
+  }
+
+  // A finger covers many page pixels (more still when the phone shows the TV's 1280×720 page), so a
+  // tap that lands just beside a small control goes to the nearest control within the finger's
+  // radius, as touch browsers do natively. A tap already on something clickable, on an iframe or on
+  // a custom element is left exactly where it is.
+  async function touchTarget(cdp, at, radius) {
+    if (!(radius > 0)) return at;
+    try {
+      const { result } = await cdp.send('Runtime.evaluate', {
+        expression: `(${TOUCH_TARGET_SCRIPT})(${at.x}, ${at.y}, ${Math.round(radius)})`, returnByValue: true, silent: true,
+      });
+      const v = result?.value;
+      return v && Number.isFinite(v.x) && Number.isFinite(v.y)
+        ? { x: clamp(Math.round(v.x), 0, viewport.w), y: clamp(Math.round(v.y), 0, viewport.h) }
+        : at;
+    } catch {
+      return at;
+    }
   }
 
   async function pressKey(cdp, { key, code, modifiers }) {
@@ -775,12 +842,16 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
         pressed.delete(button);
         await mouse(cdp, 'mouseReleased', event, { button, clickCount: 1 });
         break;
-      case 'click':
+      case 'click': {
+        const at = event.touch ? await touchTarget(cdp, toViewport(event), toViewport({ x: event.touch, y: 0, fw: event.fw, fh: event.fh }).x) : toViewport(event);
+        // The pointer arrives first, as a real mouse would: hover, enter and over fire on the target.
+        if (!pressed.size) await mouse(cdp, 'mouseMoved', event, { button: 'none' }, at);
         pressed.add(button);
-        await mouse(cdp, 'mousePressed', event, { button, clickCount: 1 });
+        await mouse(cdp, 'mousePressed', event, { button, clickCount: 1 }, at);
         pressed.delete(button);
-        await mouse(cdp, 'mouseReleased', event, { button, clickCount: 1 });
+        await mouse(cdp, 'mouseReleased', event, { button, clickCount: 1 }, at);
         break;
+      }
       case 'wheel':
         await mouse(cdp, 'mouseWheel', event, { deltaX: Number(event.deltaX) || 0, deltaY: Number(event.deltaY) || 0 });
         break;
@@ -802,7 +873,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     const next = clampViewport(w, h);
     const changed = next.w !== viewport.w || next.h !== viewport.h;
     viewport = next;
-    if (changed && ready && page) await page.send('Emulation.setDeviceMetricsOverride', metrics());
+    if (changed) await applyMetrics();
     return { value: { ...viewport } };
   }
 
@@ -834,13 +905,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (!wasLocked) {
       requestedViewport ??= { ...viewport };
       viewport = { ...TV_VIEWPORT };
-      if (ready && page) page.send('Emulation.setDeviceMetricsOverride', metrics()).catch(() => {});
+      applyMetrics();
     }
     if (lastFrame && ready) fn(Buffer.from(lastFrame.data, 'base64'), lastFrame);
     return () => {
       if (!sinks.delete(fn) || sinks.size) return;
       viewport = requestedViewport ?? viewport;
-      if (ready && page) page.send('Emulation.setDeviceMetricsOverride', metrics()).catch(() => {});
+      applyMetrics();
       if (!watchers.size) armIdle();
     };
   }

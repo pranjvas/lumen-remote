@@ -10,9 +10,9 @@ import { accelerate, bindTrackpad, readGain } from '../ui/trackpad.js';
 
 const RATE_MS = 33;          // moves and wheel deltas coalesce to ~30 messages/s
 const VIEWPORT_MS = 250;     // resize settle before browser.viewport
-const TAP_MS = 350;
 const TAP_SLOP = 10;
-const LONG_PRESS_MS = 550;
+const LONG_PRESS_MS = 650;   // a still finger held this long is a right-click; any shorter still press is a click
+const FINGER_PX = 12;        // finger contact radius (CSS px) for the server's touch adjustment
 const WHEEL_LINE_PX = 40;
 const PAD_KEY = 'lumen.browser.pad';
 const POINTER_EDGE = 0.002;  // the server keeps the pointer this far (fraction of the page) inside
@@ -488,31 +488,108 @@ export function mountBrowser(root, ctx) {
 
   /* ---------- pointer ---------- */
 
+  // Canvas position → frame pixels, plus the size of the frame on screen (fw×fh): the server undoes
+  // exactly that scale, even when newer frames of another size are already on their way here.
   const at = (e) => {
     const r = canvas.getBoundingClientRect();
-    return { x: Math.round(((e.clientX - r.left) / r.width) * frame.w), y: Math.round(((e.clientY - r.top) / r.height) * frame.h) };
+    return {
+      x: clamp(Math.round(((e.clientX - r.left) / r.width) * frame.w), 0, frame.w),
+      y: clamp(Math.round(((e.clientY - r.top) / r.height) * frame.h), 0, frame.h),
+      fw: frame.w, fh: frame.h,
+    };
   };
   const scale = () => frame.w / (canvas.getBoundingClientRect().width || 1);
   const moves = coalescer(input);
   const wheels = coalescer(input, (a, b) => ({ ...b, deltaX: a.deltaX + b.deltaX, deltaY: a.deltaY + b.deltaY }));
 
+  // Fingers. Where the browser has Touch Events (iPhone Safari and Chrome, Android), they drive the
+  // page: a non-passive touchstart/touchmove that calls preventDefault keeps the whole gesture for
+  // the canvas (no native scroll or zoom, no pointercancel, no compatibility mouse events, so no
+  // focus on the hidden text field and no keyboard popping up). Touch-type pointer events are then
+  // ignored; without Touch Events they do the same job.
+  const TOUCH_EVENTS = 'ontouchstart' in window;
   let touch = null;
   let longTimer = 0;
+  let lastPointer = 'mouse';
+
+  // `when` is the event's timeStamp: tap or long press is decided on release from when the finger
+  // really went down and up, so a busy phone (a timer firing late) never turns a tap into a right-click.
+  function touchStart(id, pt, when) {
+    lastPointer = 'touch';
+    if (!frame.w) return;
+    if (touch && touch.id !== id && when - touch.start < 10000) return; // a second finger
+    clearTimeout(longTimer);
+    touch = { id, x: pt.clientX, y: pt.clientY, lastX: pt.clientX, lastY: pt.clientY, start: when, moved: false };
+    longTimer = setTimeout(() => { if (touch && !touch.moved) haptic('key'); }, LONG_PRESS_MS); // feel the long press
+  }
+
+  function touchMove(id, pt) {
+    if (!touch || id !== touch.id || !frame.w) return;
+    const dx = pt.clientX - touch.lastX;
+    const dy = pt.clientY - touch.lastY;
+    touch.lastX = pt.clientX;
+    touch.lastY = pt.clientY;
+    if (!touch.moved && Math.hypot(pt.clientX - touch.x, pt.clientY - touch.y) < TAP_SLOP) return;
+    touch.moved = true;
+    clearTimeout(longTimer);
+    // Dragging a finger scrolls the page under it, like a touch screen.
+    const s = scale();
+    wheels.push({ kind: 'wheel', ...at(pt), deltaX: Math.round(-dx * s), deltaY: Math.round(-dy * s), modifiers: 0 });
+  }
+
+  function touchEnd(id, pt, cancelled, when) {
+    if (!touch || id !== touch.id) return;
+    clearTimeout(longTimer);
+    // A finger that stayed put is a click however long it was held (careful presses on small targets
+    // are often longer than a quick tap); held past the long press it is a right-click.
+    const still = !touch.moved && !cancelled;
+    const long = when - touch.start >= LONG_PRESS_MS;
+    touch = null;
+    wheels.flush();
+    if (!still || !frame.w) return;
+    if (!long) haptic('key');
+    input({ kind: 'click', ...at(pt), button: long ? 'right' : 'left', modifiers: 0, touch: Math.max(1, Math.round(FINGER_PX * scale())) });
+    if (keyboardOn && !long) typer.focus({ preventScroll: true });
+  }
+
+  if (TOUCH_EVENTS) {
+    const ours = (e) => (touch ? [...e.changedTouches].find((t) => t.identifier === touch.id) : null);
+    canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const t = e.changedTouches[0];
+      if (t) touchStart(t.identifier, t, e.timeStamp);
+    }, { passive: false });
+    canvas.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      const t = ours(e);
+      if (t) touchMove(t.identifier, t);
+    }, { passive: false });
+    canvas.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      const t = ours(e);
+      if (t) touchEnd(t.identifier, t, false, e.timeStamp);
+    }, { passive: false });
+    canvas.addEventListener('touchcancel', (e) => {
+      const t = ours(e);
+      if (t) touchEnd(t.identifier, t, true, e.timeStamp);
+    });
+  }
+
+  const finger = (e) => e.pointerType === 'touch';
 
   canvas.addEventListener('pointerdown', (e) => {
-    if (!frame.w) return;
-    canvas.setPointerCapture(e.pointerId);
-    if (e.pointerType === 'touch') {
-      if (touch) return;
-      touch = { id: e.pointerId, x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, start: performance.now(), moved: false, long: false };
-      longTimer = setTimeout(() => {
-        if (!touch || touch.moved) return;
-        touch.long = true;
-        haptic('key');
-        input({ kind: 'click', ...at(e), button: 'right', modifiers: 0 });
-      }, LONG_PRESS_MS);
+    if (finger(e)) {
+      if (TOUCH_EVENTS) return;
+      // No compatibility mouse events: they would focus the canvas and, through it, the hidden
+      // text field, which opens the keyboard on every tap.
+      e.preventDefault();
+      try { canvas.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
+      touchStart(e.pointerId, e, e.timeStamp);
       return;
     }
+    lastPointer = e.pointerType;
+    if (!frame.w) return;
+    try { canvas.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
     e.preventDefault();
     moves.flush();
     input({ kind: 'down', ...at(e), button: BUTTONS[e.button] || 'left', modifiers: modifiers(e) });
@@ -520,44 +597,26 @@ export function mountBrowser(root, ctx) {
   });
 
   canvas.addEventListener('pointermove', (e) => {
-    if (!frame.w) return;
-    if (e.pointerType === 'touch') {
-      if (!touch || e.pointerId !== touch.id) return;
-      const dx = e.clientX - touch.lastX;
-      const dy = e.clientY - touch.lastY;
-      touch.lastX = e.clientX;
-      touch.lastY = e.clientY;
-      if (!touch.moved && Math.hypot(e.clientX - touch.x, e.clientY - touch.y) < TAP_SLOP) return;
-      touch.moved = true;
-      clearTimeout(longTimer);
-      // Dragging a finger scrolls the page under it, like a touch screen.
-      const s = scale();
-      wheels.push({ kind: 'wheel', ...at(e), deltaX: Math.round(-dx * s), deltaY: Math.round(-dy * s), modifiers: 0 });
+    if (finger(e)) {
+      if (!TOUCH_EVENTS) touchMove(e.pointerId, e);
       return;
     }
+    if (!frame.w) return;
     moves.push({ kind: 'move', ...at(e), modifiers: modifiers(e) });
   });
 
-  const endTouch = (e) => {
-    if (!touch || e.pointerId !== touch.id) return;
-    clearTimeout(longTimer);
-    const tap = !touch.moved && !touch.long && performance.now() - touch.start < TAP_MS;
-    touch = null;
-    wheels.flush();
-    if (tap && e.type === 'pointerup') {
-      haptic('key');
-      input({ kind: 'click', ...at(e), button: 'left', modifiers: 0 });
-      if (keyboardOn) typer.focus({ preventScroll: true });
-    }
-  };
-
   canvas.addEventListener('pointerup', (e) => {
+    if (finger(e)) {
+      if (!TOUCH_EVENTS) touchEnd(e.pointerId, e, false, e.timeStamp);
+      return;
+    }
     if (!frame.w) return;
-    if (e.pointerType === 'touch') { endTouch(e); return; }
     moves.flush();
     input({ kind: 'up', ...at(e), button: BUTTONS[e.button] || 'left', modifiers: modifiers(e) });
   });
-  canvas.addEventListener('pointercancel', endTouch);
+  canvas.addEventListener('pointercancel', (e) => { if (finger(e) && !TOUCH_EVENTS) touchEnd(e.pointerId, e, true, e.timeStamp); });
+  // Capture lost without a pointerup (the system took the touch): the gesture is over, not a tap.
+  canvas.addEventListener('lostpointercapture', (e) => { if (finger(e) && !TOUCH_EVENTS) touchEnd(e.pointerId, e, true, e.timeStamp); });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
     if (!frame.w) return;
@@ -566,7 +625,8 @@ export function mountBrowser(root, ctx) {
     const s = scale();
     wheels.push({ kind: 'wheel', ...at(e), deltaX: Math.round(e.deltaX * unit * s), deltaY: Math.round(e.deltaY * unit * s), modifiers: modifiers(e) });
   }, { passive: false });
-  canvas.addEventListener('focus', () => typer.focus({ preventScroll: true }));
+  // Keyboard focus (Tab) or a mouse click passes keys to the page; a finger only does with Keyboard on.
+  canvas.addEventListener('focus', () => { if (lastPointer !== 'touch' || keyboardOn) typer.focus({ preventScroll: true }); });
 
   /* ---------- trackpad: one pointer over the page (and the TV's cursor while it shows the page) ---------- */
 
