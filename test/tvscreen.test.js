@@ -5,9 +5,9 @@ import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import { startStack, waitFor } from './helpers.js';
+import { startStack, waitFor, createTestLog } from './helpers.js';
 import { callTool } from '../server/ai/tools.js';
-import { youtubeStateScript } from '../server/features/tvscreen.js';
+import { createTvScreen, youtubeStateScript } from '../server/features/tvscreen.js';
 
 const EDGE = process.env.LUMEN_EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const skip = !fs.existsSync(EDGE) && `headless Edge is not installed at ${EDGE}`;
@@ -192,5 +192,95 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     assert.ok(Math.abs((await pageLog('click'))[0][1] - after.x * w) <= 2, 'the click lands under the TV cursor');
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
+  });
+});
+
+// The trackpad's validation (hub browser.pointer) and the pointer's edges (tvscreen.pointer) need no
+// Edge: a fake Lumen browser records the input events the pointer sends.
+const POINTER_EDGE = 0.002; // tvscreen.js EDGE
+function fakeBrowser(w = 1000, h = 500) {
+  const inputs = [];
+  return { inputs, frameSize: () => ({ w, h }), input: async (event) => { inputs.push(event); return {}; } };
+}
+
+describe('tvscreen: the trackpad pointer stops at every edge (no Edge needed)', () => {
+  const store = { map: new Map(), get(k) { return this.map.get(k); }, set(k, v) { this.map.set(k, { v }); } };
+  const screen = (page) => createTvScreen({ config: {}, log: createTestLog(), store, agent: () => null, rest: null, browser: () => page, relay: () => null });
+  const pos = (r) => [r.value.x, r.value.y];
+
+  test('dx/dy clamp to EDGE..1-EDGE on both axes; x/y clamp too; x/y win over dx/dy', async () => {
+    const page = fakeBrowser();
+    const tv = screen(page);
+    assert.deepEqual(pos(await tv.pointer({})), [0.5, 0.45], 'starts where the TV cursor starts');
+    assert.deepEqual(pos(await tv.pointer({ dx: 1 })), [1 - POINTER_EDGE, 0.45]);
+    assert.deepEqual(pos(await tv.pointer({ dx: -1 })), [POINTER_EDGE, 0.45], 'stops at the left edge');
+    assert.deepEqual(pos(await tv.pointer({ dx: -1 })), [POINTER_EDGE, 0.45], 'and stays there');
+    assert.deepEqual(pos(await tv.pointer({ dy: 1 })), [POINTER_EDGE, 1 - POINTER_EDGE], 'stops at the bottom edge');
+    assert.deepEqual(pos(await tv.pointer({ dy: -1 })), [POINTER_EDGE, POINTER_EDGE], 'stops at the top edge');
+    assert.deepEqual(pos(await tv.pointer({ x: 1, y: 1 })), [1 - POINTER_EDGE, 1 - POINTER_EDGE]);
+    assert.deepEqual(pos(await tv.pointer({ x: 0, y: 0 })), [POINTER_EDGE, POINTER_EDGE]);
+    assert.deepEqual(pos(await tv.pointer({ x: 0.3, dx: 0.5, y: 0.6, dy: -0.4 })), [0.3, 0.6], 'x/y win over dx/dy');
+    const [x, y] = pos(await tv.pointer({ x: 0.3, dy: 0.1 }));
+    assert.ok(x === 0.3 && Math.abs(y - 0.7) < 1e-9, 'x with dy: y still moves by dy');
+    // Every real move became one mousemove in frame pixels; calls that went nowhere sent nothing.
+    assert.equal(page.inputs.length, 8);
+    assert.ok(page.inputs.every((e) => e.kind === 'move'));
+    assert.deepEqual(page.inputs.at(-1), { kind: 'move', x: 300, y: 350 });
+  });
+
+  test('a move that goes nowhere sends nothing; a click or scroll at the edge still lands there', async () => {
+    const page = fakeBrowser();
+    const tv = screen(page);
+    await tv.pointer({ x: 0, y: 1 });
+    const sent = page.inputs.length;
+    assert.deepEqual(pos(await tv.pointer({ dx: -0.5, dy: 0.5 })), [POINTER_EDGE, 1 - POINTER_EDGE]);
+    assert.equal(page.inputs.length, sent, 'pushing past the corner sends no mousemove');
+    await tv.pointer({ dx: -0.1, action: 'click', button: 'right' });
+    assert.deepEqual(page.inputs.at(-1), { kind: 'click', x: 2, y: 499, button: 'right' });
+    await tv.pointer({ action: 'wheel', deltaY: 600 });
+    assert.deepEqual(page.inputs.at(-1), { kind: 'wheel', x: 2, y: 499, deltaX: 0, deltaY: 600 });
+    assert.equal((await tv.pointer({})).value.tv, false, 'not on the TV');
+  });
+});
+
+describe('hub browser.pointer: validation before the pointer moves (no Edge needed)', () => {
+  let stack, b, real;
+  const page = fakeBrowser();
+
+  before(async () => {
+    stack = await startStack();
+    b = stack.browser();
+    await b.hello;
+    real = stack.server.features.browser;
+    stack.server.features.browser = page; // tvscreen reaches Lumen's browser through features.browser
+  });
+  after(async () => {
+    if (stack) stack.server.features.browser = real;
+    await stack?.stop();
+  });
+
+  test('every bad input is refused as INVALID and moves nothing', async () => {
+    const bad = [
+      { action: 'drag' }, { action: 1 }, { dx: 3 }, { dx: -1.5 }, { dy: 2 }, { dx: '0.1' }, { dx: Number.NaN },
+      { x: -0.5 }, { x: 1.5 }, { y: -0.1 }, { y: 2 }, { x: 'left' },
+      { action: 'click', button: 'thumb' }, { action: 'wheel', deltaY: 'down' }, { action: 'wheel', deltaX: 20000 },
+    ];
+    for (const cmd of bad) {
+      const ack = await b.send('browser.pointer', cmd);
+      assert.equal(ack.error?.code, 'INVALID', JSON.stringify(cmd));
+    }
+    assert.equal(page.inputs.length, 0);
+  });
+
+  test('dx:-1, x:0 and y:1 are accepted and stop at the edges; x wins over dx', async () => {
+    const ok = (ack) => { assert.equal(ack.ok, true, JSON.stringify(ack.error)); return [ack.value.x, ack.value.y]; };
+    assert.deepEqual(ok(await b.send('browser.pointer', { x: 0.5, y: 0.5 })), [0.5, 0.5]);
+    assert.deepEqual(ok(await b.send('browser.pointer', { dx: -1 })), [POINTER_EDGE, 0.5]);
+    assert.deepEqual(ok(await b.send('browser.pointer', { x: 0 })), [POINTER_EDGE, 0.5]);
+    assert.deepEqual(ok(await b.send('browser.pointer', { y: 1 })), [POINTER_EDGE, 1 - POINTER_EDGE]);
+    assert.deepEqual(ok(await b.send('browser.pointer', { dy: 1 })), [POINTER_EDGE, 1 - POINTER_EDGE]);
+    assert.deepEqual(ok(await b.send('browser.pointer', { x: 0.25, dx: 0.5 })), [0.25, 1 - POINTER_EDGE]);
+    ok(await b.send('browser.pointer', { action: 'click' }));
+    assert.deepEqual(page.inputs.at(-1), { kind: 'click', x: 250, y: 499, button: 'left' });
   });
 });
