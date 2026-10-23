@@ -52,12 +52,16 @@ function endToEndHeaders(headers) {
   return out;
 }
 
-export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 30, queueMs = 10000 }) {
+// A browser keeps idle keep-alive sockets open through the proxy; when every slot is taken, the one
+// silent the longest (at least idleEvictMs) is closed for the newcomer and the browser reopens it later.
+export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 150, queueMs = 10000, idleEvictMs = 2000 }) {
   const log = rootLog.child('vpn-proxy');
   const server = http.createServer();
   const sockets = new Set(); // client connections (Edge)
   const streams = new Set(); // open tunnel streams
   const waiting = []; // requests queued for a stream slot: { grant, reject, timer }
+  const tunnels = new Set(); // established CONNECT tunnels: { socket, up, last } (eviction candidates)
+  let evictTimer = null;
   let active = 0;
   let port = null;
 
@@ -77,7 +81,26 @@ export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 30, queueMs 
         reject(tagged('busy', `more than ${maxStreams} connections are open through the VPN`));
       }, queueMs);
       waiting.push(entry);
+      evictForWaiters();
     });
+  }
+
+  // Closes idle tunnels (oldest silence first) until each waiter has one coming free; while anyone
+  // still waits, it looks again as tunnels go quiet.
+  function evictForWaiters() {
+    clearTimeout(evictTimer);
+    evictTimer = null;
+    if (!waiting.length) return;
+    const now = Date.now();
+    const idle = [...tunnels].filter((t) => !t.evicted && now - t.last >= idleEvictMs).sort((a, b) => a.last - b.last);
+    const closing = [...tunnels].filter((t) => t.evicted).length;
+    for (const t of idle.slice(0, Math.max(0, waiting.length - closing))) {
+      t.evicted = true;
+      log.debug('closing an idle tunnel for a waiting request', { idleMs: now - t.last });
+      t.socket.destroy();
+      t.up.destroy();
+    }
+    if (waiting.length) evictTimer = setTimeout(evictForWaiters, Math.max(100, Math.min(idleEvictMs, 500)));
   }
 
   // A freed slot passes straight to the next waiter.
@@ -153,6 +176,12 @@ export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 30, queueMs 
       socket.setNoDelay(true);
       socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head?.length) up.write(head);
+      const entry = { socket, up, last: Date.now(), evicted: false };
+      const touch = () => { entry.last = Date.now(); };
+      tunnels.add(entry);
+      socket.on('data', touch);
+      up.on('data', touch);
+      up.once('close', () => tunnels.delete(entry));
       socket.pipe(up).pipe(socket);
       log.debug('CONNECT established', { host: target.host, port: target.port });
     });
@@ -249,6 +278,7 @@ export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 30, queueMs 
       });
     },
     async stop() {
+      clearTimeout(evictTimer);
       for (const entry of waiting.splice(0)) {
         clearTimeout(entry.timer);
         entry.reject(tagged('vpn-proxy-stopped', 'VPN proxy is stopping'));

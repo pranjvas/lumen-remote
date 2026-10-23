@@ -329,24 +329,42 @@ describe('vpn: tunnel + proxy end to end through the Go test peer on 127.0.0.1',
     t.diagnostic(`5 MiB via proxy: ${((bytes * 8) / seconds / 1e6).toFixed(1)} Mbit/s in ${seconds.toFixed(2)} s`);
   });
 
-  test('stream limit: the 31st concurrent CONNECT waits for a slot (proxy maxStreams 30) and completes once one closes', { timeout: 40000 }, async () => {
+  test('stream capacity: 40 concurrent CONNECTs are carried at once (the rebuilt core allows 160; the original 32)', { timeout: 40000 }, async () => {
     const held = [];
     try {
-      for (let i = 0; i < 30; i += 1) {
-        const c = await connectVia(proxy.port, `${TUNNEL_PEER_IP}:80`);
-        assert.equal(c.status, 200, `CONNECT #${i + 1}`);
+      const opened = await Promise.all(Array.from({ length: 40 }, () => connectVia(proxy.port, `${TUNNEL_PEER_IP}:80`, { timeout: 20000 })));
+      for (const [i, c] of opened.entries()) {
         held.push(c.socket);
+        assert.equal(c.status, 200, `CONNECT #${i + 1}`);
       }
-      await waitFor(() => tunnel.status().streams === 30, { timeout: 3000, message: `30 open streams (now ${tunnel.status().streams})` });
-      const queued = connectVia(proxy.port, `${TUNNEL_PEER_IP}:80`, { timeout: 20000 });
-      queued.catch(() => {});
-      assert.equal(await Promise.race([queued.then(() => 'answered'), sleep(700).then(() => 'waiting')]), 'waiting', 'the 31st CONNECT must wait, not fail');
-      held.shift().destroy();
-      const late = await queued;
-      assert.equal(late.status, 200, 'the queued CONNECT completes after a slot frees up');
-      held.push(late.socket);
+      await waitFor(() => tunnel.status().streams === 40, { timeout: 5000, message: `40 open streams (now ${tunnel.status().streams})` });
     } finally {
       for (const s of held) s.destroy();
+    }
+    await waitFor(() => tunnel.status().streams === 0, { timeout: 8000, message: 'held streams released' });
+  });
+
+  test('a full proxy closes the longest-idle tunnel for a newcomer instead of failing it', { timeout: 40000 }, async () => {
+    const small = mods.createVpnProxy({ tunnel, log, maxStreams: 3, idleEvictMs: 300 });
+    await small.start();
+    const held = [];
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        const c = await connectVia(small.port, `${TUNNEL_PEER_IP}:80`);
+        assert.equal(c.status, 200, `CONNECT #${i + 1}`);
+        held.push(c);
+        await sleep(50);
+      }
+      const closed = held.map((c) => new Promise((resolve) => c.socket.once('close', () => resolve(true))));
+      const t0 = Date.now();
+      const late = await connectVia(small.port, `${TUNNEL_PEER_IP}:80`, { timeout: 8000 });
+      assert.equal(late.status, 200, 'the fourth CONNECT gets a slot');
+      assert.ok(Date.now() - t0 < 3000, `it got one quickly (${Date.now() - t0} ms), not after the 10 s queue`);
+      assert.equal(await Promise.race([closed[0], sleep(2000).then(() => false)]), true, 'the oldest idle tunnel was closed for it');
+      held.push(late);
+    } finally {
+      for (const c of held) c.socket.destroy();
+      await small.stop();
     }
     await waitFor(() => tunnel.status().streams === 0, { timeout: 8000, message: 'held streams released' });
   });

@@ -35,14 +35,14 @@
 #define IP_FRAG                         1
 
 #define MEM_ALIGNMENT                   4
-#define MEM_SIZE                        (4 * 1024 * 1024)
+#define MEM_SIZE                        (8 * 1024 * 1024)
 #define MEMP_NUM_PBUF                   256
 #define MEMP_NUM_UDP_PCB                8
-#define MEMP_NUM_TCP_PCB                32
+#define MEMP_NUM_TCP_PCB                192
 #define MEMP_NUM_TCP_PCB_LISTEN         2
-#define MEMP_NUM_TCP_SEG                1024
+#define MEMP_NUM_TCP_SEG                4096
 #define MEMP_NUM_SYS_TIMEOUT            16
-#define PBUF_POOL_SIZE                  2048
+#define PBUF_POOL_SIZE                  4096
 #define PBUF_POOL_BUFSIZE               1536
 
 #define TCP_MSS                         1380
