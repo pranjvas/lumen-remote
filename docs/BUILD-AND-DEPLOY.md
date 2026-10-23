@@ -63,7 +63,7 @@ Everything Lumen keeps lives in `data/` (git-ignored): `config.json`, `tv.json` 
 
 - **`http.lanAccess`**: also serve the UI to phones on the LAN. There's no login (owner's choice).
 - **`liveVideo.enabled`**: `false` turns the browser's live video on the TV off; still frames are the fallback.
-- **`liveVideo.maxHeight`**: `2160` lets live video try 4K. The default is 1080.
+- **`liveVideo.maxHeight`** and **`liveVideo.maxFps`**: live video starts at 1080p30, then tries 1080p60 and then 4K30, each after 30 quiet seconds (`probeAfterSec`). A step that has trouble is dropped for that session. `maxHeight: 2160` allows 4K; the default 1080 stops at 1080p60, the smoothest option. `maxFps: 30` stays at 30 fps. Measured on the Q95T: 1080p60 AVC at 12 Mbit/s decodes at 58–61 fps; 4K30 HEVC at 20 Mbit/s decodes at 28–31 fps. Both run about 0.5–0.7 s behind live.
 - All the defaults are in `server/config.js`.
 
 ### Run at sign-in

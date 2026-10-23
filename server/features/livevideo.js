@@ -41,12 +41,17 @@ const QUEUE_LIMIT_SEC = 0.6;
 
 /**
  * Output steps, best first. `scale` is the device scale behind the 1280×720 CSS viewport; `probe`
- * steps are never started at, only tried after a quiet spell on the step below.
+ * steps are never started at, only tried after a quiet spell on the step below (1080p30, then
+ * 1080p60, then 4K; maxHeight 1080 leaves 4K out, maxFps 30 leaves 60 out).
  */
 export const LADDER = Object.freeze([
   { name: '2160p30', width: 3840, height: 2160, fps: 30, scale: 3, probe: true,
     codecs: [{ family: 'hevc', encoder: 'hvc1.1.6.L153.B0', tv: 'hvc1.1.6.L153.B0' }, { family: 'avc', encoder: 'avc1.640033', tv: 'avc1.640033' }],
     bitrate: { start: 14e6, min: 6e6, max: 20e6 } },
+  // 60 frames a second at 1080p (level 4.2 / HEVC 4.1): tried after a quiet spell at 1080p30.
+  { name: '1080p60', width: 1920, height: 1080, fps: 60, scale: 1.5, probe: true,
+    codecs: [{ family: 'avc', encoder: 'avc1.64002A', tv: 'avc1.64002A' }, { family: 'hevc', encoder: 'hvc1.1.6.L123.B0', tv: 'hvc1.1.6.L123.B0' }],
+    bitrate: { start: 8e6, min: 4e6, max: 12e6 } },
   { name: '1080p30', width: 1920, height: 1080, fps: 30, scale: 1.5,
     codecs: [{ family: 'avc', encoder: 'avc1.640028', tv: 'avc1.640028' }, { family: 'hevc', encoder: 'hvc1.1.6.L123.B0', tv: 'hvc1.1.6.L120.B0' }],
     bitrate: { start: 5e6, min: 2e6, max: 8e6 } },
@@ -66,10 +71,10 @@ export const TV_CODEC_PROBES = [...new Set(LADDER.flatMap((r) => r.codecs.map((c
  * encoder makes it (encoders[`${name}:${family}`] true when known), at most maxHeight.
  * → [{ ...step, codec }] best first.
  */
-export function usableLadder({ caps = {}, encoders = null, maxHeight = 1080, preferHevc = true } = {}) {
+export function usableLadder({ caps = {}, encoders = null, maxHeight = 1080, maxFps = 60, preferHevc = true } = {}) {
   const out = [];
   for (const step of LADDER) {
-    if (step.height > maxHeight) continue;
+    if (step.height > maxHeight || step.fps > maxFps) continue;
     const order = preferHevc ? step.codecs : [...step.codecs].sort((a, b) => (a.family === 'avc' ? -1 : 0) - (b.family === 'avc' ? -1 : 0));
     const codec = order.find((c) => caps[c.tv] === true && (!encoders || encoders[`${step.name}:${c.family}`] !== false));
     if (codec) out.push({ ...step, codec });
@@ -351,6 +356,8 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
  * only), or { exhausted: true } when no step is left. Starts at startIndex (never at a probe step);
  * a probe step above is tried once after probeAfter quiet seconds and dropped at its first trouble.
  */
+const PROBE_GRACE_TICKS = 4;
+
 export function createRateControl({ ladder, startIndex = startIndexOf(ladder), probeAfter = 90 }) {
   let index = Math.min(startIndex, ladder.length - 1);
   let bitrate = ladder[index].bitrate.start;
@@ -380,7 +387,9 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
     tick({ drops = 0, queueSec = 0, stalls = 0, dropRatio = 0, refused = false, statsLate = false } = {}) {
       ticks += 1;
       const trouble = refused || drops > 0 || queueSec > QUEUE_LIMIT_SEC || stalls > 0 || dropRatio > 0.1 || statsLate;
-      // A probe step goes at its first trouble, for good.
+      // A probe step goes at its first trouble, for good: after a few seconds of grace, since the
+      // switch itself (a new size from a key frame, maybe a new player on the TV) comes in a burst.
+      if (probing && trouble && !refused && ticks - probing.at <= PROBE_GRACE_TICKS) return null;
       if (probing && trouble) {
         blocked.add(index);
         const back = probing.from;
@@ -421,10 +430,12 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
         lowered = null;
         return moveTo(back, 'up');
       }
-      // A probe step above (4K) once the stream has been quiet for a long while.
-      if (!lowered && index > 0 && ladder[index - 1].probe && !blocked.has(index - 1) && good >= probeAfter) {
+      // A probe step above (60 fps, 4K) once the stream has been quiet for a long while.
+      let up = index - 1; // the nearest probe step above that has not failed
+      while (up >= 0 && ladder[up].probe && blocked.has(up)) up -= 1;
+      if (!lowered && up >= 0 && ladder[up].probe && good >= probeAfter) {
         const from = index;
-        const change = moveTo(index - 1, 'probe');
+        const change = moveTo(up, 'probe');
         probing = { from, at: ticks };
         return change;
       }
@@ -474,7 +485,7 @@ async function evaluate(cdp, expression, { gesture = false } = {}) {
 
 export function createLiveVideo({ config, log: rootLog, store, browser }) {
   const log = rootLog.child('livevideo');
-  const settings = { enabled: false, maxHeight: 1080, preferHevc: true, idleStopMs: 15_000, gopSeconds: 1, fragmentMs: FRAGMENT_MS,
+  const settings = { enabled: false, maxHeight: 1080, maxFps: 60, probeAfterSec: 30, preferHevc: true, idleStopMs: 15_000, gopSeconds: 1, fragmentMs: FRAGMENT_MS,
     statsLateMs: STATS_LATE_MS, statsGoneMs: STATS_GONE_MS, statsGraceMs: STATS_GRACE_MS, ...config.liveVideo };
   const token = randomBytes(24).toString('hex');
   let server = null; // loopback HTTP + WebSocket server for the capture page
@@ -599,9 +610,9 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     await waitForPage();
     const cdp = captureTarget.cdp;
     if (!encoders) encoders = await evaluate(cdp, `lumenEncoders(${JSON.stringify(encoderProbes())})`).catch(() => null);
-    ladder = usableLadder({ caps, encoders, maxHeight: settings.maxHeight, preferHevc: settings.preferHevc });
+    ladder = usableLadder({ caps, encoders, maxHeight: settings.maxHeight, maxFps: settings.maxFps, preferHevc: settings.preferHevc });
     if (!ladder.length) throw new LumenError('UNAVAILABLE', 'The TV’s player takes none of the stream formats this PC can encode');
-    if (!rate || rate.index >= ladder.length) rate = createRateControl({ ladder, startIndex: startIndexOf(ladder, startLower) });
+    if (!rate || rate.index >= ladder.length) rate = createRateControl({ ladder, startIndex: startIndexOf(ladder, startLower), probeAfter: settings.probeAfterSec });
     const step = rate.step;
     await feature.setTvScale(step.scale);
     // Edge picks the tab to capture by its title: the page carries the capture title for a moment.
@@ -722,7 +733,9 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
       if (quietMs > settings.statsGoneMs) { log.warn('the TV stopped reporting on the live video', { quietMs }); v.onFallback?.('the TV stopped reporting'); continue; }
       signals.statsLate = quietMs > settings.statsLateMs;
       v.refused = false;
-      v.last = { ...signals, kbps: sent ? Math.round((sent.sentBytes * 8) / 1000) : 0, lagMs: tv?.lag != null ? Math.round(tv.lag * 1000) : (v.last?.lagMs ?? null) };
+      v.last = { ...signals, kbps: sent ? Math.round((sent.sentBytes * 8) / 1000) : 0, lagMs: tv?.lag != null ? Math.round(tv.lag * 1000) : (v.last?.lagMs ?? null),
+        // Frames the TV decoded per second (it reports every 2 s).
+        tvFps: tv && decodedDelta > 0 ? Math.round(decodedDelta / 2) : (v.last?.tvFps ?? null) };
       const change = rate.tick(signals);
       if (change?.exhausted) { v.onFallback?.('The TV could not play the live video'); continue; }
       if (change?.step !== undefined) {
@@ -746,7 +759,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     const step = rate?.step;
     publish(state === 'off' ? { state: 'off' } : {
       state, step: step?.name ?? null, codec: step?.codec.family ?? null, bitrate: rate?.bitrate ?? null,
-      kbps: first?.kbps ?? null, lagMs: first?.lagMs ?? null, fps: lastStats ? Math.round((lastStats.frames + lastStats.repeats) / 2) : null,
+      kbps: first?.kbps ?? null, lagMs: first?.lagMs ?? null, tvFps: first?.tvFps ?? null, fps: lastStats ? Math.round((lastStats.frames + lastStats.repeats) / 2) : null,
       // Loudest captured sample over the last 2 s (0..1); 0 for a silent page; null without sound.
       audioPeak: typeof lastStats?.audioPeak === 'number' ? Math.round(lastStats.audioPeak * 1000) / 1000 : null,
     });

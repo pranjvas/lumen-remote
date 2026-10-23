@@ -59,7 +59,7 @@ export const DEFAULTS = deepFreeze({
   // as the fallback. The Q95T's web engine is slow, so the stream starts at 1080p30 and steps down
   // to 720p30 and 540p30 when the TV or the link cannot keep up. maxHeight 2160 also lets it try 4K
   // (HEVC when the TV takes it) after a long quiet spell. fragmentMs: media per WebSocket message.
-  liveVideo: { enabled: true, maxHeight: 1080, preferHevc: true, idleStopMs: 15000, gopSeconds: 1, fragmentMs: 160 },
+  liveVideo: { enabled: true, maxHeight: 1080, maxFps: 60, preferHevc: true, idleStopMs: 15000, gopSeconds: 1, fragmentMs: 160 },
   log: { level: 'info', console: true },
 });
 

@@ -283,8 +283,9 @@ describe('fan-out', () => {
 
 describe('rate control and the ladder', () => {
   const allCaps = Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, true]));
-  const full = usableLadder({ caps: allCaps, maxHeight: 2160 });
-  const tv = usableLadder({ caps: allCaps }); // the default: 1080p at most
+  const full = usableLadder({ caps: allCaps, maxHeight: 2160, maxFps: 30 });
+  const tv = usableLadder({ caps: allCaps, maxFps: 30 }); // 1080p30 at most
+  const all = usableLadder({ caps: allCaps, maxHeight: 2160 }); // 60 fps and 4K too
 
   test('the ladder follows the TV, the encoder and maxHeight; it starts at 1080p30, never at 4K', () => {
     assert.deepEqual(tv.map((s) => s.name), ['1080p30', '720p30', '540p30']);
@@ -292,9 +293,9 @@ describe('rate control and the ladder', () => {
     assert.deepEqual(full.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:hevc', '1080p30:avc', '720p30:avc', '540p30:avc']);
     assert.equal(startIndexOf(full), 1, '4K is a probe step');
     assert.equal(startIndexOf(full, 1), 2, 'one step lower after the TV went away');
-    const noHevc = usableLadder({ caps: { 'avc1.640033': true, 'avc1.640028': true }, encoders: { '2160p30:hevc': true }, maxHeight: 2160 });
+    const noHevc = usableLadder({ caps: { 'avc1.640033': true, 'avc1.640028': true }, encoders: { '2160p30:hevc': true }, maxHeight: 2160, maxFps: 30 });
     assert.deepEqual(noHevc.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:avc', '1080p30:avc', '720p30:avc', '540p30:avc']);
-    const noEncoder = usableLadder({ caps: allCaps, encoders: { '2160p30:hevc': false, '2160p30:avc': false }, maxHeight: 2160 });
+    const noEncoder = usableLadder({ caps: allCaps, encoders: { '2160p30:hevc': false, '2160p30:avc': false }, maxHeight: 2160, maxFps: 30 });
     assert.equal(noEncoder[0].name, '1080p30');
   });
 
@@ -333,10 +334,31 @@ describe('rate control and the ladder', () => {
     for (let i = 0; i < 25 && rc.step.name !== '2160p30'; i++) change = rc.tick({});
     assert.equal(rc.step.name, '2160p30');
     assert.equal(change.cause, 'probe');
+    for (let i = 0; i < 4; i++) assert.equal(rc.tick({ drops: 1 }), null, 'the switch itself is borne');
     assert.equal(rc.tick({ dropRatio: 0.2 }).cause, 'probe-failed');
     assert.equal(rc.step.name, '1080p30');
     for (let i = 0; i < 60; i++) rc.tick({});
     assert.equal(rc.step.name, '1080p30', 'not tried again');
+  });
+
+  test('with 60 fps allowed: 1080p30 first, then 1080p60, then 4K; a failed 60 fps step is skipped', () => {
+    assert.deepEqual(all.map((s) => `${s.name}:${s.codec.family}`), ['2160p30:hevc', '1080p60:avc', '1080p30:avc', '720p30:avc', '540p30:avc']);
+    assert.deepEqual(usableLadder({ caps: allCaps }).map((s) => s.name), ['1080p60', '1080p30', '720p30', '540p30'], 'maxHeight 1080 by default');
+    assert.equal(usableLadder({ caps: { ...allCaps, 'avc1.64002A': false, 'hvc1.1.6.L123.B0': false } })[0].name, '1080p30', 'a TV without level 4.2 stays at 30');
+    const rc = createRateControl({ ladder: all, probeAfter: 20 });
+    assert.equal(rc.step.name, '1080p30');
+    for (let i = 0; i < 25 && rc.step.name === '1080p30'; i++) rc.tick({});
+    assert.equal(rc.step.name, '1080p60');
+    for (let i = 0; i < 31; i++) rc.tick({}); // it held: 1080p60 is the step now
+    for (let i = 0; i < 25 && rc.step.name === '1080p60'; i++) rc.tick({});
+    assert.equal(rc.step.name, '2160p30');
+    const again = createRateControl({ ladder: all, probeAfter: 20 });
+    for (let i = 0; i < 25 && again.step.name === '1080p30'; i++) again.tick({});
+    for (let i = 0; i < 4; i++) again.tick({});
+    assert.equal(again.tick({ drops: 1 }).cause, 'probe-failed');
+    assert.equal(again.step.name, '1080p30');
+    for (let i = 0; i < 25 && again.step.name === '1080p30'; i++) again.tick({});
+    assert.equal(again.step.name, '2160p30', 'on to 4K past the failed 60 fps step');
   });
 
   test('a step lowered for congestion is tried again after a quiet while', () => {
