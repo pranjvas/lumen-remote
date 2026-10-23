@@ -239,7 +239,7 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
     assert.equal(page.pauses, 0);
 
     // Off YouTube the minimum is bigger: a fifth of the page stays there.
-    setPage('https://news.example.com/story', 'A story');
+    setPage('https://news.example.com/another-story', 'Another story');
     page.videoArea = 0.2;
     page.lastInput = Date.now();
     const at = page.minAreas.length;

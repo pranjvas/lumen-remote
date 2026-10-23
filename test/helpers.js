@@ -307,7 +307,7 @@ export const TINY_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABC
  */
 export function connectAgent({
   port, key, host = '127.0.0.1', snapshot = AGENT_SNAPSHOT, apps = AGENT_APPS, icons = { '3201907018807': TINY_PNG },
-  version = '0.2.0', pcHost = host, autoHello = true,
+  version = '0.2.0', pcHost = host, autoHello = true, keepAlive = true,
 } = {}) {
   const ws = new WebSocket(`ws://${host}:${port}/agent?key=${encodeURIComponent(key ?? '')}`);
   const requests = [];
@@ -324,6 +324,11 @@ export function connectAgent({
   const closed = new Promise((resolve) => ws.once('close', (code) => resolve(code)));
   ws.on('error', () => {});
   ws.on('open', () => { if (autoHello) send({ t: 'hello', agent: version, version, pcHost, snapshot }); });
+  // The real agent sends its state every few seconds; the adapter drops an agent silent for 15 s, which
+  // long suites on a busy PC otherwise hit. keepAlive: false lets a test exercise that drop.
+  const pulse = keepAlive ? setInterval(() => { if (ws.readyState === WebSocket.OPEN) send({ t: 'state', snapshot }); }, 5000) : null;
+  pulse?.unref?.();
+  ws.once('close', () => clearInterval(pulse));
   ws.on('message', (data, isBinary) => {
     if (isBinary) { frames.push(data); return; }
     const msg = JSON.parse(String(data));

@@ -177,7 +177,7 @@ describe('relay', () => {
     const front = http.createServer((req, res) => handler(req, res));
     await new Promise((r) => front.listen(0, '127.0.0.1', r));
     const lan = { address: '127.0.0.1', port: front.address().port, route: (prefix, { request }) => { handler = request; return () => {}; } };
-    const relay = createRelay({ log: createTestLog(), lan });
+    const relay = createRelay({ log: createTestLog(), lan, config: LOOPBACK_OK });
     relay.start();
     const relayed = (text) => text.split('\n').filter((l) => l && !l.startsWith('#'));
     try {

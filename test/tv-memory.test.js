@@ -97,12 +97,12 @@ describe('tv.processes and tv.freeMemory through Lumen Eyes and the mock TV', ()
     await stack?.stop();
   });
 
-  test('tv.processes resolves with Eyes\' reply for this request, without its t and id', async () => {
+  test('tv.processes resolves with Eyes\' reply for this request, without its t and id, and without command lines', async () => {
     const ack = await b.send('tv.processes', {}, { timeout: 20000 });
     assert.equal(ack.ok, true, JSON.stringify(ack.error));
     assert.deepEqual(ack.value, {
       meminfo: { MemTotal: 1837 * 1024, MemAvailable: 400 * 1024, SwapFree: 10 * 1024 },
-      procs: [{ pid: 812, name: 'WebProcess', rssKb: 204800, cmd: '/usr/bin/WebProcess' }],
+      procs: [{ pid: 812, name: 'WebProcess', rssKb: 204800 }],
     });
     assert.equal(eyes.asked.length, 1);
   });
