@@ -19,6 +19,8 @@ const PASS_REQUEST = ['range', 'accept', 'accept-encoding', 'if-range'];
 const PASS_RESPONSE = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag', 'cache-control'];
 
 const b64url = (s) => Buffer.from(s, 'utf8').toString('base64url');
+// "cdn.media.example.com" → "example.com" (good enough to keep cookies on their own site).
+const siteOf = (host) => String(host ?? '').toLowerCase().split('.').slice(-2).join('.');
 const unb64url = (s) => Buffer.from(s, 'base64url').toString('utf8');
 const isPlaylist = (type, url) => /mpegurl/i.test(type ?? '') || /\.m3u8?(\?|$)/i.test(url);
 
@@ -143,13 +145,16 @@ export function createRelay({ log: rootLog, lan, vpn = () => null }) {
   }
 
   /** A relay URL for `target` the TV can fetch; referer/userAgent are sent upstream. */
-  function register(target, { referer = null, userAgent = UA } = {}) {
+  function register(target, { referer = null, origin = null, cookie = null, userAgent = null } = {}) {
     const url = webUrl(target);
     if (!url) throw new LumenError('INVALID', 'Only http(s) streams can be relayed');
     prune();
     const token = randomBytes(16).toString('hex');
     const ref = referer ? webUrl(referer) : null;
-    sessions.set(token, { referer: ref?.href ?? null, origin: ref?.origin ?? null, userAgent, at: Date.now() });
+    sessions.set(token, {
+      referer: ref?.href ?? null, origin: origin ?? ref?.origin ?? null, userAgent: userAgent || UA, at: Date.now(),
+      cookie: typeof cookie === 'string' && cookie.length < 8192 ? cookie : null, cookieSite: siteOf(url.hostname),
+    });
     return { token, url: relayUrl(token, url.href) };
   }
 
@@ -164,6 +169,8 @@ export function createRelay({ log: rootLog, lan, vpn = () => null }) {
     }
     session.at = Date.now();
     const headers = { 'user-agent': session.userAgent, ...(session.referer && { referer: session.referer }), ...(session.origin && { origin: session.origin }) };
+    // The page's cookies go only to the site that set them, never to other hosts in the playlist.
+    if (session.cookie && siteOf(target.hostname) === session.cookieSite) headers.cookie = session.cookie;
     for (const name of PASS_REQUEST) if (req.headers[name] && name !== 'accept-encoding') headers[name] = req.headers[name];
     headers['accept-encoding'] = 'identity';
     let upstream;

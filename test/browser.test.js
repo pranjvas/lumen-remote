@@ -326,17 +326,17 @@ describe('browser: Lumen clients ↔ hub ↔ headless Edge', { skip }, () => {
     await agent.opened;
     await viewer.waitForState('conn.agent', (r) => r?.v === 'online', { timeout: 8000 });
     const launches = mock.state.launches.length;
-    okAck(await viewer.send('browser.openOnTv', { url: web.url('/second') }, { timeout: 15000 }));
+    okAck(await viewer.send('browser.openInTvBrowser', { url: web.url('/second') }, { timeout: 15000 }));
     const req = await agent.waitForRequest('open-url');
     assert.equal(req.url, web.url('/second'));
     assert.equal(mock.state.launches.length, launches, 'the agent opened it, so no REST launch');
 
     agent.close();
     await viewer.waitForState('conn.agent', (r) => r?.v !== 'online', { timeout: 8000 });
-    okAck(await viewer.send('browser.openOnTv', {}, { timeout: 15000 })); // no url → the current page
+    okAck(await viewer.send('browser.openInTvBrowser', {}, { timeout: 15000 })); // no url → the current page
     const launch = mock.state.launches.at(-1);
     assert.deepEqual([mock.state.launches.length, launch.id, launch.payload], [launches + 1, 'org.tizen.browser', web.url('/second')]);
-    invalidAck(await viewer.send('browser.openOnTv', { url: 'javascript:alert(1)' }), 'a non-web URL for the TV');
+    invalidAck(await viewer.send('browser.openInTvBrowser', { url: 'javascript:alert(1)' }), 'a non-web URL for the TV');
   });
 
   test('browser.close ends the session and Edge; opening again starts a fresh one', async (t) => {

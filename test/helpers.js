@@ -312,6 +312,8 @@ export function connectAgent({
   const ws = new WebSocket(`ws://${host}:${port}/agent?key=${encodeURIComponent(key ?? '')}`);
   const requests = [];
   const listeners = new Set();
+  const frames = []; // binary messages (browser-screen JPEG frames)
+  const screen = []; // screen-* JSON messages from the PC
   const send = (msg) => ws.send(JSON.stringify(msg));
   const opened = new Promise((resolve, reject) => {
     ws.once('open', resolve);
@@ -322,8 +324,10 @@ export function connectAgent({
   const closed = new Promise((resolve) => ws.once('close', (code) => resolve(code)));
   ws.on('error', () => {});
   ws.on('open', () => { if (autoHello) send({ t: 'hello', agent: version, version, pcHost, snapshot }); });
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) { frames.push(data); return; }
     const msg = JSON.parse(String(data));
+    if (typeof msg.t === 'string' && msg.t.startsWith('screen-')) { screen.push(msg); return; }
     if (msg.t !== 'req') return;
     requests.push(msg);
     for (const fn of listeners) fn(msg);
@@ -337,6 +341,8 @@ export function connectAgent({
     } else if (msg.type === 'open-url') {
       // Agent 0.3.0 (spec §11.3): the view app control opened the URL on the TV.
       send({ t: 'reply', rid: msg.rid, ok: true, data: { method: 'view' } });
+    } else if (msg.type === 'screen') {
+      send({ t: 'reply', rid: msg.rid, ok: true, data: { on: msg.on === true } });
     } else if (msg.type === 'launch') {
       // Agent 0.4.0: an app-control launch (Smart Hub-style deep link).
       send({ t: 'reply', rid: msg.rid, ok: true, data: { appId: msg.appId, operation: msg.operation ?? null, keys: Object.keys(msg.data ?? {}) } });
@@ -352,6 +358,9 @@ export function connectAgent({
     sendEvent: (kind, value) => send({ t: 'event', kind, value }),
     waitForRequest: (type, timeout = 5000) => waitFor(() => requests.find((r) => r.type === type), { timeout, message: `agent request ${type}` }),
     onRequest: (fn) => listeners.add(fn),
+    frames,
+    screen,
+    sendScreenInput: (input) => send({ t: 'screen-input', ...input }),
     close: () => ws.terminate(),
   };
 }

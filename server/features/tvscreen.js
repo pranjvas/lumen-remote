@@ -1,0 +1,164 @@
+// Lumen browser on the TV: the page is rendered by Lumen's own browser on this PC (behind the VPN
+// when it is on) and shown full screen by the TV agent (companion/agent/screen.js). The TV remote
+// drives it — arrows move a pointer, OK clicks, Back goes back, CH ▲▼ scroll, Red closes, Green
+// reloads, Yellow hands the page's video to the TV's own player through the relay (full quality,
+// with sound). Phones keep controlling the same page in the Browser view.
+import { LumenError } from '../errors.js';
+
+const STEP = 0.014; // pointer step (fraction of the screen) for a single press
+const STEP_MAX = 0.09;
+const STREAK_MS = 260; // presses closer than this accelerate
+const SCROLL_PX = 600;
+const EDGE = 0.002;
+
+export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay }) {
+  const log = rootLog.child('tvscreen');
+  const appId = config.agent?.appId;
+  let on = false;
+  let removeSink = null;
+  let unsubscribe = null;
+  let cursor = { x: 0.5, y: 0.45 };
+  let streak = 0;
+  let lastKeyAt = 0;
+  let queue = Promise.resolve();
+
+  const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
+  const b = () => {
+    const feature = browser();
+    if (!feature) throw new LumenError('UNAVAILABLE', 'Lumen’s browser is not available');
+    return feature;
+  };
+  const a = () => {
+    const adapter = agent();
+    if (!adapter?.sendFrame || store.get('conn.agent')?.v !== 'online') {
+      throw new LumenError('UNAVAILABLE', 'The TV agent is not connected (Settings → TV agent)');
+    }
+    return adapter;
+  };
+
+  // Pointer position in frame pixels, which is what browser.input() takes.
+  function at() {
+    const size = b().frameSize();
+    return { x: Math.round(cursor.x * size.w), y: Math.round(cursor.y * size.h) };
+  }
+
+  function sendCursor() {
+    agent()?.sendScreen?.({ t: 'screen-cursor', x: cursor.x, y: cursor.y, visible: true });
+  }
+
+  function toast(text) {
+    agent()?.sendScreen?.({ t: 'screen-toast', text });
+  }
+
+  // Remote keys and pointer events are handled one at a time, in order.
+  function enqueue(fn) {
+    queue = queue.then(fn).catch((err) => log.debug('screen input failed', { message: err.message }));
+    return queue;
+  }
+
+  async function move(dx, dy) {
+    const nx = Math.min(1 - EDGE, Math.max(EDGE, cursor.x + dx));
+    const ny = Math.min(1 - EDGE, Math.max(EDGE, cursor.y + dy));
+    // Pushing past the top or bottom edge scrolls the page instead.
+    if (dy && ny === cursor.y) await b().input({ kind: 'wheel', ...at(), deltaY: dy > 0 ? SCROLL_PX / 2 : -SCROLL_PX / 2 });
+    cursor = { x: nx, y: ny };
+    sendCursor();
+    await b().input({ kind: 'move', ...at() });
+  }
+
+  async function onKey(key) {
+    const now = Date.now();
+    streak = now - lastKeyAt < STREAK_MS ? streak + 1 : 0;
+    lastKeyAt = now;
+    const step = Math.min(STEP * (1 + streak * 0.45), STEP_MAX);
+    switch (key) {
+      case 'left': return move(-step, 0);
+      case 'right': return move(step, 0);
+      case 'up': return move(0, -step * 16 / 9);
+      case 'down': return move(0, step * 16 / 9);
+      case 'enter': return b().input({ kind: 'click', ...at() });
+      case 'back': return b().nav('back');
+      case 'chup': return b().input({ kind: 'wheel', ...at(), deltaY: -SCROLL_PX });
+      case 'chdown': return b().input({ kind: 'wheel', ...at(), deltaY: SCROLL_PX });
+      case 'green': return b().nav('reload');
+      case 'red': return close();
+      case 'yellow': return playVideo().catch((err) => toast(err.message));
+      case 'blue': return toast('Type with Lumen on your phone: Browser → Keyboard');
+      default: return undefined;
+    }
+  }
+
+  async function onPointer({ x, y }, click) {
+    cursor = { x: Math.min(1, Math.max(0, Number(x) || 0)), y: Math.min(1, Math.max(0, Number(y) || 0)) };
+    sendCursor();
+    await b().input({ kind: click ? 'click' : 'move', ...at() });
+  }
+
+  function onMessage(msg) {
+    if (!on) return;
+    if (msg.t === 'screen-input') {
+      if (typeof msg.key === 'string') enqueue(() => onKey(msg.key));
+      else if (msg.pointer) enqueue(() => onPointer(msg.pointer, msg.click === true));
+    } else if (msg.t === 'screen-video') {
+      store.set('tvscreen.video', typeof msg.state === 'string' ? msg.state.slice(0, 20) : null, { src: 'derived', via: 'tvscreen' });
+      if (msg.state === 'error') log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 120) });
+    }
+  }
+
+  /** Shows Lumen's browser on the TV, optionally opening `url` first. */
+  async function open({ url } = {}) {
+    const adapter = a();
+    const feature = b();
+    if (url) await feature.open(url);
+    else {
+      await feature.ensureRunning();
+      if (!store.get('browser.url')?.v) await feature.nav('home');
+    }
+    await adapter.request('screen', { on: true });
+    if (appId && rest) await rest.launch(appId).catch((err) => log.debug('agent bring-to-front failed', { message: err.message }));
+    if (!on) {
+      on = true;
+      removeSink = feature.addSink((bytes) => agent()?.sendFrame?.(bytes));
+      unsubscribe = adapter.onScreen(onMessage);
+      setState(true);
+      log.info('browser shown on the TV', { url: store.get('browser.url')?.v ?? null });
+    }
+    sendCursor();
+    return { value: { on: true, url: store.get('browser.url')?.v ?? null } };
+  }
+
+  async function close() {
+    if (!on) return { value: { on: false } };
+    on = false;
+    removeSink?.();
+    unsubscribe?.();
+    removeSink = unsubscribe = null;
+    setState(false);
+    await agent()?.request?.('screen', { on: false }).catch(() => {});
+    log.info('browser screen closed on the TV');
+    return { value: { on: false } };
+  }
+
+  /** Plays the video the page loaded on the TV's own player, through the relay. */
+  async function playVideo() {
+    const adapter = a();
+    const media = b().media();
+    const pick = media.find((m) => m.kind === 'hls') ?? media.find((m) => m.kind === 'file') ?? media.find((m) => m.kind === 'dash');
+    if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
+    if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
+    const { url } = relay().register(pick.url, pick.headers);
+    if (!on) await open();
+    adapter.sendScreen({ t: 'screen-play', url, title: store.get('browser.title')?.v ?? '' });
+    log.info('video handed to the TV player', { kind: pick.kind, host: new URL(pick.url).hostname });
+    return { value: { kind: pick.kind, title: store.get('browser.title')?.v ?? null } };
+  }
+
+  return {
+    open,
+    close,
+    playVideo,
+    start() { setState(false); },
+    async stop() { await close(); },
+    setDemand() {},
+  };
+}

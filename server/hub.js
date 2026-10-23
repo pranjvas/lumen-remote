@@ -810,7 +810,23 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return {};
     },
     'browser.close': async () => feature('browser', 'close'),
-    'browser.openOnTv': openOnTv,
+    // "On TV": Lumen's own browser shown full screen on the TV (the TV's built-in browser stays
+    // available as browser.openInTvBrowser).
+    'browser.openOnTv': async ({ url }) => {
+      requireTvOn();
+      const target = url === undefined ? valueOf('browser.url') : webUrl(url, 'url', !!config.browser?.allowLoopback);
+      return feature('tvscreen', 'open', { url: target === valueOf('browser.url') ? undefined : target });
+    },
+    'browser.openInTvBrowser': openOnTv,
+    'tvscreen.open': async ({ url }) => {
+      requireTvOn();
+      return feature('tvscreen', 'open', { url: url === undefined ? undefined : webUrl(url, 'url', !!config.browser?.allowLoopback) });
+    },
+    'tvscreen.close': async () => feature('tvscreen', 'close'),
+    'tvscreen.playVideo': async () => {
+      requireTvOn();
+      return feature('tvscreen', 'playVideo');
+    },
 
     // The VPN switch: Lumen's browser restarts with (or without) the tunnel proxy after every change.
     'vpn.set': async ({ on }) => {

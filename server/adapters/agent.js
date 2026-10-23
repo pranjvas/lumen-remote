@@ -17,7 +17,7 @@ const REQUEST_TIMEOUT_MS = 8000;
 const ICON_RETRY_MS = 10 * 60 * 1000;
 const MAX_ICON_BYTES = 512 * 1024;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
-const REQUEST_TYPES = new Set(['apps', 'icon', 'exit', 'open-url', 'launch', 'meta']);
+const REQUEST_TYPES = new Set(['apps', 'icon', 'exit', 'open-url', 'launch', 'meta', 'screen']);
 const APP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const URL_MAX_LENGTH = 4096;
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -228,7 +228,27 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
       }
     } else if (msg.t === 'reply') {
       onReply(msg);
+    } else if (typeof msg.t === 'string' && msg.t.startsWith('screen-')) {
+      // The browser screen on the TV (agent 0.6.0+): remote keys, pointer, video player state.
+      for (const listener of screenListeners) {
+        try { listener(msg); } catch (err) { log.debug('screen listener failed', { message: err.message }); }
+      }
     }
+  }
+
+  const screenListeners = new Set();
+  const isOpen = () => Boolean(active && active.readyState === WebSocket.OPEN);
+  /** JSON to the agent's screen module (screen-cursor, screen-play, screen-toast). */
+  function sendScreen(msg) {
+    if (!isOpen()) return false;
+    active.send(JSON.stringify(msg));
+    return true;
+  }
+  /** One JPEG frame for the browser screen; skipped while the socket is backed up. */
+  function sendFrame(bytes) {
+    if (!isOpen() || active.bufferedAmount > 2 * 1024 * 1024) return false;
+    active.send(bytes, { binary: true });
+    return true;
   }
 
   async function onHello(msg) {
@@ -522,5 +542,8 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     launch,
     request,
     getIcon,
+    sendScreen,
+    sendFrame,
+    onScreen: (fn) => { screenListeners.add(fn); return () => screenListeners.delete(fn); },
   };
 }

@@ -405,7 +405,7 @@ describe('cast: through the server and the mock TV', { skip }, () => {
       const web = await webServer();
       try {
         const n = mock.state.launches.length;
-        let ack = await b.send('browser.openOnTv', { url: web.url('/page') }, { timeout: 15000 });
+        let ack = await b.send('browser.openInTvBrowser', { url: web.url('/page') }, { timeout: 15000 });
         assert.equal(ack.ok, true, JSON.stringify(ack.error));
         const launch = mock.state.launches[n];
         assert.deepEqual([launch.id, launch.appId, launch.payload], ['org.tizen.browser', BROWSER_APP, web.url('/page')]);
@@ -415,7 +415,7 @@ describe('cast: through the server and the mock TV', { skip }, () => {
         assert.equal(mock.state.webapps.length, 0, 'the App Launcher container is never used');
         assert.equal(mock.state.apps.get(BROWSER_APP).visible, true);
 
-        ack = await b.send('browser.openOnTv', { url: web.url('/page') }, { timeout: 15000 });
+        ack = await b.send('browser.openInTvBrowser', { url: web.url('/page') }, { timeout: 15000 });
         assert.equal(ack.ok, false);
         assert.match(ack.error.message, /already open/);
         assert.equal(mock.state.launches.length, n + 1, 'the refused launch string was dropped');
