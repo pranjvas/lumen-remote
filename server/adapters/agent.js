@@ -560,6 +560,8 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     launch,
     request,
     getIcon,
+    /** The Tizen app id behind an app.installed (launch) id; Eyes and the TV report running apps by it. */
+    tizenIdOf,
     sendScreen,
     sendFrame,
     onScreen: (fn) => { screenListeners.add(fn); return () => screenListeners.delete(fn); },

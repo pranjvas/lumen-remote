@@ -19,12 +19,13 @@ function frame() {
 }
 
 // A fake org.lumen.eyes: dials the URL Lumen passed, says hello, answers capture requests.
-function connectEyes(url, { fail = false } = {}) {
+function connectEyes(url, { fail = false, dropOn = null } = {}) {
   const ws = new WebSocket(url);
   const captures = [];
   ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', version: '0.2.0' })));
   ws.on('message', (raw) => {
     const msg = JSON.parse(String(raw));
+    if (msg.t === dropOn) { ws.terminate(); return; }
     if (msg.t !== 'capture') return;
     captures.push(msg);
     if (fail) {
@@ -170,5 +171,22 @@ describe('eyes: screen capture through the TV agent', () => {
     assert.equal(ack.error.code, 'FAILED');
     assert.match(ack.error.message, /could not capture/);
     await waitFor(() => eyes.at(-1).captures.length === 1, { timeout: 2000, what: 'the failing capture' });
+  });
+
+  test('a memory request fails as soon as Eyes disconnects (it does not wait out its timeout)', async () => {
+    eyes.at(-1).close();
+    await b.waitForState('conn.eyes', (r) => r?.v === 'offline', { timeout: 5000 });
+    agent.onRequest((msg) => {
+      if (msg.type === 'launch' && msg.appId === 'org.lumen.eyes') {
+        eyes.pop()?.close();
+        eyes.push(connectEyes(msg.data.lumen, { dropOn: 'procs' }));
+      }
+    });
+    const t0 = Date.now();
+    const ack = await b.send('tv.processes', {}, { timeout: 20000 });
+    assert.equal(ack.ok, false);
+    assert.equal(ack.error.code, 'UNAVAILABLE');
+    assert.match(ack.error.message, /disconnected/);
+    assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms`);
   });
 });
