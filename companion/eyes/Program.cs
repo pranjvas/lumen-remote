@@ -8,7 +8,8 @@
 // Protocol: text {t:'hello', version} on connect; text {t:'capture', id, mode?} → binary frame
 // [4-byte big-endian header length][header JSON {t:'frame', id, ok, w, h, format:'nv12', ms}][Y w*h][UV w*h/2]
 // or text {t:'frame', id, ok:false, error}; text {t:'bye'} → the app exits.
-// Also: {t:'bluetooth', id} → adapter + bonded devices; {t:'procs', id} → memory, running apps, processes.
+// Also: {t:'bluetooth', id} → adapter + bonded devices; {t:'procs', id, detail?: 1} → memory totals and
+// running apps; with detail 1 also per-app RSS/PSS and the largest processes {pid, name, rssKb}.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -33,7 +34,7 @@ namespace LumenEyes
 
     class App : CoreUIApplication
     {
-        const string Version = "0.3.2";
+        const string Version = "0.3.3";
         const int BufSize = 0x7e900;              // the library's own buffer size; frames come back at 720x540
         const int GiveUpAfterMs = 10 * 60 * 1000; // exit when Lumen has been unreachable this long
         static readonly Regex LumenUrl = new Regex(@"^ws://[0-9.]{7,15}:\d{1,5}/eyes\?key=[0-9a-f]{16,128}$");
@@ -45,6 +46,11 @@ namespace LumenEyes
         // instead of waiting out the backoff.
         volatile bool linked;
         IntPtr data, ybuf, cbuf;
+        // ClientWebSocket allows one send at a time; memory answers are sent from a background task
+        // while the receive loop keeps serving captures, so every send takes this lock.
+        static readonly SemaphoreSlim sendLock = new SemaphoreSlim(1, 1);
+        // One memory reading at a time (it walks /proc); later requests wait their turn off the loop.
+        static readonly SemaphoreSlim procsGate = new SemaphoreSlim(1, 1);
 
         protected override void OnCreate()
         {
@@ -105,7 +111,7 @@ namespace LumenEyes
                             if (type == "bye") { Exit(); return; }
                             if (type == "capture") await Capture(ws, Field(msg, "id"), Number(Field(msg, "mode"), 0), token);
                             if (type == "bluetooth") await SendText(ws, BluetoothJson(Field(msg, "id")), token);
-                            if (type == "procs") await SendText(ws, await ProcsJson(Field(msg, "id")), token);
+                            if (type == "procs") AnswerProcs(ws, Field(msg, "id"), Number(Field(msg, "detail"), 0) == 1, token);
                         }
                     }
                 }
@@ -157,7 +163,7 @@ namespace LumenEyes
             Buffer.BlockCopy(header, 0, frame, 4, header.Length);
             Marshal.Copy(yp == IntPtr.Zero ? ybuf : yp, frame, 4 + header.Length, ySize);
             Marshal.Copy(cp == IntPtr.Zero ? cbuf : cp, frame, 4 + header.Length + ySize, cSize);
-            await ws.SendAsync(new ArraySegment<byte>(frame), WebSocketMessageType.Binary, true, token);
+            await Send(ws, frame, WebSocketMessageType.Binary, token);
         }
 
         // The TV's Bluetooth adapter and bonded devices (TV web apps have no Bluetooth API; .NET does).
@@ -195,9 +201,30 @@ namespace LumenEyes
             return sb.ToString();
         }
 
-        // Memory: /proc/meminfo totals, running apps (app framework) with RSS/PSS, and every process whose
-        // /proc entry this app may read, largest first. Read-only; nothing is stopped from here.
-        static async Task<string> ProcsJson(string id)
+        // Answers {t:'procs'} from a background task so captures and Bluetooth requests keep flowing
+        // while /proc is read; the answer is sent under sendLock like every other message.
+        static void AnswerProcs(ClientWebSocket ws, string id, bool detail, CancellationToken token)
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await procsGate.WaitAsync(token);
+                    string json;
+                    try { json = await ProcsJson(id, detail); }
+                    finally { procsGate.Release(); }
+                    if (ws.State == WebSocketState.Open) await SendText(ws, json, token);
+                }
+                catch (Exception) { }
+            });
+        }
+
+        // Memory: /proc/meminfo totals and the running apps (app framework). With detail, also each app's
+        // RSS/PSS (smaps parsing, slow for big web apps) and every process whose /proc status this app may
+        // read, largest first: pid, name and RSS only. Command lines are never read or sent: on Tizen they
+        // carry launch bundles and URLs with keys (Eyes' own is ws://<pc>/eyes?key=...). Read-only; nothing
+        // is stopped from here.
+        static async Task<string> ProcsJson(string id, bool detail)
         {
             var sb = new StringBuilder("{\"t\":\"procs\",\"id\":" + Quote(id ?? "") + ",\"ok\":true,\"meminfo\":{");
             try
@@ -216,23 +243,31 @@ namespace LumenEyes
             try
             {
                 var apps = (await ApplicationManager.GetRunningApplicationsAsync()).ToList();
-                var pids = apps.Select(a => a.ProcessId).ToList();
                 Tizen.System.ProcessMemoryUsage usage = null;
-                try { usage = new Tizen.System.ProcessMemoryUsage(pids); } catch (Exception) { }
+                if (detail)
+                {
+                    try { usage = new Tizen.System.ProcessMemoryUsage(apps.Select(a => a.ProcessId).ToList()); } catch (Exception) { }
+                }
                 int n = 0;
                 foreach (var a in apps)
                 {
                     if (n++ > 0) sb.Append(',');
-                    int rss = -1, pss = -1;
-                    try { if (usage != null) { rss = usage.GetRss(a.ProcessId); pss = usage.GetPss(a.ProcessId); } } catch (Exception) { }
-                    sb.Append("{\"id\":" + Quote(a.ApplicationId ?? "") + ",\"pid\":" + a.ProcessId + ",\"state\":" + Quote(a.State.ToString()) + ",\"rssKb\":" + rss + ",\"pssKb\":" + pss + "}");
+                    sb.Append("{\"id\":" + Quote(a.ApplicationId ?? "") + ",\"pid\":" + a.ProcessId + ",\"state\":" + Quote(a.State.ToString()));
+                    if (detail)
+                    {
+                        int rss = -1, pss = -1;
+                        try { if (usage != null) { rss = usage.GetRss(a.ProcessId); pss = usage.GetPss(a.ProcessId); } } catch (Exception) { }
+                        sb.Append(",\"rssKb\":" + rss + ",\"pssKb\":" + pss);
+                    }
+                    sb.Append('}');
                 }
             }
             catch (Exception ex) { sb.Append("{\"error\":" + Quote(ex.GetType().Name + ": " + ex.Message) + "}"); }
+            if (!detail) return sb.Append("]}").ToString();
             sb.Append("],\"procs\":[");
             try
             {
-                var list = new List<Tuple<int, string, long, string>>();
+                var list = new List<Tuple<int, string, long>>();
                 int unreadable = 0;
                 foreach (var dir in Directory.GetDirectories("/proc"))
                 {
@@ -246,9 +281,7 @@ namespace LumenEyes
                             if (line.StartsWith("Name:")) comm = line.Substring(5).Trim();
                             else if (line.StartsWith("VmRSS:")) long.TryParse(Regex.Match(line, @"\d+").Value, out rss);
                         }
-                        string cmd = "";
-                        try { cmd = File.ReadAllText(dir + "/cmdline").Replace('\0', ' ').Trim(); } catch (Exception) { }
-                        list.Add(Tuple.Create(pid, comm ?? "", rss, cmd.Length > 160 ? cmd.Substring(0, 160) : cmd));
+                        list.Add(Tuple.Create(pid, comm ?? "", rss));
                     }
                     catch (Exception) { unreadable++; }
                 }
@@ -256,7 +289,7 @@ namespace LumenEyes
                 foreach (var p in list.OrderByDescending(p => p.Item3).Take(80))
                 {
                     if (k++ > 0) sb.Append(',');
-                    sb.Append("{\"pid\":" + p.Item1 + ",\"name\":" + Quote(p.Item2) + ",\"rssKb\":" + p.Item3 + ",\"cmd\":" + Quote(p.Item4) + "}");
+                    sb.Append("{\"pid\":" + p.Item1 + ",\"name\":" + Quote(p.Item2) + ",\"rssKb\":" + p.Item3 + "}");
                 }
                 sb.Append("],\"seen\":" + list.Count + ",\"unreadable\":" + unreadable + "}");
             }
@@ -265,7 +298,14 @@ namespace LumenEyes
         }
 
         static Task SendText(ClientWebSocket ws, string text, CancellationToken token) =>
-            ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(text)), WebSocketMessageType.Text, true, token);
+            Send(ws, Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, token);
+
+        static async Task Send(ClientWebSocket ws, byte[] bytes, WebSocketMessageType type, CancellationToken token)
+        {
+            await sendLock.WaitAsync(token);
+            try { await ws.SendAsync(new ArraySegment<byte>(bytes), type, true, token); }
+            finally { sendLock.Release(); }
+        }
 
         // Lumen's requests are tiny flat JSON objects; a field reader avoids a JSON dependency.
         static string Field(string json, string name)

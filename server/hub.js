@@ -767,7 +767,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     // The TV's memory: totals, running apps and readable processes (largest first), via Lumen Eyes.
     'tv.processes': async () => {
       requireTvOn();
-      return { value: await call('eyes', 'processes') };
+      return { value: await call('eyes', 'processes', { detail: true }) };
     },
 
     // Closes apps running in the background (not on screen) to free the TV's memory (features/memory.js).
