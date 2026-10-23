@@ -611,11 +611,35 @@ export function mountBrowser(root, ctx) {
     placePointer();
   }
 
+  // While the TV shows the page, moves and clicks drive the TV's own pointer (as the Mouse view does):
+  // the TV draws it, so it is smooth, and the agent turns it into page moves and clicks. Scrolling still
+  // goes to the page directly. The phone's pointer catches up with the TV's once a stroke ends.
+  const nativeTv = () => ctx.state.value('tvscreen.on', false) === true && ctx.state.value('conn.remote', null) === 'paired';
+  let native = { dx: 0, dy: 0 };
+  let nativeFrame = 0;
+  let nativeSync = 0;
+  const flushNative = () => {
+    nativeFrame = 0;
+    const dx = Math.round(native.dx);
+    const dy = Math.round(native.dy);
+    native = { dx: 0, dy: 0 };
+    if (dx || dy) ctx.live.post('pointer.move', { dx: clamp(dx, -400, 400), dy: clamp(dy, -400, 400) });
+    clearTimeout(nativeSync);
+    nativeSync = setTimeout(syncPointer, 300);
+  };
+
   bindTrackpad(pad, {
     // A slow stroke across the pad crosses the page; a finger's travel is the same page distance
     // either way, so the pointer moves the way the finger does.
     move(dx, dy) {
       if (!padLive()) return;
+      if (nativeTv()) {
+        const gain = readGain();
+        native.dx += accelerate(dx, gain);
+        native.dy += accelerate(dy, gain);
+        if (!nativeFrame) nativeFrame = requestAnimationFrame(flushNative);
+        return;
+      }
       const p = pad.getBoundingClientRect();
       const c = canvas.getBoundingClientRect();
       if (!p.width || !c.height) return;
@@ -630,6 +654,14 @@ export function mountBrowser(root, ctx) {
     },
     click(button) {
       if (!padLive()) return;
+      if (nativeTv()) {
+        if (nativeFrame) { cancelAnimationFrame(nativeFrame); flushNative(); }
+        ctx.cmd('pointer.click', { button }, { silent: false });
+        pad.classList.remove('is-tap');
+        void pad.offsetWidth;
+        pad.classList.add('is-tap');
+        return;
+      }
       pointerMoves.flush();
       sendPointer({ action: 'click', button });
       pad.classList.remove('is-tap');

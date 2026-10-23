@@ -102,8 +102,16 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { x: Math.round(cursor.x * size.w), y: Math.round(cursor.y * size.h) };
   }
 
+  // Lumen's own pointer on the TV; hidden while the TV's pointer (Mouse view, Browser pad) is in use.
+  let drawn = false;
   function sendCursor() {
+    drawn = true;
     agent()?.sendScreen?.({ t: 'screen-cursor', x: cursor.x, y: cursor.y, visible: true });
+  }
+  function hideCursor() {
+    if (!drawn) return;
+    drawn = false;
+    agent()?.sendScreen?.({ t: 'screen-cursor', x: cursor.x, y: cursor.y, visible: false });
   }
 
   function toast(text) {
@@ -184,7 +192,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   async function onPointer({ x, y }, click) {
     if (click) lastRemoteInput = Date.now();
     cursor = { x: Math.min(1, Math.max(0, Number(x) || 0)), y: Math.min(1, Math.max(0, Number(y) || 0)) };
-    sendCursor();
+    hideCursor(); // the TV draws its own pointer here
     await b().input({ kind: click ? 'click' : 'move', ...at() });
   }
 
