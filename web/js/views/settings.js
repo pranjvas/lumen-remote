@@ -479,14 +479,18 @@ function healthRow(ctx, { watch }) {
     const ack = await ctx.cmd('tv.freeMemory', {}, { el: freeBtn, timeoutMs: 90000 });
     freeBtn.classList.remove('is-busy');
     if (!ack.ok) return;
-    const { closed = [], freedMb, after } = ack.value ?? {};
-    const names = closed.map((c) => c.name).join(', ');
-    const msg = closed.length
-      ? `Closed ${names}${freedMb > 0 ? ` · about ${freedMb} MB freed` : ''}${after ? ` · ${after.availableMb} MB available` : ''}`
-      : 'No apps were running in the background';
+    const { closed = [], failed = [], freedMb, after } = ack.value ?? {};
+    const names = (list) => list.map((c) => c.name || c.id).join(', ');
+    const parts = [];
+    if (closed.length) parts.push(`Closed ${names(closed)}${freedMb > 0 ? ` · about ${freedMb} MB freed` : ''}`);
+    if (failed.length) parts.push(`Could not close ${names(failed)}`);
+    if (!parts.length) parts.push('No apps were running in the background');
+    if (after && (closed.length || failed.length)) parts.push(`${after.availableMb} MB available`);
+    const msg = parts.join(' · ');
     freeNote.textContent = msg;
     freeNote.hidden = false;
-    toast(msg, { level: closed.length ? 'ok' : 'info' });
+    freeNote.title = failed.map((f) => `${f.name || f.id}: ${f.error}`).join('\n');
+    toast(msg, { level: failed.length ? 'warn' : closed.length ? 'ok' : 'info' });
   });
   const row = rowShell({ key: 'system.cpuLoad', label: 'System health', hint: 'From the TV agent and Lumen Eyes', type: 'readonly' },
     h('div', { class: 'health-wrap' }, h('div', { class: 'health' }, cpu.el, mem.el, disk.el), h('div', { class: 'health-actions' }, freeBtn, freeNote)));

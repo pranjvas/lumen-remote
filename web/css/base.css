@@ -613,6 +613,17 @@ img { display: block; }
 @media (max-height: 759px) and (max-width: 979px) {
   .app[data-view="remote"] .askbar { display: none; }
 }
+/* Phone on its side: slimmer header, icon-only tabs, so the view keeps most of the height. */
+@media (max-height: 500px) and (max-width: 979px) {
+  :root { --header-h: 46px; --tabbar-h: 44px; }
+  .topbar .power { width: 38px; height: 38px; }
+  .chain { margin-top: 1px; }
+  .ai-btn { height: 34px; }
+  .nav { padding-top: 2px; padding-bottom: calc(2px + var(--safe-bottom)); }
+  .nav-item { height: 40px; }
+  .nav-item > span { display: none; }
+  .nav-item::before { top: 6px; }
+}
 
 /* Lumen AI button: in the header on every phone screen (desktop keeps the ask bar in view). */
 .ai-btn {

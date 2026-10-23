@@ -75,6 +75,9 @@ aiButton.addEventListener('click', () => {
     },
     onClose: () => ask.inputs.delete(sheetInput),
   });
+  // iPhone opens the keyboard only for a focus made inside the tap itself (openSheet focuses a frame
+  // later), so focus here, synchronously.
+  sheetInput?.focus({ preventScroll: true });
 });
 $('#ai-slot').replaceWith(aiButton);
 

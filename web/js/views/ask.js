@@ -298,7 +298,11 @@ export function createAsk(ctx) {
       rec.onresult = (e) => {
         const result = e.results[e.results.length - 1];
         input.value = result[0].transcript;
-        if (result.isFinal) { const text = input.value; input.value = ''; submit(text); }
+        // Submitting through the form lets its owner react as to a typed request (the header Ask sheet
+        // closes itself on submit).
+        if (!result.isFinal) return;
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else { const text = input.value; input.value = ''; submit(text); }
       };
       rec.onerror = (e) => { if (e.error !== 'aborted' && e.error !== 'no-speech') toast('The microphone is not available', { level: 'warn' }); };
       rec.onend = () => { mic.classList.remove('is-listening'); rec = null; };
