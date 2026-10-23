@@ -1,10 +1,12 @@
 // Browser: headless Edge on the Lumen PC renders the page and streams it here as frames; pointer,
 // wheel and typing go back as browser.input in frame pixels. One shared session for every client;
-// Open on TV hands the page to the TV's own browser.
+// Show on TV puts the page on the TV. The Mouse toggle opens a trackpad that moves one pointer over
+// the page (browser.pointer), the same pointer the TV shows and the TV remote moves.
 
 import { h, icon, fill } from '../ui/dom.js';
 import { toast } from '../ui/toast.js';
 import { haptic } from '../ui/haptics.js';
+import { accelerate, bindTrackpad, readGain } from '../ui/trackpad.js';
 
 const RATE_MS = 33;          // moves and wheel deltas coalesce to ~30 messages/s
 const VIEWPORT_MS = 250;     // resize settle before browser.viewport
@@ -12,6 +14,9 @@ const TAP_MS = 350;
 const TAP_SLOP = 10;
 const LONG_PRESS_MS = 550;
 const WHEEL_LINE_PX = 40;
+const PAD_KEY = 'lumen.browser.pad';
+const POINTER_EDGE = 0.002;  // the server keeps the pointer this far (fraction of the page) inside
+const PAD_SCROLL = 1.5;      // two-finger scroll: page pixels per stage pixel the fingers travel
 const VIEWPORT_MIN = 320;
 const VIEWPORT_MAX = { w: 1280, h: 800 };
 const SEARCH = 'https://duckduckgo.com/?q=';
@@ -50,6 +55,7 @@ function coalescer(send, merge) {
   };
   return {
     flush,
+    get pending() { return !!pending; },
     push(ev) {
       pending = pending && merge ? merge(pending, ev) : ev;
       const wait = RATE_MS - (performance.now() - at);
@@ -78,7 +84,12 @@ export function mountBrowser(root, ctx) {
     enterkeyhint: 'enter', 'aria-label': 'Type into the page',
   });
   const overlay = h('div', { class: 'browser-overlay' });
-  const stage = h('div', { class: 'browser-stage' }, canvas, typer, overlay);
+  const pointerEl = h('div', { class: 'browser-pointer', hidden: true, 'aria-hidden': 'true' }, icon('cursor'));
+  const stage = h('div', { class: 'browser-stage' }, canvas, typer, pointerEl, overlay);
+  const pad = h('div', {
+    class: 'touchpad browser-pad', role: 'application', 'aria-roledescription': 'trackpad', hidden: true,
+    'aria-label': 'Trackpad. Drag to move the pointer over the page, tap to click, long press to right-click, two-finger drag to scroll.',
+  }, h('p', { class: 'touch-hint', text: 'Drag to move · Tap to click · Two fingers scroll' }));
 
   let frame = { w: 0, h: 0 };
   let hasFrame = false;
@@ -86,6 +97,8 @@ export function mountBrowser(root, ctx) {
   let fps = 0;
   let lastUrl = null;
   let keyboardOn = false;
+  let padOn = localStorage.getItem(PAD_KEY) === '1';
+  let ptr = { x: 0.5, y: 0.45 }; // the shared pointer, as fractions of the page
 
   /* ---------- address bar, nav, actions ---------- */
 
@@ -129,8 +142,8 @@ export function mountBrowser(root, ctx) {
   const tvButtons = [];
   // While the TV shows Lumen's browser: hand the page's video to the TV's player, or close it.
   const tvExtras = [];
-  const tvExtra = (cls, label, iconName, cmd, done) => {
-    const b = h('button', { class: `btn ghost ${cls}`.trim(), type: 'button', hidden: true, 'aria-label': label }, icon(iconName), h('span', { text: label }));
+  const tvExtra = (cls, label, iconName, cmd, done, short = label) => {
+    const b = h('button', { class: `btn ghost ${cls}`.trim(), type: 'button', hidden: true, 'aria-label': label, title: label }, icon(iconName), h('span', { text: short }));
     b.addEventListener('click', async () => {
       b.classList.add('is-busy');
       const ack = await ctx.cmd(cmd, {}, { el: b, timeoutMs: 20000 });
@@ -148,6 +161,11 @@ export function mountBrowser(root, ctx) {
   const closeButtons = [closeButton(''), closeButton('sm')];
   const keyboardBtn = h('button', { class: 'btn ghost', type: 'button', 'aria-label': 'Keyboard', 'aria-pressed': 'false' }, icon('keyboard'), h('span', { text: 'Keyboard' }));
   keyboardBtn.addEventListener('click', () => setKeyboard(!keyboardOn));
+  const padButtons = [
+    h('button', { class: 'icon-btn browser-nav', type: 'button', 'aria-label': 'Mouse', title: 'Trackpad: move a pointer over the page (and the TV)', 'aria-pressed': 'false' }, icon('mouse')),
+    h('button', { class: 'btn ghost', type: 'button', 'aria-label': 'Mouse', 'aria-pressed': 'false' }, icon('mouse'), h('span', { text: 'Mouse' })),
+  ];
+  for (const b of padButtons) b.addEventListener('click', () => { haptic('key'); setPad(!padOn); });
 
   /* ---------- VPN (follow-up 3): the switch, its status, and "Use a config file" ---------- */
 
@@ -168,7 +186,8 @@ export function mountBrowser(root, ctx) {
     });
     return b;
   };
-  const vpnButtons = [vpnButton(''), vpnButton('tool')];
+  // One switch, beside the address (phones too: a second one in the toolbar crowded it off one row).
+  const vpnButtons = [vpnButton('')];
   const vpnDot = h('span', { class: 'status-dot off', 'aria-hidden': 'true' });
   const vpnText = h('span', { class: 'browser-vpn-text' });
   const vpnFile = h('input', { type: 'file', accept: '.conf,text/plain', hidden: true });
@@ -242,13 +261,15 @@ export function mountBrowser(root, ctx) {
         h('h1', { class: 'view-title', text: 'Browser' }),
         h('p', { class: 'view-sub', text: 'Pages render in Edge on this PC and stream here · Open on TV hands them to the TV' }))),
     h('div', { class: 'browser-bar' },
-      h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload),
+      h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload, padButtons[0]),
       form, vpnButtons[0], tvButton('primary'), tvExtra('browser-tvx', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('browser-tvx', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
     h('div', { class: 'browser-status' }, dot, statusText, meta, closeButtons[1]),
     vpnRow,
     stage,
-    h('div', { class: 'browser-tools' }, phoneNav.back, phoneNav.forward, phoneNav.reload, keyboardBtn, vpnButtons[1], tvButton('tool'),
-      tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV')),
+    pad,
+    // One row on phones; while the TV shows the page its two buttons take the place of On TV.
+    h('div', { class: 'browser-tools' }, phoneNav.back, phoneNav.forward, phoneNav.reload, padButtons[1], keyboardBtn, tvButton('tool'),
+      tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV', 'Video'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV')),
   );
 
   /* ---------- commands ---------- */
@@ -278,6 +299,7 @@ export function mountBrowser(root, ctx) {
     const on = ctx.state.value('tvscreen.on', false) === true;
     for (const b of tvExtras) b.hidden = !on;
     for (const b of tvButtons) b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (padOn) syncPointer();
   });
 
   function retry() {
@@ -320,6 +342,9 @@ export function mountBrowser(root, ctx) {
     }
     for (const b of closeButtons) b.disabled = s === 'off';
     keyboardBtn.disabled = !ready;
+    for (const b of padButtons) b.disabled = !ready;
+    pad.hidden = !(padOn && ready);
+    placePointer();
 
     const [tone, sessionLabel] = SESSION[s] || SESSION.off;
     dot.className = `status-dot ${tone}`;
@@ -415,6 +440,7 @@ export function mountBrowser(root, ctx) {
     if (!hasFrame) {
       hasFrame = true;
       paintState();
+      if (padOn) syncPointer();
     }
   }
 
@@ -425,6 +451,7 @@ export function mountBrowser(root, ctx) {
     const s = Math.min(r.width / frame.w, r.height / frame.h);
     canvas.style.width = `${Math.floor(frame.w * s)}px`;
     canvas.style.height = `${Math.floor(frame.h * s)}px`;
+    placePointer();
   }
 
   ctx.live.on('browser.frame', onFrame);
@@ -453,7 +480,7 @@ export function mountBrowser(root, ctx) {
 
   new ResizeObserver(() => { fit(); viewport(); }).observe(stage);
   ctx.on('view', (name) => {
-    if (name === 'browser') { fit(); viewport(true); }
+    if (name === 'browser') { fit(); viewport(true); if (padOn) syncPointer(); }
     else { setKeyboard(false); typer.blur(); }
   });
   ctx.on('hello', () => { sentViewport = ''; viewport(true); });
@@ -540,6 +567,89 @@ export function mountBrowser(root, ctx) {
     wheels.push({ kind: 'wheel', ...at(e), deltaX: Math.round(e.deltaX * unit * s), deltaY: Math.round(e.deltaY * unit * s), modifiers: modifiers(e) });
   }, { passive: false });
   canvas.addEventListener('focus', () => typer.focus({ preventScroll: true }));
+
+  /* ---------- trackpad: one pointer over the page (and the TV's cursor while it shows the page) ---------- */
+
+  // Moves are predicted here and sent as deltas, so the TV remote can move the same pointer between
+  // strokes; the server's answer is adopted once nothing is in flight.
+  let inflight = 0;
+  function sendPointer(ev) {
+    inflight += 1;
+    ctx.live.send('browser.pointer', ev, { timeoutMs: 5000 }).then((ack) => {
+      inflight -= 1;
+      if (!ack.ok || !ack.value || inflight || pointerMoves.pending) return;
+      ptr = { x: ack.value.x, y: ack.value.y };
+      placePointer();
+    });
+  }
+  const pointerMoves = coalescer(sendPointer, (a, b) => ({ dx: a.dx + b.dx, dy: a.dy + b.dy }));
+  const pointerWheels = coalescer(sendPointer, (a, b) => ({ ...b, deltaX: a.deltaX + b.deltaX, deltaY: a.deltaY + b.deltaY }));
+  const padLive = () => padOn && session() === 'ready' && frame.w > 0;
+
+  // Where the shared pointer is now (the TV remote may have moved it): a move of nothing reports it.
+  function syncPointer() {
+    if (session() === 'ready' && !inflight) sendPointer({});
+  }
+
+  function placePointer() {
+    const show = padOn && hasFrame && session() === 'ready';
+    pointerEl.hidden = !show;
+    if (!show) return;
+    const c = canvas.getBoundingClientRect();
+    const s = stage.getBoundingClientRect();
+    const x = c.left - s.left - stage.clientLeft + ptr.x * c.width;
+    const y = c.top - s.top - stage.clientTop + ptr.y * c.height;
+    pointerEl.style.transform = `translate(${x}px, ${y}px)`;
+  }
+
+  function setPad(on) {
+    padOn = on;
+    localStorage.setItem(PAD_KEY, on ? '1' : '0');
+    for (const b of padButtons) b.setAttribute('aria-pressed', String(on));
+    pad.hidden = !(on && session() === 'ready');
+    if (on) syncPointer();
+    placePointer();
+  }
+
+  bindTrackpad(pad, {
+    // A slow stroke across the pad crosses the page; a finger's travel is the same page distance
+    // either way, so the pointer moves the way the finger does.
+    move(dx, dy) {
+      if (!padLive()) return;
+      const p = pad.getBoundingClientRect();
+      const c = canvas.getBoundingClientRect();
+      if (!p.width || !c.height) return;
+      const k = 1 / (2 * p.width);
+      const gain = readGain();
+      const x = clamp(ptr.x + accelerate(dx, gain) * k, POINTER_EDGE, 1 - POINTER_EDGE);
+      const y = clamp(ptr.y + accelerate(dy, gain) * k * (c.width / c.height), POINTER_EDGE, 1 - POINTER_EDGE);
+      if (x === ptr.x && y === ptr.y) return;
+      pointerMoves.push({ dx: x - ptr.x, dy: y - ptr.y });
+      ptr = { x, y };
+      placePointer();
+    },
+    click(button) {
+      if (!padLive()) return;
+      pointerMoves.flush();
+      sendPointer({ action: 'click', button });
+      pad.classList.remove('is-tap');
+      void pad.offsetWidth;
+      pad.classList.add('is-tap');
+    },
+    // Natural scrolling, like dragging the page itself: the content follows the fingers.
+    scroll(dx, dy) {
+      if (!padLive()) return;
+      const s = scale() * PAD_SCROLL;
+      pointerWheels.push({ action: 'wheel', deltaX: -dx * s, deltaY: -dy * s });
+    },
+  });
+  pad.addEventListener('wheel', (e) => {
+    if (!padLive()) return;
+    e.preventDefault();
+    const unit = (e.deltaMode === 1 ? WHEEL_LINE_PX : 1) * scale();
+    pointerWheels.push({ action: 'wheel', deltaX: e.deltaX * unit, deltaY: e.deltaY * unit });
+  }, { passive: false });
+  setPad(padOn);
 
   /* ---------- typing ---------- */
 

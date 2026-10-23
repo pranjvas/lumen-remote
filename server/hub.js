@@ -32,8 +32,9 @@ const VIEW_NAME = /^[a-z][a-z-]{0,23}$/;
 const ITEM_ID = /^[\w-]{1,64}$/;
 const READ_SOURCES = new Set(['live', 'agent']);
 // Commands that stream while the user moves a pointer: they share the roomier pointer rate bucket.
-const STREAMED = new Set(['pointer.move', 'browser.input', 'browser.ack']);
+const STREAMED = new Set(['pointer.move', 'browser.input', 'browser.pointer', 'browser.ack']);
 const BROWSER_INPUT_KINDS = ['move', 'down', 'up', 'click', 'wheel', 'key', 'text'];
+const BROWSER_POINTER_ACTIONS = ['move', 'click', 'wheel'];
 const MOUSE_BUTTONS = ['left', 'right', 'middle'];
 const KEY_MODIFIERS = ['alt', 'ctrl', 'meta', 'shift'];
 
@@ -137,6 +138,20 @@ function browserInput(cmd) {
   if (cmd.modifiers !== undefined) {
     if (Array.isArray(cmd.modifiers)) event.modifiers = cmd.modifiers.map((m) => oneOf(m, 'modifiers', KEY_MODIFIERS));
     else event.modifiers = integer(cmd.modifiers, 'modifiers', 0, 15);
+  }
+  return event;
+}
+
+// The validated `browser.pointer` event: the shared pointer moves by dx/dy (fractions of the page) or
+// to x/y, then clicks or scrolls (deltaX/deltaY in frame pixels) where it is.
+function browserPointer(cmd) {
+  const event = { action: oneOf(cmd.action ?? 'move', 'action', BROWSER_POINTER_ACTIONS) };
+  for (const name of ['dx', 'dy']) if (cmd[name] !== undefined) event[name] = number(cmd[name], name, -1, 1);
+  for (const name of ['x', 'y']) if (cmd[name] !== undefined) event[name] = number(cmd[name], name, 0, 1);
+  if (event.action === 'click') event.button = oneOf(cmd.button ?? 'left', 'button', MOUSE_BUTTONS);
+  if (event.action === 'wheel') {
+    event.deltaX = number(cmd.deltaX ?? 0, 'deltaX', -10000, 10000);
+    event.deltaY = number(cmd.deltaY ?? 0, 'deltaY', -10000, 10000);
   }
   return event;
 }
@@ -821,6 +836,8 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     'browser.open': async ({ url }) => feature('browser', 'open', webUrl(url, 'url', !!config.browser?.allowLoopback)),
     'browser.nav': async ({ action }) => feature('browser', 'nav', oneOf(action, 'action', ['back', 'forward', 'reload', 'stop', 'home'])),
     'browser.input': async (cmd) => feature('browser', 'input', browserInput(cmd)),
+    // The trackpad pointer (Browser view): one position for the page and, while it shows there, the TV.
+    'browser.pointer': async (cmd) => feature('tvscreen', 'pointer', browserPointer(cmd)),
     'browser.viewport': async ({ w, h }) => feature('browser', 'setViewport', number(w, 'w', 1, 16384), number(h, 'h', 1, 16384)),
     'browser.ack': async ({ seq }, client) => {
       integer(seq, 'seq', 0, Number.MAX_SAFE_INTEGER);

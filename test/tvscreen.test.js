@@ -35,6 +35,14 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
           + '<script>const p = document.getElementById("movie_player"); p.getVideoData = () => ({ video_id: "dQw4w9WgXcQ", isLive: false }); p.getCurrentTime = () => 75.5;</script>');
         return;
       }
+      // A page that logs where the mouse moves and clicks (CSS pixels), tall enough to scroll.
+      if (req.url.startsWith('/pointer')) {
+        res.end('<title>Pointer</title><div style="height:4000px"></div><script>window.log = [];'
+          + 'addEventListener("mousemove", (e) => log.push(["move", e.clientX, e.clientY]));'
+          + 'addEventListener("click", (e) => log.push(["click", e.clientX, e.clientY]));'
+          + 'addEventListener("contextmenu", (e) => { e.preventDefault(); log.push(["right", e.clientX, e.clientY]); });</script>');
+        return;
+      }
       if (req.url.startsWith('/second')) res.end(`<title>Second</title><p>Search: ${new URL(req.url, 'http://x').searchParams.get('q') ?? ''}</p>`);
       else res.end('<title>Page</title><a href="/second">Go to second</a><form action="/second"><input name="q" placeholder="Search"></form><h1 style="height:3000px">Hello TV</h1>');
     });
@@ -120,6 +128,68 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     await waitFor(() => plays() > before, { timeout: 15000, what: 'the video handed to the TV player' });
     assert.match(agent.screen.filter((m) => m.t === 'screen-play').at(-1).url, /\/relay\//);
     await waitFor(async () => (await page.evaluate('v.paused')) === true, { timeout: 5000, what: 'the page video paused' });
+    agent.sendScreenInput({ key: 'red' });
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
+  });
+
+  // The Browser view's trackpad: browser.pointer moves one shared pointer by deltas and clicks or
+  // scrolls where it is.
+  const ok = (ack) => { assert.equal(ack.ok, true, JSON.stringify(ack.error)); return ack.value; };
+  const near = (a, b) => Math.abs(a - b) < 1e-9;
+  const pageLog = (kind) => stack.server.features.browser.evaluate(`log.filter((e) => e[0] === '${kind}')`);
+
+  test('the trackpad pointer moves, clicks, right-clicks and scrolls Lumen’s page', async () => {
+    const page = stack.server.features.browser;
+    ok(await b.send('browser.open', { url: `http://127.0.0.1:${web.address().port}/pointer` }, { timeout: 40000 }));
+    await waitFor(async () => (await page.evaluate('document.title').catch(() => '')) === 'Pointer', { timeout: 15000, what: 'the pointer page' });
+    const here = ok(await b.send('browser.pointer', {}));
+    assert.equal(here.tv, false);
+    const moved = ok(await b.send('browser.pointer', { dx: 0.1, dy: -0.05 }));
+    assert.ok(near(moved.x, here.x + 0.1) && near(moved.y, here.y - 0.05), JSON.stringify({ here, moved }));
+    const [w, h] = await page.evaluate('[innerWidth, innerHeight]');
+    await waitFor(async () => (await pageLog('move')).length > 0, { timeout: 5000, what: 'a mousemove on the page' });
+    const [, mx, my] = (await pageLog('move')).at(-1);
+    assert.ok(Math.abs(mx - moved.x * w) <= 2 && Math.abs(my - moved.y * h) <= 2, `moved to ${mx},${my} in ${w}x${h}`);
+
+    ok(await b.send('browser.pointer', { action: 'click' }));
+    await waitFor(async () => (await pageLog('click')).length === 1, { timeout: 5000, what: 'a click on the page' });
+    const [, cx, cy] = (await pageLog('click'))[0];
+    assert.ok(Math.abs(cx - mx) <= 1 && Math.abs(cy - my) <= 1, 'the click lands where the pointer is');
+    ok(await b.send('browser.pointer', { action: 'click', button: 'right' }));
+    await waitFor(async () => (await pageLog('right')).length === 1, { timeout: 5000, what: 'a right-click on the page' });
+    ok(await b.send('browser.pointer', { action: 'wheel', deltaY: 600 }));
+    await waitFor(async () => (await page.evaluate('scrollY')) > 0, { timeout: 5000, what: 'the page to scroll' });
+
+    // Moves stop at the edges; bad input is refused.
+    const edge = ok(await b.send('browser.pointer', { dx: 1 }));
+    assert.ok(edge.x < 1 && edge.x > 0.99);
+    for (const bad of [{ action: 'drag' }, { dx: 3 }, { x: -0.5 }, { action: 'click', button: 'thumb' }, { action: 'wheel', deltaY: 'down' }]) {
+      const ack = await b.send('browser.pointer', bad);
+      assert.equal(ack.error?.code, 'INVALID', JSON.stringify(bad));
+    }
+    ok(await b.send('browser.pointer', { x: 0.5, y: 0.45 }));
+  });
+
+  test('with the page on the TV, the trackpad and the TV remote move the same pointer', async () => {
+    ok(await b.send('browser.openOnTv', {}, { timeout: 40000 }));
+    await b.waitForState('tvscreen.on', (r) => r?.v === true, { timeout: 5000 });
+    const cursor = () => agent.screen.filter((m) => m.t === 'screen-cursor').at(-1);
+    const moved = ok(await b.send('browser.pointer', { dx: -0.2, dy: 0.1 }));
+    assert.equal(moved.tv, true);
+    assert.ok(near(moved.x, 0.3) && near(moved.y, 0.55), JSON.stringify(moved));
+    await waitFor(() => near(cursor().x, moved.x) && near(cursor().y, moved.y), { timeout: 5000, message: 'the TV cursor to follow the trackpad' });
+
+    agent.sendScreenInput({ key: 'right' });
+    await waitFor(() => cursor().x > moved.x, { timeout: 5000, what: 'the remote to move the pointer on' });
+    const after = ok(await b.send('browser.pointer', {}));
+    assert.equal(after.x, cursor().x, 'the trackpad sees where the remote left the pointer');
+
+    const page = stack.server.features.browser;
+    await page.evaluate('log.length = 0');
+    ok(await b.send('browser.pointer', { action: 'click' }));
+    await waitFor(async () => (await pageLog('click')).length === 1, { timeout: 5000, what: 'a click on the page' });
+    const [w] = await page.evaluate('[innerWidth]');
+    assert.ok(Math.abs((await pageLog('click'))[0][1] - after.x * w) <= 2, 'the click lands under the TV cursor');
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
   });

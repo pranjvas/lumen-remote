@@ -196,6 +196,7 @@ const HEADER = 64;
 const browser = {
   session: 'off', error: null, url: null, title: null, loading: false, history: [], index: -1,
   w: 1280, h: 800, scroll: 0, typed: '', focus: false, seq: 0, dirty: true, frameAt: 0, loadTimer: null,
+  pointer: { x: 0.5, y: 0.45 }, tv: false,
 };
 const presence = new Map(); // ws → { name, visible, sent, acked }
 const BROWSER_META = { src: 'derived', via: 'browser' };
@@ -343,7 +344,24 @@ const BROWSER_COMMANDS = {
     requireOn();
     const href = browserUrl(url || browser.url);
     await sleep(500);
+    browser.tv = true;
+    patch([['tvscreen.on', true, { src: 'derived', via: 'tvscreen' }]]);
     return { value: { url: href, method: 'view' } };
+  },
+  'tvscreen.close': () => {
+    browser.tv = false;
+    patch([['tvscreen.on', false, { src: 'derived', via: 'tvscreen' }]]);
+    return { value: { on: false } };
+  },
+  // The trackpad's shared pointer, in fractions of the page (server/features/tvscreen.js pointer()).
+  'browser.pointer': ({ dx = 0, dy = 0, x, y, action = 'move', button = 'left', deltaX = 0, deltaY = 0 }) => {
+    if (browser.session !== 'ready') throw new Fail('UNAVAILABLE', 'The browser is not running');
+    const edge = (v) => Math.min(0.998, Math.max(0.002, v));
+    browser.pointer = { x: edge(x ?? browser.pointer.x + dx), y: edge(y ?? browser.pointer.y + dy) };
+    const at = { x: Math.round(browser.pointer.x * browser.w), y: Math.round(browser.pointer.y * browser.h) };
+    if (action === 'click') browserInput({ kind: 'click', ...at, button });
+    else if (action === 'wheel') browserInput({ kind: 'wheel', ...at, deltaX, deltaY });
+    return { value: { ...browser.pointer, tv: browser.tv } };
   },
 };
 

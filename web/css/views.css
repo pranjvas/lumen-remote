@@ -766,13 +766,22 @@
   overflow: hidden;
 }
 .browser-head { flex: none; margin-bottom: 4px; }
-.browser-bar { display: flex; align-items: center; gap: 10px; flex: none; }
+.browser-bar { display: flex; align-items: center; gap: 10px; flex: none; container: browserbar / inline-size; }
+/* The address field keeps its room: in a narrower bar the TV buttons, then VPN, drop their labels. */
+@container browserbar (max-width: 1000px) {
+  .browser-bar .browser-tvx { width: 40px; padding: 0; }
+  .browser-bar .browser-tvx span { display: none; }
+}
+@container browserbar (max-width: 700px) {
+  .browser-bar .browser-vpn { width: 40px; padding: 0; }
+  .browser-bar .browser-vpn span { display: none; }
+}
 .browser-navgroup { display: flex; gap: 2px; flex: none; }
 .browser-nav { width: 40px; height: 40px; }
 .browser-nav:disabled { opacity: 0.3; }
 .browser-address-box {
   flex: 1;
-  min-width: 0;
+  min-width: 160px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -908,15 +917,19 @@
 .browser-tools .btn {
   flex-direction: column;
   gap: 3px;
+  min-width: 0;
   height: 52px;
-  padding: 0 4px;
+  padding: 0 2px;
   border-radius: 14px;
-  font-size: 10.5px;
+  font-size: 9.5px;
   font-weight: 600;
-  letter-spacing: 0.03em;
+  letter-spacing: 0;
   color: var(--ink-2);
 }
+.browser-tools .btn span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .browser-tools .btn .icon { width: 22px; height: 22px; }
+/* While the TV shows the page, Video and Close TV stand in for On TV. */
+.browser-view .browser-tv[aria-pressed="true"] { display: none; }
 .browser-tools .btn[aria-pressed="true"] { color: var(--accent); background: color-mix(in oklab, var(--accent) 12%, transparent); }
 .browser-tools .btn:disabled { opacity: 0.3; }
 
@@ -930,7 +943,8 @@
   .browser-status { min-height: 24px; padding: 0 4px; }
   .browser-meta { display: none; }
   .browser-stage { border-radius: 16px; }
-  .browser-tools { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; flex: none; }
+  /* One row however many tools show (6, or 7 while the TV shows the page). */
+  .browser-tools { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 2px; flex: none; }
   /* The page gets the room: no ask bar under it, and the tab bar makes space for a seventh tab. */
   .app[data-view="browser"] .askbar { display: none; }
   .nav-item { min-width: 0; flex: 1 1 0; padding-left: 2px; padding-right: 2px; }
@@ -949,6 +963,33 @@
   position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
   padding: 4px 10px; border-radius: 999px; font-size: 12px; pointer-events: none;
   color: #f3efe7; background: rgba(10, 10, 12, 0.72);
+}
+
+/* Browser trackpad: the pad under the page (the Mouse view's .touchpad) and the pointer drawn over it. */
+.browser-pad {
+  flex: none;
+  width: min(100%, 560px);
+  height: clamp(150px, 22dvh, 220px);
+  margin: 0;
+  align-self: center;
+  -webkit-touch-callout: none;
+}
+.browser-pad .touch-hint { bottom: 12px; padding: 0 12px; }
+.browser-navgroup .browser-nav[aria-pressed="true"] { color: var(--accent); background: color-mix(in oklab, var(--accent) 12%, transparent); }
+.browser-pointer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 22px;
+  height: 22px;
+  margin: -3px 0 0 -5.5px; /* the arrow's tip sits on the point */
+  color: var(--accent);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.8)) drop-shadow(0 0 8px color-mix(in oklab, var(--accent) 55%, transparent));
+  pointer-events: none;
+}
+.browser-pointer .icon { width: 22px; height: 22px; fill: color-mix(in oklab, var(--accent) 35%, transparent); }
+@media (max-width: 979px) {
+  .browser-pad { width: 100%; height: clamp(130px, 21dvh, 200px); border-radius: 18px; }
 }
 
 /* Browser VPN (follow-up 3): the switch, its status row, "Use a config file". */

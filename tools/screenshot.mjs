@@ -8,7 +8,8 @@
 //
 // Targets: tools/dev-ui.mjs (fake /live, default port 8799) or tools/dev-stack.mjs (the real server on
 // the mock TV, port 8798: --base http://127.0.0.1:8798).
-// --extras adds interaction shots against tools/dev-ui.mjs (volume sheet, an Ask run, a cast, the TV keyboard).
+// --extras adds interaction shots against tools/dev-ui.mjs (volume sheet, an Ask run, a cast, the TV keyboard,
+// the Browser view's trackpad).
 // Exit code 1 when any console error, exception or failed request was seen.
 
 import { spawn, execFile } from 'node:child_process';
@@ -241,6 +242,40 @@ try {
         await settle(900);
         await shot(`extra-ime-${suffix}`);
         await fetch(`${BASE}/dev/ime?open=0`, { method: 'POST' });
+        await settle(400);
+
+        // The Browser view's trackpad: a page open, the Mouse toggle on, a stroke on the pad (touch on
+        // phones), then the same with the page on the TV.
+        // Real input (a touch on phones), so the page sees a user gesture.
+        const drag = async (points) => {
+          for (const [i, p] of points.entries()) {
+            if (mobile) await cdp.send('Input.dispatchTouchEvent', { type: i ? 'touchMove' : 'touchStart', touchPoints: [p] });
+            else await cdp.send('Input.dispatchMouseEvent', { type: i ? 'mouseMoved' : 'mousePressed', ...p, button: 'left', buttons: 1, clickCount: 1 });
+            if (points.length > 1) await sleep(40);
+          }
+          if (mobile) await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+          else await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...points.at(-1), button: 'left', buttons: 0, clickCount: 1 });
+        };
+        const centre = (selector) => evaluate(`(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.offsetParent);
+          if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
+        const tap = async (selector) => { const p = await centre(selector); if (p) await drag([p]); };
+        await fetch(`${BASE}/dev/browser?url=${encodeURIComponent('https://example.com/')}`, { method: 'POST' });
+        await evaluate(`location.hash = '#/browser'; true`);
+        await settle(1200);
+        await tap('.browser-view button[aria-label="Mouse"]');
+        await settle(700);
+        const pad = await centre('.browser-pad');
+        const sign = mobile ? 1 : -1; // the pointer is shared, so the desktop run starts where the phone left it
+        await drag([[0, 0], [12, 4], [30, 10], [50, 16], [70, 20]].map(([dx, dy]) => ({ x: pad.x + sign * dx, y: pad.y + sign * dy })));
+        await settle(600);
+        await shot(`extra-browser-pad-${suffix}`);
+        await tap('.browser-view .browser-tv');
+        await settle(1400);
+        await shot(`extra-browser-pad-tv-${suffix}`);
+        await tap('.browser-view button[aria-label="Close TV"]');
+        await settle(300);
+        await tap('.browser-view button[aria-label="Mouse"]');
+        await fetch(`${BASE}/dev/browser?close=1`, { method: 'POST' });
         await settle(400);
       }
     }

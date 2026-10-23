@@ -2,7 +2,8 @@
 // when it is on) and shown full screen by the TV agent (companion/agent/screen.js). The TV remote
 // drives it — arrows move a pointer, OK clicks, Back goes back, CH ▲▼ scroll, Red closes, Green
 // reloads, Yellow hands the page's video to the TV's own player through the relay (full quality,
-// with sound). Phones keep controlling the same page in the Browser view. YouTube is the exception:
+// with sound). Phones keep controlling the same page in the Browser view, and its trackpad moves this
+// same pointer (browser.pointer), so the TV's cursor follows the phone. YouTube is the exception:
 // its web player streams separate audio and video over MSE (UMP POSTs to googlevideo.com), so there
 // is no single stream to relay; its videos open in the TV's own YouTube app at the same position.
 import { LumenError } from '../errors.js';
@@ -141,6 +142,26 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       case 'blue': return toast('Type with Lumen on your phone: Browser → Keyboard');
       default: return undefined;
     }
+  }
+
+  /** The pointer a phone's trackpad drives (hub browser.pointer): moves by dx/dy (fractions of the
+   *  page) or to x/y, then clicks or scrolls where it is. It is the same pointer the TV remote moves,
+   *  so the TV's cursor follows while the page is on the TV. → where it is now. */
+  async function pointer({ dx = 0, dy = 0, x, y, action = 'move', button = 'left', deltaX = 0, deltaY = 0 } = {}) {
+    const next = {
+      x: Math.min(1 - EDGE, Math.max(EDGE, x ?? cursor.x + dx)),
+      y: Math.min(1 - EDGE, Math.max(EDGE, y ?? cursor.y + dy)),
+    };
+    const moved = next.x !== cursor.x || next.y !== cursor.y;
+    if (moved || action !== 'move') {
+      const feature = b();
+      cursor = next;
+      if (on && moved) sendCursor();
+      if (action === 'click') await feature.input({ kind: 'click', ...at(), button });
+      else if (action === 'wheel') await feature.input({ kind: 'wheel', ...at(), deltaX, deltaY });
+      else await feature.input({ kind: 'move', ...at() });
+    }
+    return { value: { x: cursor.x, y: cursor.y, tv: on } };
   }
 
   async function onPointer({ x, y }, click) {
@@ -388,6 +409,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     open,
     close,
     playVideo,
+    pointer,
     start() { setState(false); },
     async stop() {
       if (current?.job) transcoder()?.stopJob(current.job);
