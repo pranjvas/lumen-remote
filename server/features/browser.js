@@ -344,7 +344,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let flushDue = 0;
   const watchers = new Map(); // client on the Browser view → { outstanding: [{ seq, bytes, at }], lastSeq }
   // Source pacing: Edge's frames whose acks are held back ({ sessionId, at }), oldest first.
-  const pace = { held: [], sessionId: null, releaseTimer: null, releasedFor: 0, arrived: 0, refreshTimer: null, refreshedAt: 0, repeating: false, parked: false };
+  const pace = { held: [], sessionId: null, cdp: null, releaseTimer: null, releasedFor: 0, arrived: 0, refreshTimer: null, refreshedAt: 0, repeating: false, parked: false };
   let idleTimer = null;
 
   // ---------- state ----------
@@ -465,12 +465,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (cdp !== page || !ready) return;
     const now = Date.now();
     if (settings.pace) {
-      // A restarted screencast has a new session; acks for the old one mean nothing to Edge.
-      if (sessionId !== pace.sessionId) {
-        pace.held = [];
+      // A restarted screencast (or a pop-up's own, while it is on show) is a new session: what was
+      // held for the old one is let go.
+      if (sessionId !== pace.sessionId || cdp !== pace.cdp) {
+        ackHeld(pace.held.length);
         pace.sessionId = sessionId;
+        pace.cdp = cdp;
       }
-      pace.held.push({ sessionId, at: now });
+      pace.held.push({ sessionId, at: now, cdp });
       pace.arrived += 1;
       clearTimeout(pace.refreshTimer);
       pace.refreshTimer = null;
@@ -490,8 +492,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   function ackHeld(count) {
-    const cdp = page;
-    for (const { sessionId } of pace.held.splice(0, count)) cdp?.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+    for (const { sessionId, cdp } of pace.held.splice(0, count)) cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
   }
 
   // The next release: LEAD_MS before the next fan-out slot at the normal rate (also while frames
@@ -556,7 +557,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   function resetPacing() {
     clearTimeout(pace.releaseTimer);
     clearTimeout(pace.refreshTimer);
-    Object.assign(pace, { held: [], sessionId: null, releaseTimer: null, releasedFor: 0, arrived: 0, refreshTimer: null, refreshedAt: 0, repeating: false, parked: false });
+    Object.assign(pace, { held: [], sessionId: null, cdp: null, releaseTimer: null, releasedFor: 0, arrived: 0, refreshTimer: null, refreshedAt: 0, repeating: false, parked: false });
   }
 
   function ack(client, acked) {
