@@ -33,6 +33,12 @@ const PAUSE_PAGE_SCRIPT = `(() => {
   document.querySelectorAll('.html5-video-player').forEach((p) => { try { if (p.pauseVideo) p.pauseVideo(); } catch (e) {} });
   document.querySelectorAll('video').forEach((v) => { try { v.pause(); } catch (e) {} });
 })()`;
+// The page's biggest video plays again (the hand-off paused it and the TV could not play it).
+const RESUME_PAGE_SCRIPT = `(() => {
+  const v = [...document.querySelectorAll('video')].sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
+  if (v && v.paused) v.play().catch(() => {});
+  return !!v;
+})()`;
 const YOUTUBE_REPEAT_MS = 15000; // the same video started again this soon after a hand-off is only paused
 const YOUTUBE_MIN_EMBED_AREA = 40000; // CSS px²: a YouTube embed smaller than ~200×200 is not "the page's video"
 const YOUTUBE_APP_IDS = new Set(['111299001912', '9Ur5IzDKqV.TizenYouTube']);
@@ -269,7 +275,13 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       if (msg.state !== 'paused') log.info('TV player', { state: String(msg.state).slice(0, 20), mode: typeof msg.mode === 'string' ? msg.mode.slice(0, 10) : null, note: msg.state === 'error' ? null : String(msg.error ?? '').slice(0, 120) || null });
       if (msg.state === 'error') {
         log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 200), stage: current?.stage ?? null });
-        enqueue(() => fallback(String(msg.error ?? '')));
+        enqueue(async () => {
+          if (await fallback(String(msg.error ?? ''))) return;
+          // Nothing left to try: the page's own video plays again, so the TV shows it (live video)
+          // instead of a page paused for the hand-off.
+          await browser()?.evaluate?.(RESUME_PAGE_SCRIPT).catch(() => {});
+          log.info('the TV could not play the video; it plays on the page again');
+        });
       }
     }
   }
@@ -476,8 +488,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
 
   // The player is in front on the TV as soon as it gets the stream (the agent reports 'playing' later).
   function sendPlay(adapter, msg) {
-    adapter.sendScreen(msg);
+    // Live video stops before the TV's player starts (the TV has one decoder for both); waiting for
+    // the player's first report let a new stream header through, and the two players then fought.
     setVideo('loading');
+    syncLivePause();
+    adapter.sendScreen(msg);
   }
 
   async function handOff({ url: explicit, convert = false } = {}, ctx = {}) {

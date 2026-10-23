@@ -115,6 +115,13 @@
     send({ t: 'screen-input', pointer: { x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight }, click: e.type === 'click' });
   }
 
+  // A live video message from the PC ('LV' + 'I' or 'M', live.js), not a JPEG frame.
+  function isLiveData(buffer) {
+    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 8) return false;
+    const b = new Uint8Array(buffer, 0, 2);
+    return b[0] === 0x4c && b[1] === 0x56;
+  }
+
   // ---- the TV's own video player ----
 
   function playVideo(url, title, fromStart, engine, drm) {
@@ -359,6 +366,9 @@
     },
     // Binary messages: live video ('LV…', live.js) or a JPEG frame.
     frame: function (buffer) {
+      // While the TV's own player is in front, live video waits: the TV has one decoder for both,
+      // and a live player started next to it leaves the video black and can crash this page.
+      if (video && isLiveData(buffer)) return;
       if (live && live.data(buffer)) return;
       showFrame(buffer);
     },
