@@ -461,9 +461,9 @@ textarea.field { height: auto; min-height: 92px; padding: 12px 14px; resize: ver
 .sheet-title {
   margin: 0;
   font-family: var(--font-display);
-  font-weight: 400;
+  letter-spacing: -0.02em;
+  font-weight: 600;
   font-size: 24px;
-  font-variation-settings: "opsz" 72;
 }
 .sheet.is-closing { animation: sheetOut 200ms var(--ease-io) forwards; }
 .scrim.is-closing { animation: fadeOut 200ms var(--ease-io) forwards; }

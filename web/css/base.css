@@ -166,7 +166,6 @@ img { display: block; }
   font-size: 22px;
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  font-variation-settings: "opsz" 72, "SOFT" 50;
 }
 .brand-stack {
   display: flex;
@@ -387,11 +386,10 @@ img { display: block; }
 .view-title {
   margin: 0;
   font-family: var(--font-display);
-  font-weight: 400;
+  font-weight: 600;
   font-size: 28px;
   line-height: 1.15;
-  letter-spacing: -0.01em;
-  font-variation-settings: "opsz" 72, "SOFT" 30;
+  letter-spacing: -0.025em;
 }
 .view-sub { margin: 4px 0 0; color: var(--ink-3); font-size: 13px; }
 
@@ -592,7 +590,8 @@ img { display: block; }
   .app[data-view="remote"] .askbar { display: none; }
 }
 
-/* The Ask view has its own, larger composer. */
+/* The Ask view has its own composer, docked under the conversation. */
+.app[data-view="ask"] .askbar { visibility: hidden; }
 @media (max-width: 979px) {
   .app[data-view="ask"] .askbar { display: none; }
 }

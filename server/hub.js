@@ -556,9 +556,10 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     if (typeof ai?.ask !== 'function') throw new LumenError('UNAVAILABLE', 'Ask Lumen is not available');
     const question = text(cmd.text?.trim?.(), 'text', { max: 2000 });
     const id = typeof cmd.id === 'string' && cmd.id ? cmd.id : randomUUID();
+    const thread = cmd.thread === undefined ? undefined : text(cmd.thread, 'thread', { max: 64, pattern: /^[A-Za-z0-9_-]+$/ });
     const emit = (event) => send(client, { ...event, t: 'ai', id });
     Promise.resolve()
-      .then(() => ai.ask(question, { id, emit }))
+      .then(() => ai.ask(question, { id, emit, thread }))
       .catch((err) => {
         log.warn('ai.ask failed', err);
         emit({ kind: 'error', message: toErrorPayload(err).message });

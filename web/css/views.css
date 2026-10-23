@@ -83,11 +83,10 @@
 .now-card-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .now-hero-title {
   font-family: var(--font-display);
-  font-style: italic;
-  font-weight: 500;
+  letter-spacing: -0.02em;
+  font-weight: 600;
   font-size: 28px;
   line-height: 1.15;
-  font-variation-settings: "opsz" 72;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -606,7 +605,8 @@
 }
 .now-casting-head { display: flex; align-items: center; gap: 14px; }
 .now-casting-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.now-casting-title { font-family: var(--font-display); font-size: 22px; font-weight: 500; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.now-casting-title { font-family: var(--font-display);
+  letter-spacing: -0.02em; font-size: 22px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cast-state { display: inline-flex; align-items: flex-end; gap: 3px; height: 22px; width: 22px; flex: none; }
 .cast-state i { flex: 1; height: 30%; border-radius: 1px; background: var(--accent); }
 .cast-state.is-playing i { animation: eq 900ms var(--ease-io) infinite alternate; }
@@ -631,7 +631,8 @@
     var(--panel);
 }
 .scene-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.scene-name { margin: 0; font-family: var(--font-display); font-weight: 500; font-size: 22px; font-variation-settings: "opsz" 48; }
+.scene-name { margin: 0; font-family: var(--font-display);
+  letter-spacing: -0.02em; font-weight: 600; font-size: 22px; }
 .scene-steps { display: flex; flex-wrap: wrap; gap: 6px; }
 .step {
   display: inline-flex;
@@ -707,101 +708,7 @@
 .ai-pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
 .ai-pill.ready i { background: var(--live); box-shadow: 0 0 8px var(--live); }
 
-.ask-composer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 60px;
-  padding: 6px 8px 6px 18px;
-  margin-bottom: 26px;
-  border-radius: 20px;
-  background: var(--panel);
-  border: 1px solid var(--hair-strong);
-  box-shadow: var(--shadow-deep);
-  transition: border-color var(--dur-state), box-shadow var(--dur-state);
-}
-.ask-composer:focus-within { border-color: color-mix(in oklab, var(--accent) 60%, transparent); box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 12%, transparent), var(--shadow-deep); }
-.ask-composer > .icon { color: var(--accent); }
-.ask-composer input { flex: 1; min-width: 0; height: 100%; border: 0; background: transparent; font-size: 17px; }
-.ask-composer input::placeholder { color: var(--ink-3); }
-.ask-composer .send { color: var(--accent-ink); background: var(--accent); }
-
-.ask-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 30px 12px 10px; }
-.ask-orb {
-  display: grid;
-  place-items: center;
-  width: 84px;
-  height: 84px;
-  margin-bottom: 16px;
-  border-radius: 50%;
-  color: var(--accent);
-  background: radial-gradient(circle at 50% 35%, color-mix(in oklab, var(--accent) 30%, transparent), transparent 70%);
-  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 30%, transparent), 0 0 60px -10px var(--accent);
-  animation: breathe 5s var(--ease-io) infinite;
-}
-@keyframes breathe { 50% { box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 45%, transparent), 0 0 80px -6px var(--accent); } }
-.ask-lead { margin: 0 0 6px; font-family: var(--font-display); font-size: 24px; font-weight: 400; font-variation-settings: "opsz" 72; }
-.ask-setup { display: inline-flex; align-items: center; gap: 8px; margin: 6px 0 4px; padding: 8px 12px; border-radius: 12px; font-size: 13px; color: var(--warn); background: color-mix(in oklab, var(--warn) 10%, transparent); }
-.ask-examples { justify-content: center; margin-top: 16px; max-width: 560px; }
-
-.transcript { display: flex; flex-direction: column; gap: 18px; }
-.run { display: flex; flex-direction: column; gap: 10px; animation: rise var(--dur-panel) var(--ease-out); }
-.run-ask { align-self: flex-end; max-width: 85%; }
-.run-quote {
-  display: inline-block;
-  padding: 10px 16px;
-  border-radius: 18px 18px 4px 18px;
-  font-family: var(--font-display);
-  font-style: italic;
-  font-size: 18px;
-  font-variation-settings: "opsz" 36;
-  background: color-mix(in oklab, var(--accent) 14%, var(--panel));
-  border: 1px solid color-mix(in oklab, var(--accent) 25%, transparent);
-}
-.run-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 92%;
-  padding: 14px 16px;
-  border-radius: 4px 18px 18px 18px;
-  background: var(--panel);
-  border: 1px solid var(--hair);
-}
-.run-status { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-3); }
-.run-status .icon { color: var(--live); }
-.run.is-running .run-status span:last-child {
-  background: linear-gradient(90deg, var(--ink-3) 0%, var(--ink) 50%, var(--ink-3) 100%) 0 0 / 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: shimmer 1.8s linear infinite;
-}
-@keyframes shimmer { to { background-position: -200% 0; } }
-.run-tools { display: flex; flex-direction: column; gap: 6px; }
-.run-tools:empty, .run-notes:empty, .run-answer:empty { display: none; }
-.tool-chip {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 10px;
-  padding: 8px 12px;
-  border-radius: 12px;
-  font-size: 13px;
-  background: var(--hair);
-  border: 1px solid var(--hair);
-}
-.tool-icon { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: color-mix(in oklab, var(--live) 20%, transparent); color: var(--live); }
-.tool-chip.is-failed .tool-icon { background: color-mix(in oklab, var(--danger) 20%, transparent); color: var(--danger); }
-.tool-name { font-weight: 600; }
-.tool-input { font-size: 11.5px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
-.tool-result { flex-basis: 100%; padding-left: 30px; color: var(--ink-2); }
-.run-notes p { margin: 0; font-size: 13.5px; color: var(--ink-2); }
-.run-answer { font-size: 16px; line-height: 1.5; color: var(--ink); }
-.run-error { display: flex; align-items: flex-start; gap: 8px; margin: 0; color: var(--danger); font-size: 14px; }
-.run-foot { display: flex; justify-content: flex-end; }
-.run-foot:empty { display: none; }
-.run.is-failed .run-status .icon { color: var(--danger); }
+/* The Ask view itself (chat, composer, replies) is styled in ask.css. */
 
 /* ---------- Mouse ---------- */
 
@@ -985,7 +892,8 @@
   box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 30%, transparent), 0 0 60px -10px var(--accent);
   animation: breathe 5s var(--ease-io) infinite;
 }
-.browser-lead { margin: 0 0 8px; font-family: var(--font-display); font-weight: 400; font-size: 24px; font-variation-settings: "opsz" 72; }
+.browser-lead { margin: 0 0 8px; font-family: var(--font-display);
+  letter-spacing: -0.02em; font-weight: 600; font-size: 24px; }
 .browser-copy { margin: 0 0 18px; color: var(--ink-2); font-size: 13.5px; line-height: 1.5; }
 .browser-suggest { justify-content: center; }
 .browser-error .browser-orb { color: var(--danger); background: radial-gradient(circle at 50% 35%, color-mix(in oklab, var(--danger) 26%, transparent), transparent 70%); box-shadow: 0 0 0 1px color-mix(in oklab, var(--danger) 35%, transparent); animation: none; }

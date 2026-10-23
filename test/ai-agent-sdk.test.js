@@ -475,6 +475,30 @@ describe('agent-sdk: backend selection in createAi', () => {
     assert.deepEqual(none, { backend: 'off', ready: false, reason: `${SIGN_IN}, or set ANTHROPIC_API_KEY` });
   });
 
+  test('a chat thread replays earlier exchanges to Claude; other threads and thread-less asks start fresh', async () => {
+    const seen = [];
+    const agentSdk = sdkFake(true);
+    agentSdk.run = async (text) => {
+      seen.push(text);
+      return { ok: true, text: `answer ${seen.length}`, tools: [{ name: 'WebSearch', ok: true }, { name: 'mcp__lumen__look_at_screen', ok: true }, { name: 'mcp__lumen__look_at_screen', ok: true }] };
+    };
+    const { feature } = makeAi({}, { api: apiFake(false), agentSdk });
+    const emit = () => {};
+    await feature.ask('Find and play Harold and Kumar', { id: 'r1', emit, thread: 'chat-1' });
+    await feature.ask('It can be on any app', { id: 'r2', emit, thread: 'chat-1' });
+    await feature.ask('Mute the TV', { id: 'r3', emit, thread: 'chat-2' });
+    await feature.ask('Mute the TV', { id: 'r4', emit });
+    assert.equal(seen[0], 'Find and play Harold and Kumar');
+    assert.match(seen[1], /^Earlier in this conversation/);
+    assert.match(seen[1], /User: Find and play Harold and Kumar\nLumen did: WebSearch, look_at_screen ×2\nLumen replied: answer 1/);
+    assert.match(seen[1], /new message \(it may refer to the conversation above\): It can be on any app$/);
+    assert.equal(seen[2], 'Mute the TV');
+    assert.equal(seen[3], 'Mute the TV');
+    feature.forget('chat-1');
+    await feature.ask('Again', { id: 'r5', emit, thread: 'chat-1' });
+    assert.equal(seen[4], 'Again');
+  });
+
   test('explicit backends: agent-sdk without a login, off, and the retired claude-code value', async () => {
     const signedOut = await makeAi({ backend: 'agent-sdk' }, { api: apiFake(true), agentSdk: sdkFake(false) }).feature.status();
     assert.deepEqual(signedOut, { backend: 'agent-sdk', ready: false, reason: SIGN_IN, note: NOTE });

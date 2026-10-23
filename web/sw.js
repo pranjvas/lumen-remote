@@ -1,7 +1,7 @@
 // Offline shell only: network-first for the app's static files, falling back to the cache.
 // API, upload, MCP and the live WebSocket are never cached or intercepted.
 
-const CACHE = 'lumen-shell-v1';
+const CACHE = 'lumen-shell-v2';
 const SHELL = [
   '/',
   '/index.html',
@@ -12,13 +12,12 @@ const SHELL = [
   '/css/remote.css',
   '/css/views.css',
   '/css/screen.css',
+  '/css/ask.css',
   '/js/boot-theme.js',
   '/js/main.js',
   '/icons/lumen.svg',
-  '/fonts/inter-var-latin.woff2',
-  '/fonts/fraunces-var-latin.woff2',
-  '/fonts/fraunces-var-italic-latin.woff2',
-  '/fonts/jetbrains-mono-var-latin.woff2',
+  '/fonts/geist-var.woff2',
+  '/fonts/geist-mono-var.woff2',
 ];
 const NEVER = /^\/(api|live|mcp|cast)(\/|$)/;
 

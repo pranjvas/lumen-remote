@@ -14,7 +14,33 @@ const API_SETUP = 'Set ANTHROPIC_API_KEY or run `ant auth login`';
 const NO_BACKEND = `${SIGN_IN}, or set ANTHROPIC_API_KEY`;
 const SDK_NOTE = 'Uses your Claude Code login (personal use)';
 
+const THREAD_TURNS = 6; // earlier exchanges replayed to Claude per chat
+const THREAD_IDLE_MS = 2 * 60 * 60 * 1000;
+const MAX_THREADS = 50;
+const THREAD_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+// "launch_app, look_at_screen ×6, press_keys ×5": what a run did, without inputs or images.
+function toolDigest(tools = []) {
+  const counts = new Map();
+  for (const tool of tools) {
+    const name = `${String(tool.name).replace(/^mcp__lumen__/, '')}${tool.ok === false ? ' (failed)' : ''}`;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return [...counts].map(([name, n]) => (n > 1 ? `${name} ×${n}` : name)).join(', ') || 'no tools';
+}
+
+// The request Claude sees: the new message, preceded by this chat's earlier exchanges.
+export function withHistory(turns, request) {
+  if (!turns?.length) return request;
+  const lines = ['Earlier in this conversation (oldest first):'];
+  for (const turn of turns) {
+    lines.push(`User: ${turn.user}`, `Lumen did: ${turn.did}`, `Lumen replied: ${turn.reply}`, '');
+  }
+  lines.push(`The user's new message (it may refer to the conversation above): ${request}`);
+  return lines.join('\n');
+}
 
 // backends: { api?, agentSdk? } replaces the real ones (tests).
 export function createAi({ config, data, log, store, hub, adapters, backends }) {
@@ -23,7 +49,28 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
   const api = backends?.api ?? createApiBackend({ config, log });
   const agentSdk = backends?.agentSdk ?? createAgentSdkBackend({ config, log, dataDir: config.dataDir ?? data.dir });
   const runs = new Map();
+  const threads = new Map(); // thread id → { turns: [{ user, did, reply }], at }
   let token = null;
+
+  function threadTurns(thread) {
+    if (!thread) return [];
+    const entry = threads.get(thread);
+    if (!entry || Date.now() - entry.at > THREAD_IDLE_MS) {
+      threads.delete(thread);
+      return [];
+    }
+    return entry.turns;
+  }
+
+  function remember(thread, turn) {
+    if (!thread) return;
+    const entry = threads.get(thread) ?? { turns: [] };
+    entry.turns = [...entry.turns, turn].slice(-THREAD_TURNS);
+    entry.at = Date.now();
+    threads.delete(thread);
+    threads.set(thread, entry);
+    while (threads.size > MAX_THREADS) threads.delete(threads.keys().next().value);
+  }
 
   const mode = () => config.ai?.backend ?? 'auto';
   const wantsSdk = () => mode() === 'agent-sdk' || (mode() === 'auto' && !api.isConfigured());
@@ -61,7 +108,8 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
 
   // emit receives complete browser messages: { t: 'ai', id, kind: 'status'|'tool'|'text'|'result'|'error'|'done', … }.
   // Resolves { ok, text?, error? } when the run is over; never rejects.
-  async function ask(text, { id, emit }) {
+  async function ask(text, { id, emit, thread: threadId }) {
+    const thread = typeof threadId === 'string' && THREAD_ID.test(threadId) ? threadId : null;
     const started = Date.now();
     const send = (event) => {
       try {
@@ -94,6 +142,13 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
         ...(outcome.turns !== undefined && { turns: outcome.turns }),
         ms,
       });
+      if (request && outcome.error?.code !== 'CANCELLED') {
+        remember(thread, {
+          user: clip(request, 500),
+          did: toolDigest(outcome.tools),
+          reply: clip(outcome.ok ? outcome.text || 'Done.' : `(failed) ${outcome.error?.message ?? ''}`, 800),
+        });
+      }
       return { ok: outcome.ok, text: outcome.text, error: outcome.error };
     };
 
@@ -110,7 +165,7 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
       backendName = current.backend;
       if (!current.ready) return finish({ ok: false, error: { code: 'UNAVAILABLE', message: current.reason } });
       const backend = current.backend === 'api' ? api : agentSdk;
-      const outcome = await backend.run(request, { emit: send, signal: controller.signal, toolContext });
+      const outcome = await backend.run(withHistory(threadTurns(thread), request), { emit: send, signal: controller.signal, toolContext });
       return finish(outcome);
     } catch (err) {
       logger.error('ask failed', { error: err.message });
@@ -129,6 +184,7 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
   return {
     ask,
     cancel,
+    forget: (thread) => threads.delete(thread),
     status: settledStatus,
     mcpHandler: createMcpHandler({ getToken: mcpToken, toolContext, log: log.child('mcp') }),
     async start() {

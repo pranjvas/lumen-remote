@@ -1,30 +1,16 @@
 /* HALO design tokens — Nocturne (dark, default) and Gallery (light). */
 
 @font-face {
-  font-family: "Inter";
-  src: url("/fonts/inter-var-latin.woff2") format("woff2");
+  font-family: "Geist";
+  src: url("/fonts/geist-var.woff2") format("woff2");
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: "Fraunces";
-  src: url("/fonts/fraunces-var-latin.woff2") format("woff2");
+  font-family: "Geist Mono";
+  src: url("/fonts/geist-mono-var.woff2") format("woff2");
   font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Fraunces";
-  src: url("/fonts/fraunces-var-italic-latin.woff2") format("woff2");
-  font-weight: 100 900;
-  font-style: italic;
-  font-display: swap;
-}
-@font-face {
-  font-family: "JetBrains Mono";
-  src: url("/fonts/jetbrains-mono-var-latin.woff2") format("woff2");
-  font-weight: 100 800;
   font-style: normal;
   font-display: swap;
 }
@@ -38,9 +24,9 @@
 
 :root {
   color-scheme: dark;
-  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI Variable", "SF Pro Text", system-ui, Roboto, sans-serif;
-  --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
-  --font-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, Consolas, monospace;
+  --font-ui: "Geist", "Segoe UI Variable Text", "Segoe UI Variable", "SF Pro Text", system-ui, Roboto, sans-serif;
+  --font-display: "Geist", "Segoe UI Variable Display", "SF Pro Display", system-ui, sans-serif;
+  --font-mono: "Geist Mono", "Cascadia Mono", ui-monospace, Consolas, monospace;
 
   --void: #07080a;
   --chassis: #0e1013;

@@ -1,0 +1,182 @@
+/* Ask view: a chat with Lumen. User messages are bubbles on the right; Lumen's replies sit beside a
+   small spark with a live status, a thumbnail of what it saw, the answer and its collapsed steps. */
+
+.ask-view { display: flex; flex-direction: column; min-height: 100%; }
+.ask-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.ask-thread { flex: 1; width: 100%; max-width: 860px; margin: 0 auto; padding-bottom: 8px; }
+
+/* ---------- empty state ---------- */
+
+.ask-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 36px 12px 12px; }
+.ask-empty[hidden] { display: none; }
+.ask-orb {
+  display: grid;
+  place-items: center;
+  width: 76px;
+  height: 76px;
+  margin-bottom: 18px;
+  border-radius: 50%;
+  color: var(--accent);
+  background: radial-gradient(circle at 50% 35%, color-mix(in oklab, var(--accent) 30%, transparent), transparent 70%);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 30%, transparent), 0 0 60px -10px var(--accent);
+  animation: breathe 5s var(--ease-io) infinite;
+}
+@keyframes breathe { 50% { box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 45%, transparent), 0 0 80px -6px var(--accent); } }
+.ask-lead { margin: 0 0 8px; font-family: var(--font-display); font-size: 26px; font-weight: 600; letter-spacing: -0.025em; }
+.ask-sub { margin: 0; max-width: 520px; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
+.ask-setup { display: inline-flex; align-items: center; gap: 8px; margin: 12px 0 0; padding: 8px 12px; border-radius: 12px; font-size: 13px; color: var(--warn); background: color-mix(in oklab, var(--warn) 10%, transparent); }
+.ask-examples { justify-content: center; margin-top: 20px; max-width: 600px; }
+
+/* ---------- conversation ---------- */
+
+.transcript { display: flex; flex-direction: column; gap: 28px; padding-top: 4px; }
+.run { display: flex; flex-direction: column; gap: 14px; animation: rise var(--dur-panel) var(--ease-out); }
+
+.run-ask { align-self: flex-end; max-width: min(78%, 560px); }
+.run-quote {
+  margin: 0;
+  padding: 10px 15px;
+  border-radius: 18px 18px 6px 18px;
+  font-size: 15px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 16%, var(--panel));
+  border: 1px solid color-mix(in oklab, var(--accent) 26%, transparent);
+}
+
+.run-reply { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px; align-items: start; }
+.run-avatar {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 14%, var(--panel));
+  border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
+}
+.run.is-running .run-avatar { animation: breathe 2.4s var(--ease-io) infinite; }
+.run.is-failed .run-avatar { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 35%, transparent); }
+.run-body { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding-top: 4px; }
+
+.run-status { display: flex; align-items: center; gap: 9px; min-height: 22px; font-size: 13.5px; color: var(--ink-3); }
+.run-status[hidden] { display: none; }
+.run.is-running .run-status span:last-child {
+  background: linear-gradient(90deg, var(--ink-3) 0%, var(--ink) 50%, var(--ink-3) 100%) 0 0 / 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 1.8s linear infinite;
+}
+@keyframes shimmer { to { background-position: -200% 0; } }
+
+.run-eye {
+  display: block;
+  width: min(380px, 100%);
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid var(--hair-strong);
+  box-shadow: 0 16px 40px -22px color-mix(in oklab, var(--tint) 70%, transparent);
+  background: #050607;
+}
+.run-eye[hidden] { display: none; }
+
+.run-answer { font-size: 15.5px; line-height: 1.6; color: var(--ink); overflow-wrap: anywhere; }
+.run-answer:empty { display: none; }
+.run-answer p { margin: 0 0 10px; }
+.run-answer p:last-child { margin-bottom: 0; }
+.run-answer ul { margin: 0 0 10px; padding-left: 20px; }
+.run-answer li { margin: 3px 0; }
+.run-answer strong { font-weight: 600; }
+.run-answer a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.run-error { display: flex; align-items: flex-start; gap: 8px; margin: 0; color: var(--danger); font-size: 14.5px; }
+
+.run-steps {
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  overflow: hidden;
+}
+.run-steps[hidden] { display: none; }
+.run-steps-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.run-steps-summary::-webkit-details-marker { display: none; }
+.run-steps-summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--dur-state);
+}
+.run-steps[open] .run-steps-summary::before { transform: rotate(45deg); }
+.run-steps-summary:hover { color: var(--ink-2); }
+.run-steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  margin: 0;
+  padding: 2px 12px 12px;
+  overflow: auto;
+  list-style: none;
+  border-top: 1px solid var(--hair);
+}
+.run-step { display: flex; align-items: flex-start; gap: 8px; padding-top: 6px; font-size: 13px; line-height: 1.4; color: var(--ink-2); }
+.run-step-icon { display: grid; place-items: center; flex: none; width: 18px; height: 18px; border-radius: 50%; color: var(--live); background: color-mix(in oklab, var(--live) 16%, transparent); }
+.run-step.is-failed .run-step-icon { color: var(--danger); background: color-mix(in oklab, var(--danger) 16%, transparent); }
+.run-step.is-note { padding-left: 26px; color: var(--ink-3); }
+
+.run-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; }
+.run-meta { font-size: 12px; color: var(--ink-3); }
+.run-cancel[hidden] { display: none; }
+
+/* ---------- composer, docked under the conversation ---------- */
+
+.ask-dock {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  width: 100%;
+  max-width: 860px;
+  margin: 8px auto 0;
+  padding: 14px 0 calc(14px + var(--safe-bottom));
+  background: linear-gradient(to top, var(--void) 72%, transparent);
+}
+.ask-composer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 56px;
+  padding: 6px 8px 6px 18px;
+  border-radius: 18px;
+  background: var(--panel);
+  border: 1px solid var(--hair-strong);
+  box-shadow: var(--shadow-deep);
+  transition: border-color var(--dur-state), box-shadow var(--dur-state);
+}
+.ask-composer:focus-within { border-color: color-mix(in oklab, var(--accent) 60%, transparent); box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 12%, transparent), var(--shadow-deep); }
+.ask-composer > .icon { color: var(--accent); }
+.ask-composer input { flex: 1; min-width: 0; height: 100%; border: 0; background: transparent; font-size: 16px; }
+.ask-composer input::placeholder { color: var(--ink-3); }
+.ask-composer .send { color: var(--accent-ink); background: var(--accent); }
+
+@media (max-width: 720px) {
+  .run-ask { max-width: 88%; }
+  .run-reply { grid-template-columns: 26px minmax(0, 1fr); gap: 10px; }
+  .run-avatar { width: 26px; height: 26px; }
+}
