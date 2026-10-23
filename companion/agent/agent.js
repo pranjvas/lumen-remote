@@ -287,11 +287,21 @@
     if (msg.type === 'icon') return iconFor(msg.appId);
     if (msg.type === 'open-url') return openUrl(msg.url);
     if (msg.type === 'launch') return launchApp(msg.appId, msg.operation, msg.data);
+    if (msg.type === 'meta') return appMeta(msg.appId);
     if (msg.type === 'exit') {
       setTimeout(quit, 200);
       return null;
     }
     throw new Error('unknown request: ' + msg.type);
+  }
+
+  // ---- meta: an app's declared metadata (partner apps put their deep-link template here,
+  // e.g. http://samsung.com/tv/metadata/launch_social_v.link with a %% CONTENT_ID %% placeholder) ----
+
+  function appMeta(appId) {
+    if (!APP_ID_RE.test(String(appId || ''))) throw new Error('meta needs a Tizen app id');
+    const meta = tizen.application.getAppMetaData(appId) || [];
+    return meta.slice(0, 64).map(function (m) { return { key: String(m.key).slice(0, 200), value: String(m.value).slice(0, 2000) }; });
   }
 
   // ---- launch: open an app with app-control extra data (how Smart Hub tiles deep-link) ----

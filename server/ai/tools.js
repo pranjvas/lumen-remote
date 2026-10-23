@@ -3,6 +3,7 @@
 // checked semantically; actions go through hub.handle so the hub's safety rules and read-back
 // apply exactly as they do for a browser command.
 import { matchUrl, parseCastUrl } from '../features/cast.js';
+import { runFlow } from './skills.js';
 
 // The synthetic hub client for AI-issued commands; acks go nowhere (handle() returns them).
 const AI_CLIENT = Object.freeze({ id: 'lumen-ai', ai: true, send() {} });
@@ -70,6 +71,33 @@ async function send(hub, cmd) {
   }
   if (!res?.ok) fail(res?.error?.message || 'The command failed', res?.error?.code || 'FAILED');
   return res.value;
+}
+
+// The TV-side actions a skill flow needs, through the same hub commands as the remote.
+function flowIo({ hub, eyes, signal, sleepFn = sleep }) {
+  return {
+    key: (key) => send(hub, { cmd: 'key', key }),
+    launch: (appId) => send(hub, { cmd: 'app.launch', appId }),
+    isRunning: async (appId) => (await send(hub, { cmd: 'app.status', appId }))?.running === true,
+    typeText: (text, submit) => send(hub, { cmd: 'text.send', text, submit }),
+    sleep: sleepFn,
+    aborted: () => signal?.aborted === true,
+    async look() {
+      if (!eyes?.latest) return null;
+      try {
+        const shot = await send(hub, { cmd: 'screen.capture' });
+        const latest = eyes.latest();
+        return latest?.at === shot.at ? { data: latest.png.toString('base64'), mimeType: 'image/png' } : null;
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+// What to type into an app's search: letters, digits and single spaces ("Harold & Kumar" → "Harold Kumar").
+function cleanSearchText(text) {
+  return String(text ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function levenshtein(a, b) {
@@ -253,11 +281,11 @@ function validate(schema, value, path = 'input') {
       if (problem) return problem;
     }
   }
-  if (types.includes('object') && TYPE_CHECKS.object(value)) {
+  if (types.includes('object') && TYPE_CHECKS.object(value) && schema.properties) {
     for (const key of Object.keys(value)) {
       if (!(key in schema.properties)) return `${path} has an unexpected field "${key}"`;
     }
-    for (const key of schema.required) {
+    for (const key of schema.required ?? []) {
       if (value[key] === undefined) return `${path}.${key} is required`;
     }
     for (const [key, child] of Object.entries(value)) {
@@ -645,6 +673,160 @@ const TOOLS = [
         foregroundApp: app ? { id: app.id ?? null, name: app.name ?? null } : null,
         image: { data: latest.png.toString('base64'), mimeType: 'image/png' },
       };
+    },
+  },
+  {
+    name: 'play_title',
+    description: 'Play a film, show or video by name, in one step. Lumen finds where it streams in India (JustWatch), picks a service on this TV where it is included (never rent or buy), and plays it: Netflix and YouTube by deep link, other apps with that app\'s skill (open, search, type, open the result, play). Returns what it did and a picture of the screen to confirm. Use this first for any "play X" request; pass app when the user names one.',
+    inputSchema: object({
+      title: { type: 'string', minLength: 1, maxLength: 120, description: 'The title as the user said it (fix obvious typos)' },
+      year: { type: 'integer', minimum: 1900, maximum: 2100, description: 'Release year, when known, to pick the right one' },
+      type: { type: 'string', enum: ['movie', 'show'], description: 'Film or series, when known' },
+      app: { type: 'string', maxLength: 40, description: 'Only use this app (name or id), when the user asked for one' },
+    }, ['title']),
+    async run({ title, year, type, app }, ctx) {
+      const { hub, store, titles, skills } = ctx;
+      if (!titles || !skills) fail('Playing titles is not available', 'UNAVAILABLE');
+      if (app && /cine\s*hd/i.test(app)) fail('Lumen does not search or play titles inside CineHD.', 'UNAVAILABLE');
+      const installedIds = (valueOf(store, 'app.installed') ?? []).map((a) => a?.id).filter(Boolean);
+      const found = await titles.find(title, { year, type, installedIds, preferApp: app });
+      if (!found.match) return { ok: false, error: { code: 'NOT_FOUND', message: `"${title}" was not found in the India catalogue; try web search for the exact title` } };
+      const where = found.match.offers.map((o) => `${o.service} (${o.monetization.toLowerCase()})`);
+      const label = `${found.match.title}${found.match.year ? ` (${found.match.year})` : ''}`;
+      if (!found.choice) {
+        const message = {
+          'rent-or-buy-only': `${label} is only to rent or buy here (${where.join(', ')}). Renting costs money, so Lumen did not do it; tell the user.`,
+          'not-on-requested-app': `${label} is not included on ${app}; it is on ${where.join(', ')}.`,
+          'not-on-installed-apps': `${label} streams on ${where.join(', ')}, none of which is installed on this TV.`,
+          'not-streaming': `${label} is not streaming in India right now.`,
+        }[found.why] ?? `${label} could not be played.`;
+        return { ok: true, played: false, title: label, availableOn: where, otherMatches: found.candidates, summary: message };
+      }
+      const choice = found.choice;
+      const steps = [`found ${label} on ${choice.service} (${choice.monetization.toLowerCase()})`];
+      if (choice.kind === 'netflix' && /^\d{4,12}$/.test(choice.contentId ?? '')) {
+        const session = await send(hub, { cmd: 'cast.url', url: `https://www.netflix.com/title/${choice.contentId}` });
+        const viaAgent = session?.via === 'agent';
+        steps.push(viaAgent ? 'started it in Netflix by deep link' : 'opened Netflix (no TV agent, so on its home screen)');
+        return { ok: true, played: viaAgent, title: label, service: choice.service, steps, summary: viaAgent ? `Playing ${label} on Netflix` : `Opened Netflix; ${label} needs choosing there` };
+      }
+      if (choice.kind === 'youtube' && /^[\w-]{11}$/.test(choice.contentId ?? '')) {
+        await send(hub, { cmd: 'cast.url', url: `https://www.youtube.com/watch?v=${choice.contentId}` });
+        steps.push('started it in YouTube');
+        return { ok: true, played: true, title: label, service: choice.service, steps, summary: `Playing ${label} on YouTube` };
+      }
+      const skill = skills.get(choice.skill) ?? skills.get(choice.appId);
+      const io = flowIo(ctx);
+      const state = {};
+      const full = ['open', 'search', 'type', 'pickResult', 'play'];
+      if (skill && full.every((f) => skill.flows[f])) {
+        let image = null;
+        const searchText = cleanSearchText(found.match.title);
+        for (const flow of full) {
+          const out = await runFlow(skill, flow, io, { text: searchText }, state);
+          steps.push(...out.steps);
+          image = out.image ?? image;
+        }
+        image ??= await io.look();
+        return {
+          ok: true, played: 'check', title: label, service: choice.service, skill: skill.slug, steps,
+          summary: `Ran the ${skill.app} skill for ${label}; check the picture: it should be playing. If it is not, finish by sight and fix the skill with save_app_skill.`,
+          image,
+        };
+      }
+      // No complete skill yet: open the app and hand over to sight.
+      if (skill?.flows.open) steps.push(...(await runFlow(skill, 'open', io, {}, state)).steps);
+      else {
+        await send(hub, { cmd: 'app.launch', appId: choice.appId });
+        steps.push(`opened ${choice.service}`);
+        await (ctx.sleepFn ?? sleep)(5000);
+      }
+      return {
+        ok: true, played: false, title: label, service: choice.service, searchFor: cleanSearchText(found.match.title), steps,
+        skill: skill ? { slug: skill.slug, notes: skill.notes, flows: Object.keys(skill.flows) } : null,
+        summary: `Opened ${choice.service} for ${label}. Lumen has no complete ${choice.service} skill yet: find and play it by sight (search, open the title, play), then save the steps with save_app_skill so next time is automatic.`,
+        image: await io.look(),
+      };
+    },
+  },
+  {
+    name: 'find_title',
+    description: 'Where a film or show streams in India (JustWatch), on which services, and whether it is included or rent/buy. Use when the user asks where something is, or before choosing an app yourself.',
+    inputSchema: object({
+      title: { type: 'string', minLength: 1, maxLength: 120, description: 'Title to look up' },
+      year: { type: 'integer', minimum: 1900, maximum: 2100, description: 'Release year, when known' },
+    }, ['title']),
+    async run({ title, year }, { store, titles }) {
+      if (!titles) fail('Title lookup is not available', 'UNAVAILABLE');
+      const installedIds = (valueOf(store, 'app.installed') ?? []).map((a) => a?.id).filter(Boolean);
+      const found = await titles.find(title, { year, installedIds });
+      if (!found.match) return { ok: true, found: false, summary: `"${title}" is not in the India catalogue` };
+      return {
+        ok: true, found: true,
+        title: found.match.title, year: found.match.year, type: found.match.type,
+        offers: found.match.offers.map((o) => ({ service: o.service, monetization: o.monetization, url: o.url })),
+        bestOnThisTv: found.choice ? { service: found.choice.service, monetization: found.choice.monetization } : null,
+        otherMatches: found.candidates,
+        summary: found.choice ? `${found.match.title}: ${found.choice.service} (${found.choice.monetization.toLowerCase()})` : `${found.match.title}: no included service on this TV`,
+      };
+    },
+  },
+  {
+    name: 'get_app_skill',
+    description: 'Read what Lumen knows about working inside a TV app: notes and runnable flows (open, search, type, pickResult, play …). Call it before navigating any app by sight. Without app, lists all skills.',
+    inputSchema: object({
+      app: { type: 'string', maxLength: 60, description: 'App name or id; omit to list skills' },
+    }),
+    async run({ app }, { skills }) {
+      if (!skills) fail('Skills are not available', 'UNAVAILABLE');
+      if (!app) return { ok: true, skills: skills.list(), summary: `${skills.list().length} app skills` };
+      const skill = skills.get(app);
+      if (!skill) return { ok: true, found: false, summary: `No skill for ${app} yet; work by sight and save one with save_app_skill` };
+      return { ok: true, found: true, skill: { slug: skill.slug, app: skill.app, appIds: skill.appIds, summary: skill.summary, notes: skill.notes, flows: skill.flows, source: skill.source, updated: skill.updated }, summary: `${skill.app} skill (${Object.keys(skill.flows).join(', ') || 'notes only'})` };
+    },
+  },
+  {
+    name: 'run_app_flow',
+    description: 'Run one flow of an app skill (for example open, search, type with text, pickResult, play) in one step, then see the screen. Prefer this over pressing keys yourself whenever the skill has the flow.',
+    inputSchema: object({
+      app: { type: 'string', minLength: 1, maxLength: 60, description: 'App name or id' },
+      flow: { type: 'string', minLength: 1, maxLength: 30, description: 'Flow name from the skill' },
+      text: { type: 'string', maxLength: 120, description: 'Text for typing flows' },
+    }, ['app', 'flow']),
+    async run({ app, flow, text }, ctx) {
+      const { skills, store } = ctx;
+      if (!skills) fail('Skills are not available', 'UNAVAILABLE');
+      if (/cine\s*hd/i.test(app) || isCineHd(foregroundApp(store))) fail('Lumen does not run flows inside CineHD.', 'UNAVAILABLE');
+      const skill = skills.get(app);
+      if (!skill) fail(`No skill for ${app}`, 'NOT_FOUND');
+      if (!skill.flows[flow]) fail(`${skill.app} has no "${flow}" flow (it has ${Object.keys(skill.flows).join(', ') || 'none'})`, 'NOT_FOUND');
+      const io = flowIo(ctx);
+      const out = await runFlow(skill, flow, io, { text: text ? cleanSearchText(text) : '' }, {});
+      return { ok: true, steps: out.steps, summary: `Ran ${skill.app} ${flow}`, image: out.image ?? (await io.look()) };
+    },
+  },
+  {
+    name: 'save_app_skill',
+    description: 'Save or improve what you learned about an app so the next request is automatic. Call it, without being asked, after you completed something inside an app by sight, or fixed a flow that did not work. notes: short factual bullets (layout, where search is, keyboard, quirks). flows: runnable steps; each step has one action: {"launch":true}, {"wait":ms}, {"keys":["KEY_LEFT",…]}, {"ifColdStart":[steps]}, {"typeGrid":{"rows":[["A","B",…],…],"start":"A","maxChars":16}} for the app\'s own keyboard (repeat a label across columns for a wide key like Space; null for a gap), {"typeText":true} for the TV keyboard, {"exitGrid":"right"} to move from the keyboard into results, {"look":true}. Standard flow names for titles: open, search, type, pickResult, play.',
+    inputSchema: object({
+      app: { type: 'string', minLength: 1, maxLength: 60, description: 'App name as shown on the TV' },
+      appId: { type: 'string', maxLength: 64, description: 'The app id (from list_apps), when known' },
+      summary: { type: 'string', maxLength: 200, description: 'One line: what the skill does' },
+      notes: { type: 'string', maxLength: 4000, description: 'Markdown bullets of facts about the app' },
+      flows: { type: 'object', description: 'Named flows (lists of steps); merged into the existing ones' },
+      verified: { type: 'string', maxLength: 120, description: 'What you just confirmed on screen, e.g. "2026-10-23: The Office search"' },
+    }, ['app']),
+    async run({ app, appId, summary, notes, flows, verified }, { skills, store }) {
+      if (!skills) fail('Skills are not available', 'UNAVAILABLE');
+      if (/cine\s*hd/i.test(app) || /^pvcinehd01\./.test(appId ?? '')) fail('Lumen does not keep skills for CineHD.', 'UNAVAILABLE');
+      const fromList = (valueOf(store, 'app.installed') ?? []).find((a) => norm(a?.name) === norm(app));
+      let saved;
+      try {
+        saved = skills.save({ app, appIds: [appId, fromList?.id].filter(Boolean), summary, notes, flows, verified });
+      } catch (err) {
+        fail(`The skill was not saved: ${err.message}`, 'INVALID');
+      }
+      return { ok: true, skill: saved.slug, flows: Object.keys(saved.flows), summary: `Saved the ${saved.app} skill (${Object.keys(saved.flows).join(', ') || 'notes'})` };
     },
   },
 ];

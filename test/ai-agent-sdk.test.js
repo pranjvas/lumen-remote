@@ -499,6 +499,21 @@ describe('agent-sdk: backend selection in createAi', () => {
     assert.equal(seen[4], 'Again');
   });
 
+  test('chat threads survive a restart (saved to the data dir)', async () => {
+    const files = new Map();
+    const data = { dir: tempDir(), readJson: (name, fallback) => (files.has(name) ? JSON.parse(files.get(name)) : fallback), writeJson: (name, obj) => files.set(name, JSON.stringify(obj)) };
+    const seen = [];
+    const agentSdk = sdkFake(true);
+    agentSdk.run = async (text) => { seen.push(text); return { ok: true, text: 'opened JioHotstar', tools: [] }; };
+    const make = () => {
+      const store = fakeStore();
+      return createAi({ config: { ...aiConfig({}), dataDir: tempDir() }, data, log: createTestLog(), store, hub: fakeHub(store), backends: { api: apiFake(false), agentSdk } });
+    };
+    await make().ask('Find and play Harold and Kumar part 2', { id: 'a1', emit: () => {}, thread: 'chat-9' });
+    await make().ask('Stuck', { id: 'a2', emit: () => {}, thread: 'chat-9' }); // a new instance: Lumen restarted
+    assert.match(seen[1], /User: Find and play Harold and Kumar part 2\nLumen did: no tools\nLumen replied: opened JioHotstar/);
+  });
+
   test('explicit backends: agent-sdk without a login, off, and the retired claude-code value', async () => {
     const signedOut = await makeAi({ backend: 'agent-sdk' }, { api: apiFake(true), agentSdk: sdkFake(false) }).feature.status();
     assert.deepEqual(signedOut, { backend: 'agent-sdk', ready: false, reason: SIGN_IN, note: NOTE });

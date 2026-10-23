@@ -607,6 +607,26 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return touching(['app.foreground'], () => call('rest', 'launch', appId));
     },
 
+    // App skills the AI uses and learns (server/ai/skills.js): list, read, forget a learned one.
+    'skills.list': async () => ({ value: features.ai?.skills?.list() ?? [] }),
+    'skills.get': async ({ slug }) => {
+      text(slug, 'slug', { max: 41, pattern: /^[a-z0-9-]+$/ });
+      const skill = features.ai?.skills?.get(slug);
+      if (!skill) throw new LumenError('NOT_FOUND', 'No such skill');
+      return { value: skill };
+    },
+    'skills.forget': async ({ slug }) => {
+      text(slug, 'slug', { max: 41, pattern: /^[a-z0-9-]+$/ });
+      return { value: features.ai?.skills?.remove(slug) === true };
+    },
+
+    // Whether an app is running / visible (REST), for skills that behave differently on a cold start.
+    'app.status': async ({ appId }) => {
+      text(appId, 'appId', { max: 64, pattern: APP_ID });
+      requireTvOn();
+      return call('rest', 'getApp', appId);
+    },
+
     'input.set': async ({ source }) => {
       text(source, 'source', { max: 16, pattern: SOURCE });
       requireTvOn();
@@ -705,6 +725,14 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
         throw new LumenError('INVALID', 'data must be an object of app-control keys');
       }
       const res = await call('agent', 'request', 'launch', { appId, operation, data });
+      return { value: res.value ?? res };
+    },
+
+    // An installed app's declared metadata (deep-link templates and the like) through the agent.
+    'agent.meta': async ({ appId }) => {
+      requireTvOn();
+      text(appId, 'appId', { max: 128, pattern: /^[A-Za-z0-9._-]+$/ });
+      const res = await call('agent', 'request', 'meta', { appId });
       return { value: res.value ?? res };
     },
 

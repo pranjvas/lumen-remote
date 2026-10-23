@@ -7,6 +7,8 @@ import { SETTINGS } from '../catalog/settings.js';
 import { SIGN_IN, createAgentSdkBackend } from './agent-sdk-backend.js';
 import { createApiBackend } from './api-backend.js';
 import { createMcpHandler } from './mcp.js';
+import { createSkills } from './skills.js';
+import { createTitles } from '../features/titles.js';
 
 const MAX_CONCURRENT = 2;
 const MAX_TEXT = 1000;
@@ -45,11 +47,35 @@ export function withHistory(turns, request) {
 // backends: { api?, agentSdk? } replaces the real ones (tests).
 export function createAi({ config, data, log, store, hub, adapters, backends }) {
   const logger = log.child('ai');
-  const toolContext = { hub, store, eyes: adapters?.eyes, catalog: { settings: SETTINGS, keys: KEYS, apps: APPS, isAllowedKey } };
+  const toolContext = {
+    hub, store, eyes: adapters?.eyes,
+    titles: createTitles({ log }),
+    skills: createSkills({ dataDir: config.dataDir ?? data?.dir, log }),
+    catalog: { settings: SETTINGS, keys: KEYS, apps: APPS, isAllowedKey },
+  };
   const api = backends?.api ?? createApiBackend({ config, log });
   const agentSdk = backends?.agentSdk ?? createAgentSdkBackend({ config, log, dataDir: config.dataDir ?? data.dir });
   const runs = new Map();
+  const THREADS_FILE = 'ai-threads.json';
+  // Chat threads survive restarts: they are saved to the data dir after every exchange.
   const threads = new Map(); // thread id → { turns: [{ user, did, reply }], at }
+  try {
+    const saved = data?.readJson?.(THREADS_FILE, {}) ?? {};
+    for (const [id, entry] of Object.entries(saved)) {
+      if (THREAD_ID.test(id) && Array.isArray(entry?.turns) && Date.now() - Number(entry.at) < THREAD_IDLE_MS) {
+        threads.set(id, { turns: entry.turns.slice(-THREAD_TURNS), at: Number(entry.at) });
+      }
+    }
+  } catch (err) {
+    logger.warn('chat threads not restored', { error: err.message });
+  }
+  function saveThreads() {
+    try {
+      data?.writeJson?.(THREADS_FILE, Object.fromEntries(threads));
+    } catch (err) {
+      logger.warn('chat threads not saved', { error: err.message });
+    }
+  }
   let token = null;
 
   function threadTurns(thread) {
@@ -70,6 +96,7 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
     threads.delete(thread);
     threads.set(thread, entry);
     while (threads.size > MAX_THREADS) threads.delete(threads.keys().next().value);
+    saveThreads();
   }
 
   const mode = () => config.ai?.backend ?? 'auto';
@@ -184,7 +211,8 @@ export function createAi({ config, data, log, store, hub, adapters, backends }) 
   return {
     ask,
     cancel,
-    forget: (thread) => threads.delete(thread),
+    forget: (thread) => { threads.delete(thread); saveThreads(); },
+    skills: toolContext.skills,
     status: settledStatus,
     mcpHandler: createMcpHandler({ getToken: mcpToken, toolContext, log: log.child('mcp') }),
     async start() {

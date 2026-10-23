@@ -7,6 +7,7 @@ import { h, icon, fill } from '../ui/dom.js';
 import { makeId } from '../core/live.js';
 import { toast } from '../ui/toast.js';
 import { backendName } from './settings.js';
+import { openSheet } from '../ui/sheet.js';
 
 const EXAMPLES = ['Increase brightness', 'Play Friends on Netflix', 'What is on the TV right now?', 'Sleep in 30 minutes', 'Switch to HDMI 1', 'Find a comedy on Prime Video'];
 const STORE_KEY = 'lumen.ask.chat';
@@ -22,6 +23,7 @@ const toolTitle = (name) => bareName(name)
   .join(' ');
 const STEP_TEXT = {
   look_at_screen: 'Looked at the screen',
+  get_app_skill: 'Read the app skill',
   WebSearch: 'Searched the web',
   WebFetch: 'Read a web page',
 };
@@ -214,6 +216,7 @@ export function createAsk(ctx) {
         record.status = '';
         addStep(run, step);
         if (bareName(msg.name) === 'look_at_screen' && msg.ok !== false) showEye(run);
+        if (bareName(msg.name) === 'save_app_skill' && msg.ok !== false) loadSkills();
         break;
       }
       case 'text':
@@ -313,6 +316,66 @@ export function createAsk(ctx) {
     return { form, input };
   }
 
+  // ---- app skills: what Lumen knows about each app (built in or learned by the AI) ----
+
+  const FLOW_LABEL = { open: 'Open', search: 'Search', type: 'Type', pickResult: 'Pick result', play: 'Play' };
+  const skillsList = h('div', { class: 'skills-list' });
+  const skillsCount = h('span', { class: 'skills-count' });
+  const skillsPanel = h('details', { class: 'skills-panel' },
+    h('summary', { class: 'skills-summary' }, icon('agent', 'xs'), h('span', { text: 'App skills' }), skillsCount,
+      h('span', { class: 'skills-hint', text: 'How Lumen works inside each app. It adds to these as it learns.' })),
+    skillsList);
+
+  async function loadSkills() {
+    const ack = await ctx.live.send('skills.list', {}, { timeoutMs: 8000 });
+    if (!ack.ok) return;
+    const skills = ack.value || [];
+    skillsCount.textContent = String(skills.length);
+    fill(skillsList, ...skills.map((s) => h('button', { class: 'skill-card', type: 'button', onClick: () => showSkill(s.slug) },
+      h('span', { class: 'skill-app', text: s.app }),
+      h('span', { class: `skill-source is-${s.source}`, text: s.source === 'learned' ? 'Learned' : 'Built in' }),
+      h('span', { class: 'skill-flows', text: s.flows.length ? s.flows.map((f) => FLOW_LABEL[f] || f).join(' · ') : 'Notes only' }),
+      s.verified ? h('span', { class: 'skill-verified', text: `Verified ${s.verified}` }) : null)));
+  }
+
+  function describeStep(step) {
+    if (step.launch) return 'Open the app';
+    if (step.wait !== undefined) return `Wait ${(step.wait / 1000).toFixed(1)} s`;
+    if (step.keys) return `Press ${step.keys.map((k) => k.replace(/^KEY_/, '').toLowerCase()).join(', ')}`;
+    if (step.ifColdStart) return `If the app was closed: ${step.ifColdStart.map(describeStep).join('; ')}`;
+    if (step.typeGrid) return 'Type the title on the app\u2019s own keyboard';
+    if (step.typeText) return 'Type the title with the TV keyboard';
+    if (step.exitGrid) return 'Move from the keyboard to the results';
+    if (step.look) return 'Look at the screen';
+    return JSON.stringify(step);
+  }
+
+  async function showSkill(slug) {
+    const ack = await ctx.live.send('skills.get', { slug }, { timeoutMs: 8000 });
+    if (!ack.ok) { toast(ack.error?.message || 'Could not read the skill', { level: 'error' }); return; }
+    const skill = ack.value;
+    openSheet({
+      title: skill.app,
+      className: 'skill-sheet',
+      build(body, sheet) {
+        body.append(
+          h('p', { class: 'skill-sheet-summary', text: skill.summary }),
+          h('div', { class: 'skill-sheet-meta' },
+            h('span', { text: skill.source === 'learned' ? 'Learned by Lumen' : 'Built in' }),
+            skill.updated ? h('span', { text: `Updated ${skill.updated}` }) : null,
+            skill.verified ? h('span', { text: `Verified ${skill.verified}` }) : null),
+          h('div', { class: 'run-answer skill-notes' }, ...renderAnswer(skill.notes)),
+          ...Object.entries(skill.flows).map(([name, steps]) => h('section', { class: 'skill-flow' },
+            h('h3', { text: FLOW_LABEL[name] || name }),
+            h('ol', null, ...steps.map((step) => h('li', { text: describeStep(step) }))))),
+          skill.source === 'learned' ? h('button', { class: 'btn ghost sm', type: 'button', onClick: async () => {
+            const res = await ctx.cmd('skills.forget', { slug: skill.slug });
+            if (res.ok) { toast(`Forgot what Lumen learned about ${skill.app}`, { level: 'ok' }); sheet.close(); loadSkills(); }
+          } }, icon('trash', 'xs'), h('span', { text: 'Forget what was learned' })) : null);
+      },
+    });
+  }
+
   function mountView(root) {
     const { form } = composer({ big: true });
     const fresh = h('button', { class: 'btn sm ghost', type: 'button', onclick: newChat }, icon('plus', 'xs'), h('span', { text: 'New chat' }));
@@ -321,9 +384,11 @@ export function createAsk(ctx) {
       h('header', { class: 'view-head' },
         h('div', null, h('h1', { class: 'view-title', text: 'Ask Lumen' }), h('p', { class: 'view-sub', text: 'Claude runs the TV with the same commands as the remote' })),
         h('div', { class: 'ask-head-actions' }, statusPill, fresh)),
+      skillsPanel,
       thread,
       h('div', { class: 'ask-dock' }, form));
-    ctx.on('view', (name) => { if (name === 'ask') requestAnimationFrame(() => scrollToEnd()); });
+    ctx.on('view', (name) => { if (name === 'ask') { loadSkills(); requestAnimationFrame(() => scrollToEnd()); } });
+    ctx.on('hello', () => { if (ctx.viewName === 'ask') loadSkills(); });
   }
 
   for (const record of chat.runs) append(record);
