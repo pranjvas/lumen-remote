@@ -828,9 +828,10 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return feature('tvscreen', 'open', { url: url === undefined ? undefined : webUrl(url, 'url', !!config.browser?.allowLoopback) });
     },
     'tvscreen.close': async () => feature('tvscreen', 'close'),
-    'tvscreen.playVideo': async ({ url }) => {
+    'tvscreen.playVideo': async ({ url, convert }) => {
       requireTvOn();
-      return feature('tvscreen', 'playVideo', { url: url === undefined ? undefined : webUrl(url, 'url', !!config.browser?.allowLoopback) });
+      if (convert !== undefined) boolean(convert, 'convert');
+      return feature('tvscreen', 'playVideo', { url: url === undefined ? undefined : webUrl(url, 'url', !!config.browser?.allowLoopback), convert: convert === true });
     },
 
     // The VPN switch: Lumen's browser restarts with (or without) the tunnel proxy after every change.

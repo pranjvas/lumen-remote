@@ -171,16 +171,25 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return rank(own) ?? rank(media) ?? null;
   }
 
-  /** Plays the page's video (or `url`) on the TV's own player, through the relay. */
-  async function playVideo({ url: explicit } = {}) {
+  /** Plays the page's video (or `url`) on the TV's own player, through the relay; convert: true
+   *  skips the direct attempt and converts on this PC straight away. */
+  async function playVideo({ url: explicit, convert = false } = {}) {
     const adapter = a();
     const pick = await pickMedia(explicit);
     if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
     const { url } = relay().register(pick.url, pick.headers);
     if (!on) await open();
-    if (current?.job) transcoder()?.stopJob(current.job);
+    const tc = transcoder();
+    const known = tc?.existing?.(pick.url);
+    if (current?.job && current.job !== known?.id) tc?.stopJob(current.job);
     current = { pick, title: store.get('browser.title')?.v ?? '', stage: 'direct', job: null };
+    // A video already converted (or known not to play directly) goes straight to the converted copy.
+    if (known || convert) {
+      current.stage = known && !known.copy ? 'copy' : 'direct';
+      await fallback(known ? 'converted before' : 'conversion requested');
+      return { value: { kind: pick.kind, title: current.title, converted: true } };
+    }
     adapter.sendScreen({ t: 'screen-play', url, title: current.title });
     log.info('video handed to the TV player', { kind: pick.kind, host: new URL(pick.url).hostname });
     return { value: { kind: pick.kind, title: store.get('browser.title')?.v ?? null } };
@@ -202,7 +211,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     try {
       const { id } = await tc.convert(current.pick.url, { headers: current.pick.headers, proxyUrl: relay()?.proxyUrl?.() ?? null, copy: next === 'copy' });
       current.job = id;
-      agent()?.sendScreen?.({ t: 'screen-play', url: relay().convertedUrl(id), title: current.title });
+      agent()?.sendScreen?.({ t: 'screen-play', url: relay().convertedUrl(id), title: current.title, fromStart: true });
       log.info('playing the converted video on the TV', { stage: next, after: error.slice(0, 80) });
     } catch (err) {
       log.warn('conversion failed', { stage: next, message: err.message });

@@ -77,8 +77,27 @@ export function createTranscoder({ config, log: rootLog }) {
    * Starts converting `input` (a URL) for the TV; resolves once the first segment exists.
    * → { id, dir } — the relay serves <dir>/index.m3u8 and its segments.
    */
-  // Not called start(): Lumen calls start() on every feature at boot.
-  async function convert(input, { headers = {}, proxyUrl = null, copy = false } = {}) {
+  // Not called start(): Lumen calls start() on every feature at boot. Reuses a live job for the same
+  // input and mode, and retries once when the first connection fails (a VPN hiccup is common).
+  async function convert(input, options = {}) {
+    const key = `${options.copy ? 'copy' : 'encode'}|${input}`;
+    for (const [id, job] of jobs) {
+      if (job.key === key && (job.exited === undefined || job.exited === 0)) {
+        job.at = Date.now();
+        return { id, dir: job.dir, reused: true };
+      }
+    }
+    try {
+      return await convertOnce(input, options, key);
+    } catch (err) {
+      if (!/5XX|502|503|504|Connection|timed out|refused/i.test(err.message)) throw err;
+      log.info('retrying the conversion', { message: err.message.slice(0, 120) });
+      await new Promise((r) => setTimeout(r, 1500));
+      return convertOnce(input, options, key);
+    }
+  }
+
+  async function convertOnce(input, { headers = {}, proxyUrl = null, copy = false } = {}, key) {
     const ffmpeg = findFfmpeg({ config });
     if (!ffmpeg) throw new LumenError('UNAVAILABLE', 'Converting needs ffmpeg on this PC (put ffmpeg.exe in Lumen\'s data/bin folder)');
     prune();
@@ -87,7 +106,7 @@ export function createTranscoder({ config, log: rootLog }) {
     fs.mkdirSync(dir, { recursive: true });
     const args = ffmpegArgs({ input, headers, proxyUrl, outDir: dir, copyVideo: copy, copyAudio: copy, encoder: config.ffmpeg?.encoder ?? 'libx264' });
     const child = spawn(ffmpeg, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-    const job = { dir, child, at: Date.now(), stderr: '' };
+    const job = { dir, child, at: Date.now(), stderr: '', key };
     jobs.set(id, job);
     child.stderr.on('data', (d) => { job.stderr = (job.stderr + d.toString()).slice(-2000); });
     child.on('exit', (code) => {
@@ -108,6 +127,14 @@ export function createTranscoder({ config, log: rootLog }) {
     throw new LumenError('FAILED', `The video could not be converted for the TV (${why.slice(0, 120)})`);
   }
 
+  /** The job for this input that is still usable (for skipping a direct attempt known to fail). */
+  function existing(input) {
+    for (const [id, job] of jobs) {
+      if (job.key?.endsWith(`|${input}`) && (job.exited === undefined || job.exited === 0)) return { id, copy: job.key.startsWith('copy|') };
+    }
+    return null;
+  }
+
   /** A file of job `id` (index.m3u8 or seg_NNNNN.ts) or null. */
   function file(id, name) {
     const job = jobs.get(id);
@@ -119,6 +146,7 @@ export function createTranscoder({ config, log: rootLog }) {
 
   return {
     convert,
+    existing,
     file,
     stopJob: (id) => cleanup(id),
     available: () => Boolean(findFfmpeg({ config })),

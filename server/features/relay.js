@@ -162,10 +162,20 @@ export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = 
   // /relay/x/<job>/<file>: HLS written by the transcoder (features/transcode.js).
   function serveConverted(req, res, job, name) {
     const file = transcoder()?.file(job, name);
+    if (name.endsWith('.m3u8')) log.debug('converted playlist requested', { job, found: Boolean(file) });
     if (!file) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
     const playlist = name.endsWith('.m3u8');
+    if (playlist) {
+      // The playlist grows while ffmpeg works, so players treat it as live and join near the end;
+      // EXT-X-START tells them to start at the beginning.
+      const text = fs.readFileSync(file, 'utf8').replace(/^#EXTM3U\r?\n/, '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n');
+      const body = Buffer.from(text, 'utf8');
+      res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
+      res.end(req.method === 'HEAD' ? undefined : body);
+      return;
+    }
     const size = fs.statSync(file).size;
-    res.writeHead(200, { 'content-type': playlist ? 'application/vnd.apple.mpegurl' : 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
+    res.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(file).pipe(res);
   }

@@ -103,7 +103,7 @@
 
   // ---- the TV's own video player ----
 
-  function playVideo(url, title) {
+  function playVideo(url, title, fromStart) {
     stopVideo(false);
     video = { url: url, title: title || '', state: 'loading' };
     root.className = 'screen video';
@@ -127,6 +127,9 @@
       webapis.avplay.prepareAsync(function () {
         read(function () { webapis.avplay.play(); });
         report('playing');
+        // A stream Lumen is still converting grows while it plays, so the player joins at its live
+        // end; go back to the start once playback is running.
+        if (fromStart) setTimeout(function () { read(function () { webapis.avplay.seekTo(0); }); }, 1200);
       }, function (err) {
         report('error', 'prepare: ' + String(err && (err.name + ' ' + (err.message || '')) || err));
         toast('The TV could not play this video');
@@ -198,7 +201,7 @@
         cursor.style.transform = 'translate(' + Math.round(msg.x * 1920) + 'px,' + Math.round(msg.y * 1080) + 'px)';
         cursor.style.display = msg.visible === false ? 'none' : 'block';
       } else if (msg.t === 'screen-play') {
-        playVideo(msg.url, msg.title);
+        playVideo(msg.url, msg.title, msg.fromStart === true);
       } else if (msg.t === 'screen-toast') {
         toast(String(msg.text || '').slice(0, 140));
       }
