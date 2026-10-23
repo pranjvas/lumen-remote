@@ -254,17 +254,35 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
 
   // ---- memory (TV web apps see only totals; Eyes reads apps and processes through Tizen .NET) ----
 
-  /** → { meminfo (kB), apps [{ id, pid, state, rssKb, pssKb }], procs [{ pid, name, rssKb, cmd }], seen, unreadable } */
-  async function processes() {
+  /**
+   * → { meminfo (kB), apps [{ id, pid, state }] }; with detail also apps' rssKb/pssKb and
+   * procs [{ pid, name, rssKb }], seen, unreadable. Detail costs the TV a PSS pass over every app and a
+   * /proc walk, so only an explicit tv.processes asks for it. Command lines are dropped even if an older
+   * Eyes (0.3.2) sends them: they can carry launch bundles and keyed URLs, and every /live client sees this.
+   */
+  async function processes({ detail = false } = {}) {
     await ensureOnline();
     const id = randomUUID();
     const msg = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', 'Lumen Eyes did not answer about memory (it needs Eyes 0.3.2)')); }, 10000);
+      const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', 'Lumen Eyes did not answer about memory (it needs Eyes 0.3.2)')); }, detail ? 20000 : 10000);
       btPending.set(id, { resolve, reject, timer });
-      active.send(JSON.stringify({ t: 'procs', id }));
+      active.send(JSON.stringify({ t: 'procs', id, detail: detail ? 1 : 0 }));
     });
-    const { t, id: _id, ...rest } = msg;
-    return rest;
+    const { t, id: _id, procs, seen, unreadable, apps, ...rest } = msg;
+    const out = { ...rest };
+    if (Array.isArray(apps)) {
+      out.apps = apps.map((a) => {
+        if (!a || typeof a !== 'object' || a.error) return a;
+        const { id: appId, pid, state, rssKb, pssKb } = a;
+        return detail ? { id: appId, pid, state, rssKb, pssKb } : { id: appId, pid, state };
+      });
+    }
+    if (detail) {
+      if (Array.isArray(procs)) out.procs = procs.map((p) => ({ pid: p?.pid, name: p?.name, rssKb: p?.rssKb }));
+      if (seen !== undefined) out.seen = seen;
+      if (unreadable !== undefined) out.unreadable = unreadable;
+    }
+    return out;
   }
 
   // ---- watching (the Screen view) ----

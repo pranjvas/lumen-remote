@@ -3,6 +3,7 @@
 // /api/screen.png, and the AI's look_at_screen tool returns it as image content.
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { WebSocket } from 'ws';
 import { startStack, request, waitFor } from './helpers.js';
 import { nv12ToRgb, nv12ToPng } from '../server/util/image.js';
@@ -22,10 +23,24 @@ function frame() {
 function connectEyes(url, { fail = false, dropOn = null } = {}) {
   const ws = new WebSocket(url);
   const captures = [];
+  const procs = [];
   ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', version: '0.2.0' })));
   ws.on('message', (raw) => {
     const msg = JSON.parse(String(raw));
     if (msg.t === dropOn) { ws.terminate(); return; }
+    if (msg.t === 'procs') {
+      // Answers the way Eyes 0.3.2 did: everything, command lines included, whatever was asked.
+      procs.push(msg);
+      ws.send(JSON.stringify({
+        t: 'procs', id: msg.id, ok: true,
+        meminfo: { MemTotal: 1837 * 1024, MemAvailable: 600 * 1024, SwapFree: 0 },
+        apps: [{ id: 'org.tizen.netflix-app', pid: 101, state: 'Background', rssKb: 300000, pssKb: 250000 }],
+        procs: [{ pid: 101, name: 'netflix', rssKb: 300000, cmd: '/usr/bin/launchpad-loader __AUL_STARTTIME__ http://x/?token=secret' },
+          { pid: 202, name: 'org.lumen.eyes', rssKb: 40000, cmd: 'org.lumen.eyes lumen ws://127.0.0.1:1/eyes?key=' + 'a'.repeat(64) }],
+        seen: 2, unreadable: 0,
+      }));
+      return;
+    }
     if (msg.t !== 'capture') return;
     captures.push(msg);
     if (fail) {
@@ -38,13 +53,38 @@ function connectEyes(url, { fail = false, dropOn = null } = {}) {
     ws.send(Buffer.concat([length, header, frame()]));
   });
   ws.on('error', () => {});
-  return { ws, captures, close: () => ws.terminate() };
+  return { ws, captures, procs, close: () => ws.terminate() };
 }
 
 function pngSize(buffer) {
   assert.deepEqual([...buffer.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
 }
+
+// The Eyes app is C# for the TV and cannot run here; these guard its memory answer at source level.
+describe('eyes app source (companion/eyes/Program.cs): the memory answer', () => {
+  const src = readFileSync(new URL('../companion/eyes/Program.cs', import.meta.url), 'utf8');
+
+  test('never reads process command lines', () => {
+    assert.doesNotMatch(src, /\/cmdline/);
+    assert.doesNotMatch(src, /\\"cmd\\"/);
+  });
+
+  test('is answered off the receive loop, and every send is serialized', () => {
+    assert.doesNotMatch(src, /type == "procs"\)\s*await/);
+    assert.match(src, /type == "procs"\) AnswerProcs\(/);
+    assert.match(src, /Task\.Run\(async \(\) =>\s*\{\s*try\s*\{\s*await procsGate\.WaitAsync/);
+    assert.equal((src.match(/ws\.SendAsync\(/g) ?? []).length, 1, 'only Send() calls SendAsync');
+    assert.match(src, /await sendLock\.WaitAsync\(token\);\s*try \{ await ws\.SendAsync/);
+  });
+
+  test('PSS and the /proc walk run only when detail is asked for', () => {
+    assert.match(src, /if \(detail\)\s*\{\s*try \{ usage = new Tizen\.System\.ProcessMemoryUsage/);
+    const walk = src.indexOf('Directory.GetDirectories("/proc")');
+    const bail = src.indexOf('if (!detail) return');
+    assert.ok(bail > 0 && bail < walk, 'the light answer returns before /proc is walked');
+  });
+});
 
 describe('image: NV12 → RGB → PNG', () => {
   test('limited-range white and black map to full range; the frame is stretched to 16:9', () => {
@@ -155,6 +195,26 @@ describe('eyes: screen capture through the TV agent', () => {
     await b.waitForState('screen.watching', (r) => r?.v === 5000, { timeout: 5000 });
     await b.send('view', { name: 'remote', visible: true });
     await b.waitForState('screen.watching', (r) => r?.v === 0, { timeout: 5000 });
+  });
+
+  test('tv.processes asks Eyes for detail and never passes command lines on to /live clients', async () => {
+    const live = eyes.at(-1);
+    const ack = await b.send('tv.processes', {}, { timeout: 15000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    assert.equal(live.procs.at(-1).detail, 1);
+    assert.deepEqual(ack.value.procs, [{ pid: 101, name: 'netflix', rssKb: 300000 }, { pid: 202, name: 'org.lumen.eyes', rssKb: 40000 }]);
+    assert.equal(ack.value.apps[0].pssKb, 250000);
+    assert.equal(ack.value.seen, 2);
+    assert.doesNotMatch(JSON.stringify(ack.value), /cmd|token=|key=/);
+  });
+
+  test('the memory feature asks Eyes for the cheap reading only (no PSS pass, no /proc walk)', async () => {
+    const live = eyes.at(-1);
+    const out = await stack.server.adapters.eyes.processes();
+    assert.equal(live.procs.at(-1).detail, 0);
+    assert.equal(out.meminfo.MemAvailable, 600 * 1024);
+    assert.deepEqual(out.apps, [{ id: 'org.tizen.netflix-app', pid: 101, state: 'Background' }]);
+    assert.equal(out.procs, undefined);
   });
 
   test('a capture the TV refuses is reported as FAILED', async () => {
