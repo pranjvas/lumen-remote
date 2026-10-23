@@ -32,6 +32,15 @@ export function bindTrackpad(pad, { move, click, scroll, paused = () => false })
   let gesture = null;
   let longTimer = 0;
 
+  // iOS can still hand a finger on the pad to the page's own scrolling (the view scrolls on short
+  // phones) and cancel the pointer stream halfway through a drag. Taking the touches themselves keeps
+  // the whole gesture on the pad; the pointer events below still do the work.
+  if ('ontouchstart' in window) {
+    const keep = (e) => { if (!paused() && e.cancelable) e.preventDefault(); };
+    pad.addEventListener('touchstart', keep, { passive: false });
+    pad.addEventListener('touchmove', keep, { passive: false });
+  }
+
   pad.addEventListener('pointerdown', (e) => {
     if (paused()) return;
     pad.setPointerCapture(e.pointerId);

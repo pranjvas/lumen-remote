@@ -1,7 +1,7 @@
 // Offline shell only: network-first for the app's static files, falling back to the cache.
 // API, upload, MCP and the live WebSocket are never cached or intercepted.
 
-const CACHE = 'lumen-shell-v10';
+const CACHE = 'lumen-shell-v11';
 const SHELL = [
   '/',
   '/index.html',
