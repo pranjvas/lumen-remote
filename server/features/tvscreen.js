@@ -396,6 +396,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   const PAGE_MEDIA_SCRIPT = `({
     videos: [...document.querySelectorAll('video')].map((v) => ({ src: v.currentSrc || v.src || '', area: v.clientWidth * v.clientHeight, playing: !v.paused })),
     frames: [...document.querySelectorAll('iframe')].map((f) => ({ src: f.src || '', area: f.clientWidth * f.clientHeight })),
+    view: innerWidth * innerHeight,
   })`;
   async function pickMedia(explicit) {
     const feature = b();
@@ -407,8 +408,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const all = found?.videos ?? [];
     // An MSE player (a blob: video) bigger than a plain-URL video is the page's video: the smaller
     // one is an ad or a preview, and the player's stream is among those the page loaded.
+    // A plain-URL video smaller than a watch page's player (an ad box, a preview) is never the page's
+    // video either, even while the real player is still loading.
     const mse = Math.max(0, ...all.filter((v) => /^blob:/.test(v.src)).map((v) => v.area));
-    const videos = all.filter((v) => /^https?:/.test(v.src) && v.area >= mse).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
+    const minArea = Math.max(mse, AUTO_MIN_AREA * (found?.view || 0));
+    const videos = all.filter((v) => /^https?:/.test(v.src) && v.area >= minArea).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
     const asFile = (v) => ({ url: v.src, kind: /\.m3u8/i.test(v.src) ? 'hls' : 'file', headers: headersFor(v.src) });
     if (videos[0]?.playing) return asFile(videos[0]);
     // A YouTube embed is the page's video only while none of the page's own players plays (an MSE
