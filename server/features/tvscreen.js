@@ -71,7 +71,7 @@ export function youtubeStateScript(id) {
 })()`;
 }
 
-export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay, transcoder = () => null, cast = () => null }) {
+export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay, transcoder = () => null, cast = () => null, liveVideo = () => null }) {
   const log = rootLog.child('tvscreen');
   const appId = config.agent?.appId;
   let on = false;
@@ -96,6 +96,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let autoFailed = null; // { url, at }: the page whose video could not be handed over
   let heldFrame = null; // the page's latest frame, held back while the TV's player is in front
   let removeStoreListener = null;
+  // Live video (features/livevideo.js): the TV agent (0.8+) plays the page as a video stream with its
+  // sound; the JPEG frames go to the TV only until that plays, while it is paused, or when it fails.
+  let live = null; // { handle, playing, paused }
+  let liveWanted = config.liveVideo?.enabled === true;
+  let lastJpeg = null;
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
   const setVideo = (value) => store.set('tvscreen.video', value, { src: 'derived', via: 'tvscreen' });
@@ -249,8 +254,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (msg.t === 'screen-input') {
       if (typeof msg.key === 'string') enqueue(() => onKey(msg.key));
       else if (msg.pointer) enqueue(() => onPointer(msg.pointer, msg.click === true));
+    } else if (msg.t === 'screen-live') {
+      onLive(msg);
     } else if (msg.t === 'screen-video') {
       setVideo(typeof msg.state === 'string' ? msg.state.slice(0, 20) : null);
+      syncLivePause();
       // Back on the page: it shows the frame held back while the player was in front (a still page
       // sends no new one).
       if (!videoActive() && heldFrame) {
@@ -295,12 +303,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       // While the TV's player is in front the page's frames are not shown: the TV would only decode
       // them on the thread its player needs. The latest one is kept for the return to the page.
       removeSink = feature.addSink((bytes) => {
+        lastJpeg = bytes;
         if (videoActive()) { heldFrame = bytes; return; }
         heldFrame = null;
+        if (liveShowing()) return;
         agent()?.sendFrame?.(bytes);
       });
       unsubscribe = adapter.onScreen(onMessage);
       setState(true);
+      offerLive();
       if (config.tvscreen?.autoPlayOnTv !== false) autoTimer = setInterval(() => { autoHandOff().catch(() => {}); }, AUTO_POLL_MS);
       log.info('browser shown on the TV', { url: store.get('browser.url')?.v ?? null });
     }
@@ -318,6 +329,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     unsubscribe?.();
     removeSink = unsubscribe = null;
     heldFrame = null;
+    stopLive(null);
     // The agent's own 'stopped' arrives after the subscription is gone.
     setVideo(null);
     setState(false);
@@ -596,11 +608,106 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     }
   }
 
+  // ---------- live video ----------
+
+  const liveShowing = () => !!(live && live.playing && !live.paused);
+
+  // Asks the TV agent whether it has the live player (older agents do not answer).
+  function offerLive() {
+    const feature = liveVideo();
+    if (!liveWanted || !feature?.enabled?.() || live) return;
+    agent()?.sendScreen?.({ t: 'screen-live-offer', probes: feature.codecProbes() });
+  }
+
+  function onLive(msg) {
+    const state = typeof msg.state === 'string' ? msg.state : '';
+    if (state === 'ready') {
+      const feature = liveVideo();
+      if (!liveWanted || !feature?.enabled?.() || live) return;
+      const caps = {};
+      if (msg.caps && typeof msg.caps === 'object') for (const [k, v] of Object.entries(msg.caps).slice(0, 32)) caps[String(k).slice(0, 60)] = v === true;
+      const viewer = {
+        send: (buf, opts) => agent()?.sendVideo?.(buf, opts) ?? false,
+        buffered: () => agent()?.bufferedAmount?.() ?? 0,
+        onFallback: (reason) => stopLive(reason),
+      };
+      try {
+        live = { handle: feature.attach(viewer, caps), playing: false, paused: false };
+        log.info('live video offered to the TV', { caps: Object.keys(caps).filter((k) => caps[k]) });
+        syncLivePause();
+      } catch (err) {
+        log.info('live video not available', { message: err.message });
+      }
+      return;
+    }
+    if (!live) return;
+    if (state === 'playing') {
+      if (!live.playing) log.info('live video playing on the TV', { size: msg.w && msg.h ? `${msg.w}x${msg.h}` : null, muted: msg.muted === true });
+      live.playing = true;
+      browser()?.setSparseFrames?.(true);
+    } else if (state === 'stats') {
+      const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+      live.handle.report({ lag: n(msg.lag), dropped: n(msg.dropped) ?? 0, decoded: n(msg.decoded) ?? 0, stalls: n(msg.stalls) ?? 0, buffered: n(msg.buffered) });
+    } else if (state === 'resync') {
+      live.handle.resync();
+    } else if (state === 'refused') {
+      // The TV's player refused this format or could not decode it: the next step down is tried.
+      log.info('the TV refused the live stream', { reason: String(msg.reason ?? '').slice(0, 120) });
+      live.playing = false;
+      browser()?.setSparseFrames?.(false);
+      live.handle.refused();
+      if (lastJpeg && !videoActive()) agent()?.sendFrame?.(lastJpeg);
+    } else if (state === 'unsupported' || state === 'error') {
+      stopLive(`TV: ${String(msg.reason ?? state).slice(0, 120)}`);
+    }
+  }
+
+  // The live player steps aside while the TV's own player is in front or a sign-in pop-up is shown
+  // (the capture shows the page, not the pop-up): the JPEG frames show those.
+  function syncLivePause() {
+    if (!live) return;
+    const pause = videoActive() || !!browser()?.popupShown?.();
+    if (pause === live.paused) return;
+    live.paused = pause;
+    if (pause) {
+      live.handle.pause();
+      live.playing = false;
+      browser()?.setSparseFrames?.(false);
+      agent()?.sendScreen?.({ t: 'screen-live-stop' });
+      if (lastJpeg && !videoActive()) agent()?.sendFrame?.(lastJpeg);
+    } else {
+      live.handle.resume();
+    }
+  }
+
+  // Back to the JPEG frames (the TV cannot play the stream, live video was turned off, or closed).
+  function stopLive(reason) {
+    if (!live) return;
+    const { handle } = live;
+    live = null;
+    handle.detach();
+    browser()?.setSparseFrames?.(false);
+    agent()?.sendScreen?.({ t: 'screen-live-stop' });
+    if (reason) {
+      log.info('live video stopped; showing frames', { reason: String(reason).slice(0, 160) });
+      if (on && lastJpeg && !videoActive()) agent()?.sendFrame?.(lastJpeg);
+    }
+  }
+
+  /** Turns live video on or off for the browser on the TV (the JPEG frames are the fallback). */
+  function setLive({ on: want }) {
+    liveWanted = want === true;
+    if (!liveWanted) stopLive('turned off');
+    else if (on) offerLive();
+    return { value: { live: liveWanted } };
+  }
+
   return {
     open,
     close,
     playVideo,
     pointer,
+    setLive,
     start() {
       setState(false);
       // The agent gone (closed, the TV off): its player is gone too, whatever it last reported.
@@ -609,6 +716,8 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
           heldFrame = null;
           setVideo(null);
         }
+        if ('conn.agent' in patch && patch['conn.agent']?.v !== 'online') stopLive(null);
+        if ('browser.popup' in patch) syncLivePause();
       });
     },
     async stop() {

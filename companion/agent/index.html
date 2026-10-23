@@ -45,6 +45,10 @@
     .screen.video #frame, .screen.video #cursor { display: none !important; }
     #frame { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; object-fit: contain; }
     #av { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; }
+    /* Live video of Lumen's browser (live.js): under the JPEG frame until it plays, then the frame hides. */
+    #live { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; background: #000; display: none; object-fit: contain; }
+    .screen.live #frame { visibility: hidden; }
+    .screen.video #live { display: none !important; }
     #mse { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; background: #000; display: none; }
     /* Big enough to find from the sofa on any page: amber arrow, dark outline, soft glow; the tip is the point. */
     #cursor { position: absolute; top: 0; left: 0; width: 64px; height: 64px; margin: -5px 0 0 -11px; display: none; pointer-events: none;
@@ -69,6 +73,7 @@
   <div id="screen" class="screen off">
     <object id="av" type="application/avplayer"></object>
     <video id="mse" playsinline></video>
+    <video id="live" playsinline></video>
     <img id="frame" alt="">
     <div id="cursor"></div>
     <div id="hint" class="hint"></div>
@@ -76,6 +81,7 @@
   </div>
   <script src="$WEBAPIS/webapis/webapis.js"></script>
   <script src="hls.min.js"></script>
+  <script src="live.js"></script>
   <script src="screen.js"></script>
   <script src="agent.js"></script>
 </body>

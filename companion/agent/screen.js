@@ -44,6 +44,7 @@
   const toastEl = document.getElementById('toast');
   const player = document.getElementById('av');
   const mse = document.getElementById('mse');
+  const live = window.LumenLive || null; // live.js: the page as a video stream with sound
   let hls = null;
 
   function read(fn, fallback) {
@@ -101,6 +102,7 @@
     if (!key) return;
     e.preventDefault();
     e.stopPropagation();
+    if (live) live.unmute();
     if (video) return videoKey(key);
     send({ t: 'screen-input', key: key, repeat: e.repeat === true });
   }
@@ -117,6 +119,7 @@
 
   function playVideo(url, title, fromStart, engine, drm) {
     stopVideo(false);
+    if (live) live.stop(); // one decoder for the TV's player
     video = { url: url, title: title || '', state: 'loading', mode: 'avplay', engine: engine || null, drm: drm || null, started: false };
     const mine = video;
     // AVPlay is one player shared by every video: a callback from a video that has since been
@@ -335,6 +338,7 @@
   window.LumenScreen = {
     init: function (sendFn) {
       send = sendFn;
+      if (live) live.init(sendFn, document.getElementById('live'), root);
       document.addEventListener('keydown', onKey, true);
       document.addEventListener('mousemove', onPointer, true);
       document.addEventListener('click', onPointer, true);
@@ -348,17 +352,25 @@
     },
     stop: function () {
       stopVideo(false);
+      if (live) live.stop();
       active = false;
       unregisterKeys();
       root.className = 'screen off';
     },
-    frame: showFrame,
+    // Binary messages: live video ('LV…', live.js) or a JPEG frame.
+    frame: function (buffer) {
+      if (live && live.data(buffer)) return;
+      showFrame(buffer);
+    },
     message: function (msg) {
       if (msg.t === 'screen-cursor') {
         cursor.style.transform = 'translate(' + Math.round(msg.x * 1920) + 'px,' + Math.round(msg.y * 1080) + 'px)';
         cursor.style.display = msg.visible === false ? 'none' : 'block';
       } else if (msg.t === 'screen-play') {
         playVideo(msg.url, msg.title, msg.fromStart === true, msg.engine, msg.drm && typeof msg.drm === 'object' ? msg.drm : null);
+      } else if (msg.t.indexOf('screen-live') === 0) {
+        if (live) live.message(msg);
+        else send({ t: 'screen-live', state: 'unsupported', reason: 'no live player' });
       } else if (msg.t === 'screen-toast') {
         toast(String(msg.text || '').slice(0, 140));
       }

@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<!-- Lumen live video: capture page. Lumen opens this as a second tab of its own (headless) Edge,
+     served from a loopback-only port. It captures the browsing tab (getDisplayMedia, tab picked by
+     its title through --auto-select-tab-capture-source-by-title), with the tab's own audio, encodes
+     it with WebCodecs (hardware H.264 / HEVC, AAC) and sends the encoded chunks to Lumen over a
+     loopback WebSocket. Lumen packs them as fragmented MP4 for the TV (server/features/livevideo.js).
+     Messages to Lumen: text JSON (hello, vconfig, aconfig, stats, error) and binary chunks
+     [kind u8 (2 video, 4 audio), flags u8 (1 = key), 0 u16, timestamp f64 LE (us)] + data. -->
+<html><head><meta charset="utf-8"><title>Lumen capture</title></head>
+<body>Lumen capture
+<script>
+'use strict';
+const params = new URLSearchParams(location.search);
+const ws = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(params.get('t') || '')}`);
+ws.binaryType = 'arraybuffer';
+const sendJson = (m) => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
+const t0 = performance.now();
+const nowUs = () => Math.round((performance.now() - t0) * 1000);
+
+let stream = null, vtrack = null, atrack = null;
+let venc = null, aenc = null, cfg = null, encoded = null; // cfg: { codec, width, height, fps, bitrate, gop, format }
+let lastFrame = null, lastEncodeAt = 0, forceKey = true, framesSinceKey = 0, vOffset = null, aOffset = null;
+let repeatTimer = null, statsTimer = null, stopped = false;
+const stats = { frames: 0, repeats: 0, skipped: 0, bytes: 0, captured: 0 };
+
+function header(kind, key, ts, data) {
+  const out = new Uint8Array(12 + data.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint8(0, kind); view.setUint8(1, key ? 1 : 0); view.setFloat64(4, ts, true);
+  out.set(new Uint8Array(data), 12);
+  return out.buffer;
+}
+
+function b64(buf) {
+  const bytes = new Uint8Array(buf instanceof ArrayBuffer ? buf : buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function fail(where, err) { sendJson({ t: 'error', where, message: String(err && err.message || err).slice(0, 300) }); }
+
+// ---- video ----
+
+function configureVideo(next) {
+  const isHevc = /^(hvc1|hev1)/.test(next.codec);
+  const config = {
+    codec: next.codec, width: next.width, height: next.height, framerate: next.fps, bitrate: next.bitrate,
+    bitrateMode: 'constant', latencyMode: 'realtime', hardwareAcceleration: next.hw === false ? 'no-preference' : 'prefer-hardware',
+    ...(isHevc ? { hevc: { format: 'annexb' } } : { avc: { format: 'avc' } }),
+  };
+  if (!venc || venc.state === 'closed') {
+    venc = new VideoEncoder({
+      output: (chunk, md) => {
+        if (md && md.decoderConfig && encoded) {
+          const d = md.decoderConfig;
+          sendJson({ t: 'vconfig', codec: encoded.codec, width: d.codedWidth || encoded.width, height: d.codedHeight || encoded.height, fps: encoded.fps,
+            format: encoded.format, description: d.description ? b64(d.description) : null });
+        }
+        const data = new ArrayBuffer(chunk.byteLength);
+        chunk.copyTo(data);
+        stats.bytes += chunk.byteLength;
+        if (ws.readyState === 1) ws.send(header(2, chunk.type === 'key', chunk.timestamp, data));
+      },
+      error: (e) => { fail('video encoder', e); venc = null; forceKey = true; },
+    });
+  }
+  venc.configure(config);
+  encoded = { ...next, format: isHevc ? 'annexb' : 'avc' };
+  cfg = encoded;
+  forceKey = true;
+}
+
+function encodeFrame(frame, ts) {
+  if (!cfg || !venc || venc.state !== 'configured') return;
+  if (venc.encodeQueueSize > 2 || ws.bufferedAmount > 8 * 1024 * 1024) { stats.skipped += 1; forceKey = forceKey || ws.bufferedAmount > 8 * 1024 * 1024; return; }
+  const key = forceKey || framesSinceKey >= cfg.gop;
+  const f = new VideoFrame(frame, { timestamp: ts });
+  try { venc.encode(f, { keyFrame: key }); } catch (e) { fail('encode', e); }
+  f.close();
+  if (key) { forceKey = false; framesSinceKey = 0; } else framesSinceKey += 1;
+  lastEncodeAt = performance.now();
+}
+
+async function videoLoop() {
+  const reader = new MediaStreamTrackProcessor({ track: vtrack }).readable.getReader();
+  for (;;) {
+    const { value: frame, done } = await reader.read();
+    if (done || stopped) { if (frame) frame.close(); break; }
+    stats.captured += 1;
+    if (vOffset === null) vOffset = nowUs() - frame.timestamp;
+    const ts = frame.timestamp + vOffset;
+    // Frames of another size (the tab is being resized, a constraint change is under way) are not
+    // encoded at the configured size: the encoder would scale them.
+    if (cfg && frame.displayWidth === cfg.width && frame.displayHeight === cfg.height) {
+      encodeFrame(frame, ts);
+      stats.frames += 1;
+      if (lastFrame) lastFrame.close();
+      lastFrame = frame;
+    } else {
+      frame.close();
+    }
+  }
+}
+
+// A still page sends no new frames; the last one is encoded again so the TV's player keeps a
+// continuous timeline (a few hundred bytes per repeat).
+function repeatTick() {
+  if (!cfg || !lastFrame) return;
+  const gap = performance.now() - lastEncodeAt;
+  if (gap < 1500 / cfg.fps) return;
+  encodeFrame(lastFrame, nowUs());
+  stats.repeats += 1;
+}
+
+// ---- audio ----
+
+async function audioLoop() {
+  const reader = new MediaStreamTrackProcessor({ track: atrack }).readable.getReader();
+  let configured = false;
+  for (;;) {
+    const { value: data, done } = await reader.read();
+    if (done || stopped) { if (data) data.close(); break; }
+    if (!configured) {
+      configured = true;
+      aenc = new AudioEncoder({
+        output: (chunk, md) => {
+          if (md && md.decoderConfig) {
+            const d = md.decoderConfig;
+            sendJson({ t: 'aconfig', codec: 'mp4a.40.2', sampleRate: d.sampleRate, channels: d.numberOfChannels, description: d.description ? b64(d.description) : null });
+          }
+          const buf = new ArrayBuffer(chunk.byteLength);
+          chunk.copyTo(buf);
+          if (ws.readyState === 1 && ws.bufferedAmount < 8 * 1024 * 1024) ws.send(header(4, true, chunk.timestamp + (aOffset || 0), buf));
+        },
+        error: (e) => fail('audio encoder', e),
+      });
+      try {
+        aenc.configure({ codec: 'mp4a.40.2', sampleRate: data.sampleRate, numberOfChannels: Math.min(2, data.numberOfChannels), bitrate: 128000 });
+      } catch (e) { fail('audio configure', e); aenc = null; }
+    }
+    if (aOffset === null) aOffset = nowUs() - data.timestamp;
+    if (aenc && aenc.state === 'configured') {
+      try { aenc.encode(data); } catch (e) { fail('audio encode', e); }
+    }
+    data.close();
+  }
+}
+
+// ---- control ----
+
+// Called by Lumen over DevTools (with a user gesture) while the browsing tab carries the capture title.
+window.lumenStart = async function (opts) {
+  stream = await navigator.mediaDevices.getDisplayMedia({
+    video: { width: opts.width, height: opts.height, frameRate: opts.fps, resizeMode: 'crop-and-scale' },
+    audio: { suppressLocalAudioPlayback: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
+    selfBrowserSurface: 'exclude', surfaceSwitching: 'exclude', systemAudio: 'exclude', monitorTypeSurfaces: 'exclude', preferCurrentTab: false,
+  });
+  vtrack = stream.getVideoTracks()[0];
+  atrack = stream.getAudioTracks()[0] || null;
+  vtrack.addEventListener('ended', () => { sendJson({ t: 'ended' }); });
+  if (vtrack.contentHint !== undefined) vtrack.contentHint = 'detail';
+  videoLoop().catch((e) => fail('video loop', e));
+  if (atrack) audioLoop().catch((e) => fail('audio loop', e));
+  repeatTimer = setInterval(repeatTick, Math.max(5, Math.round(1000 / (opts.fps || 60))));
+  statsTimer = setInterval(() => {
+    sendJson({ t: 'stats', ...stats, queue: venc ? venc.encodeQueueSize : null, buffered: ws.bufferedAmount, settings: vtrack ? vtrack.getSettings() : null });
+    stats.frames = stats.repeats = stats.skipped = stats.bytes = stats.captured = 0;
+  }, 2000);
+  const s = vtrack.getSettings();
+  return { width: s.width, height: s.height, frameRate: s.frameRate, audio: !!atrack };
+};
+
+// Which encoders this Edge has (hardware), for the codec choice.
+window.lumenEncoders = async function (list) {
+  const out = {};
+  for (const c of list) {
+    try {
+      const r = await VideoEncoder.isConfigSupported({ codec: c.codec, width: c.width, height: c.height, framerate: c.fps, bitrate: c.bitrate,
+        latencyMode: 'realtime', hardwareAcceleration: 'prefer-hardware', ...(/^(hvc1|hev1)/.test(c.codec) ? { hevc: { format: 'annexb' } } : { avc: { format: 'avc' } }) });
+      out[c.key] = !!r.supported;
+    } catch (e) { out[c.key] = false; }
+  }
+  return out;
+};
+
+ws.onmessage = async (event) => {
+  let msg; try { msg = JSON.parse(event.data); } catch (e) { return; }
+  try {
+    if (msg.t === 'config') {
+      const sizeChanged = !cfg || cfg.width !== msg.width || cfg.height !== msg.height || cfg.fps !== msg.fps;
+      if (sizeChanged && vtrack) await vtrack.applyConstraints({ width: msg.width, height: msg.height, frameRate: msg.fps, resizeMode: 'crop-and-scale' });
+      configureVideo(msg);
+    } else if (msg.t === 'bitrate' && cfg) {
+      configureVideo({ ...cfg, bitrate: msg.bitrate });
+    } else if (msg.t === 'key') {
+      forceKey = true;
+    } else if (msg.t === 'stop') {
+      stopped = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    }
+  } catch (e) { fail(msg.t, e); }
+};
+ws.onopen = () => sendJson({ t: 'hello', clock: performance.timeOrigin + t0 }); // chunk timestamps are µs after `clock` (ms, wall time)
+ws.onclose = () => { stopped = true; if (stream) stream.getTracks().forEach((t) => t.stop()); };
+</script>
+</body></html>

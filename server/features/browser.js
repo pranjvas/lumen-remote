@@ -36,6 +36,9 @@ const SPECIAL_KEYS = {
 // and Lumen shows the pop-up while it lasts. Title changes are reported through a binding (Edge's
 // own Target.targetInfoChanged can lag seconds behind a script-set title).
 const TITLE_BINDING = '__lumenTitle';
+// Live video (features/livevideo.js): the browsing tab carries this title for the moment its capture
+// starts (Edge picks the tab to capture by title); it is never reported as the page's title.
+export const CAPTURE_TITLE = 'LumenLiveCapture-7f3a';
 const PAGE_SCRIPT = `(() => {
   if (window !== top) return;
   const nativeOpen = window.open;
@@ -271,6 +274,18 @@ function isAlive(pid) {
 export function createBrowser({ config, log: rootLog, store, hub, vpn = () => null }) {
   const log = rootLog.child('browser');
   const settings = { idleMs: 1_200_000, maxFps: 15, quality: 60, maxWidth: 1280, maxHeight: 800, ...config.browser };
+  // Live video of the page to the TV (features/livevideo.js): Edge is started so a tab of its own can
+  // capture the page with its sound. The PC stays silent (--disable-audio-output: tab capture still
+  // gets the audio, --mute-audio would silence it too).
+  const live = config.liveVideo?.enabled === true;
+  const liveArgs = () => (live ? [
+    `--auto-select-tab-capture-source-by-title=${CAPTURE_TITLE}`, '--disable-audio-output',
+    '--enable-features=PlatformHEVCEncoderSupport',
+    // A 4K stream needs a device scale of 3 behind the TV's 1280×720 CSS viewport; an emulated scale
+    // above 2 is captured at 2.
+    ...((config.liveVideo?.maxHeight ?? 0) >= 2160 ? ['--force-device-scale-factor=3'] : []),
+  ] : ['--mute-audio']);
+  let tvScale = 1; // device scale of the TV's viewport (1.5 renders 1280×720 CSS px as 1920×1080)
   // Lumen browser on TV (features/tvscreen.js): extra receivers of every frame as JPEG bytes. While one
   // is attached the viewport is the TV's 16:9 and phones see a scaled copy.
   const sinks = new Set();
@@ -428,6 +443,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   function viewers(set) {
+    const hadWatchers = watchers.size > 0;
     const next = new Set(set);
     for (const client of watchers.keys()) if (!next.has(client)) watchers.delete(client);
     for (const client of next) {
@@ -437,6 +453,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     }
     if (watchers.size) clearIdle();
     else armIdle();
+    if (sparseFrames && (watchers.size > 0) !== hadWatchers) applyMetrics(); // a phone needs every frame again
   }
 
   // ---------- Edge process ----------
@@ -501,6 +518,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // Edge is never left running after this: killOnExit covers a crash of Lumen itself.
   async function teardown() {
     launchedProxy = null;
+    savedBounds = null;
     clearIdle();
     clearTimeout(flushTimer);
     flushTimer = null;
@@ -595,8 +613,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       .catch((err) => log.warn('cleanup after browser exit failed', err));
   }
 
-  const metrics = () => ({ width: viewport.w, height: viewport.h, deviceScaleFactor: 1, mobile: false });
-  const screencastParams = () => ({ format: 'jpeg', quality: settings.quality, maxWidth: settings.maxWidth, maxHeight: settings.maxHeight, everyNthFrame: 1 });
+  const metrics = () => ({ width: viewport.w, height: viewport.h, deviceScaleFactor: sinks.size ? tvScale : 1, mobile: false });
+  // While the TV plays the page as live video and no phone watches, the JPEG frames are only a
+  // fallback: Edge makes one every LIVE_NTH_FRAME frames instead of every frame.
+  const LIVE_NTH_FRAME = 20;
+  let sparseFrames = false;
+  const screencastParams = () => ({ format: 'jpeg', quality: settings.quality, maxWidth: settings.maxWidth, maxHeight: settings.maxHeight,
+    everyNthFrame: sparseFrames && !watchers.size ? LIVE_NTH_FRAME : 1 });
 
   // A new viewport size. Afterwards Edge could keep streaming the old layout (or the new one squeezed
   // into the old size) until something on the page repainted, so a phone or the TV showed a picture
@@ -648,7 +671,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       // than the window: the screencast then sent squeezed frames or none at all.
       `--window-size=${VIEWPORT.maxW},${VIEWPORT.maxH}`,
       '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
-      '--disable-background-networking', '--disable-component-update', '--mute-audio', '--force-color-profile=srgb',
+      '--disable-background-networking', '--disable-component-update', ...liveArgs(), '--force-color-profile=srgb',
       // A fresh headless profile has no media engagement, so a page's video with sound never starts by
       // itself (YouTube sat at 0:00 until clicked). The PC plays no sound anyway (--mute-audio), and a
       // video page opened on the TV should start (and be handed to the TV) as it would in a desktop browser.
@@ -709,7 +732,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       refreshHistory(cdp);
     });
     cdp.on('Runtime.bindingCalled', ({ name, payload }) => {
-      if (name !== TITLE_BINDING || cdp !== page) return;
+      if (name !== TITLE_BINDING || cdp !== page || payload === CAPTURE_TITLE) return;
       titleFromPage = payload || null;
       if (payload) publish('title', payload);
       else refreshHistory(cdp); // no <title>: the history supplies the hostname
@@ -1023,6 +1046,41 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     };
   }
 
+  // ---------- live video (features/livevideo.js) ----------
+
+  /** Fewer JPEG frames while live video carries the page to the TV (phones still get every frame). */
+  function setSparseFrames(on) {
+    const before = sparseFrames && !watchers.size;
+    sparseFrames = on === true;
+    if ((sparseFrames && !watchers.size) !== before) applyMetrics();
+  }
+
+  /** DevTools details of the running browser for a capture tab, or null when it is not ready. */
+  const devtools = () => (ready && devPort && mainTargetId ? { port: devPort, targetId: mainTargetId, ws: browser } : null);
+
+  /** Device scale of the TV's viewport (its CSS size stays 1280×720). */
+  function setTvScale(scale) {
+    const next = clamp(Number(scale) || 1, 1, 3);
+    if (next === tvScale) return resizing;
+    tvScale = next;
+    return sinks.size ? applyMetrics() : resizing;
+  }
+
+  // The window's page area made exactly the TV's viewport, so a capture of the tab is the page and
+  // nothing else (Edge's "sharing this tab" bar takes room from it); `restore` puts the window back.
+  let savedBounds = null;
+  async function fitContents({ restore = false } = {}) {
+    if (!browser || !mainTargetId) return;
+    const { windowId, bounds } = await browser.send('Browser.getWindowForTarget', { targetId: mainTargetId });
+    if (restore) {
+      if (savedBounds) await browser.send('Browser.setWindowBounds', { windowId, bounds: savedBounds });
+      savedBounds = null;
+      return;
+    }
+    savedBounds ??= { width: bounds.width, height: bounds.height };
+    await browser.send('Browser.setContentsSize', { windowId, width: TV_VIEWPORT.w, height: TV_VIEWPORT.h });
+  }
+
   // ---------- for the AI: read, look, click ----------
 
   // Visible text plus the interactive elements on screen, numbered; positions are CSS pixels.
@@ -1081,6 +1139,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   return {
     applyProxy,
     addSink,
+    devtools,
+    setTvScale,
+    fitContents,
+    setSparseFrames,
+    /** Whether a sized pop-up is on show instead of the page (a capture of the page does not show it). */
+    popupShown: () => !!popup,
     media,
     frameSize,
     // When someone last clicked, typed or navigated (tvscreen hands only videos people start to the TV).

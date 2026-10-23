@@ -252,6 +252,15 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     return true;
   }
 
+  /** Live video (features/livevideo.js): one init segment or fragment message. Not sent while more
+   *  than `limit` bytes wait in the socket (the caller then skips to the next key frame). */
+  function sendVideo(bytes, { limit = Infinity } = {}) {
+    if (!isOpen() || active.bufferedAmount > limit) return false;
+    active.send(bytes, { binary: true });
+    return true;
+  }
+  const bufferedAmount = () => (isOpen() ? active.bufferedAmount : 0);
+
   async function onHello(msg) {
     clearTimeout(launchTimer);
     const version = str(msg.agent, 40);
@@ -564,6 +573,8 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     tizenIdOf,
     sendScreen,
     sendFrame,
+    sendVideo,
+    bufferedAmount,
     onScreen: (fn) => { screenListeners.add(fn); return () => screenListeners.delete(fn); },
   };
 }

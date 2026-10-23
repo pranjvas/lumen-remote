@@ -52,6 +52,11 @@ export const DEFAULTS = deepFreeze({
     maxWidth: 1280,
     maxHeight: 800,
   },
+  // Live video of the Lumen browser on the TV (features/livevideo.js): the page captured with its
+  // sound, hardware-encoded on this PC and played by the TV agent's MSE player; the JPEG frames stay
+  // as the fallback. maxHeight 2160 allows 4K (HEVC when the TV takes it), stepping down to 1080p60
+  // and 720p60 when the TV or the link cannot keep up.
+  liveVideo: { enabled: true, maxHeight: 2160, preferHevc: true, idleStopMs: 15000, gopSeconds: 2 },
   log: { level: 'info', console: true },
 });
 

@@ -875,6 +875,11 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return feature('tvscreen', 'open', { url: url === undefined ? undefined : webUrl(url, 'url', !!config.browser?.allowLoopback) });
     },
     'tvscreen.close': async () => feature('tvscreen', 'close'),
+    // Live video of the browser on the TV (with its sound) on or off; off shows still frames.
+    'tvscreen.live': async ({ on }) => {
+      boolean(on, 'on');
+      return feature('tvscreen', 'setLive', { on });
+    },
     'tvscreen.playVideo': async ({ url, convert }) => {
       requireTvOn();
       if (convert !== undefined) boolean(convert, 'convert');
