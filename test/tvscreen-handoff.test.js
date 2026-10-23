@@ -231,6 +231,16 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
     assert.equal(youtubeLaunches(), n);
   });
 
+  test('a small plain-URL video (an ad) is not taken for the page\'s bigger MSE player', async () => {
+    setPage(up('/watch-mse'), 'Watch');
+    page.videos = [bigVideo('blob:http://127.0.0.1/main'), { src: up('/ad.mp4'), area: 300 * 250, playing: true }];
+    page.frames = [];
+    const plays = playMsgs().length;
+    const ack = await b.send('tvscreen.playVideo', {}, { timeout: 15000 });
+    assert.equal(ack.ok, false, 'no stream of the page was sniffed in this test');
+    assert.ok(!playMsgs().slice(plays).some((m) => /ad\.mp4/.test(m.url ?? '')), 'the ad was not sent to the TV');
+  });
+
   test('an automatic hand-off that fails leaves the page playing, and is not retried every tick', async () => {
     await reopen();
     await sleep(5200); // past the manual hand-offs above

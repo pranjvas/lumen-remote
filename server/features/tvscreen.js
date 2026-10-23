@@ -405,7 +405,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (explicit) return { url: explicit, kind: /\.m3u8/i.test(explicit) ? 'hls' : 'file', headers: headersFor(explicit) };
     const found = await feature.evaluate(PAGE_MEDIA_SCRIPT).catch(() => null);
     const all = found?.videos ?? [];
-    const videos = all.filter((v) => /^https?:/.test(v.src)).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
+    // An MSE player (a blob: video) bigger than a plain-URL video is the page's video: the smaller
+    // one is an ad or a preview, and the player's stream is among those the page loaded.
+    const mse = Math.max(0, ...all.filter((v) => /^blob:/.test(v.src)).map((v) => v.area));
+    const videos = all.filter((v) => /^https?:/.test(v.src) && v.area >= mse).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
     const asFile = (v) => ({ url: v.src, kind: /\.m3u8/i.test(v.src) ? 'hls' : 'file', headers: headersFor(v.src) });
     if (videos[0]?.playing) return asFile(videos[0]);
     // A YouTube embed is the page's video only while none of the page's own players plays (an MSE
@@ -618,13 +621,17 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   // for memory): the next offer starts a step lower, and after two the TV stays on frames until live
   // video is turned on again (tvscreen.live).
   let liveStrikes = 0;
+  let lastStrikeAt = 0;
   let liveHidden = false; // the TV's agent is in the background (the owner switched to another app)
   const MAX_LIVE_STRIKES = 2;
+  const STRIKES_FORGOTTEN_MS = 10 * 60 * 1000; // a drop this long ago no longer counts against live video
+  const strike = () => { liveStrikes += 1; lastStrikeAt = Date.now(); };
 
   // Asks the TV agent whether it has the live player (older agents do not answer).
   function offerLive() {
     const feature = liveVideo();
     if (!liveWanted || !feature?.enabled?.() || live) return;
+    if (liveStrikes && Date.now() - lastStrikeAt > STRIKES_FORGOTTEN_MS) liveStrikes = 0;
     if (liveStrikes >= MAX_LIVE_STRIKES) {
       log.info('live video not offered: the TV agent went away twice while playing it', { strikes: liveStrikes });
       return;
@@ -648,7 +655,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
         send: (buf, opts) => agent()?.sendVideo?.(buf, opts) ?? false,
         buffered: () => agent()?.bufferedAmount?.() ?? 0,
         onFallback: (reason) => {
-          if (/stopped reporting/.test(String(reason))) liveStrikes += 1; // its page was starved
+          if (/stopped reporting/.test(String(reason))) strike(); // its page was starved
           stopLive(reason);
         },
       };
@@ -744,7 +751,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
           setVideo(null);
         }
         if ('conn.agent' in patch && patch['conn.agent']?.v !== 'online' && live && !liveHidden) {
-          liveStrikes += 1;
+          strike();
           log.warn('the TV agent went away during live video', { strikes: liveStrikes });
           stopLive(null);
         }
