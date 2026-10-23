@@ -23,6 +23,9 @@ const { Worker } = require('node:worker_threads');
 
 const DATA_BYTES = 4 * 1024 * 1024;
 const CONTROL_WORDS = 128;
+const UDP_BATCH = 64; // datagrams per recvmany round trip (wg_poll reads at most 64 per slice)
+const OUTBOX_MAX_ITEMS = 128; // queued UDP sends flushed early past this many...
+const OUTBOX_MAX_BYTES = 512 * 1024; // ...or this many bytes
 
 const ERRNO_NAMES = ['EPERM', 'ENOENT', 'ESRCH', 'EINTR', 'EIO', 'ENXIO', 'E2BIG', 'ENOEXEC', 'EBADF', 'ECHILD', 'EAGAIN', 'ENOMEM', 'EACCES', 'EFAULT', 'ENOTBLK', 'EBUSY', 'EEXIST', 'EXDEV', 'ENODEV', 'ENOTDIR', 'EISDIR', 'EINVAL', 'ENFILE', 'EMFILE', 'ENOTTY', 'ETXTBSY', 'EFBIG', 'ENOSPC', 'ESPIPE', 'EROFS', 'EMLINK', 'EPIPE', 'EDOM', 'ERANGE', 'EDEADLK', 'ENAMETOOLONG', 'ENOLCK', 'ENOSYS', 'ENOTEMPTY', 'ELOOP', 'EWOULDBLOCK', 'ENOMSG', 'EIDRM', 'ENOSTR', 'ENODATA', 'ETIME', 'ENOSR', 'EREMOTE', 'ENOLINK', 'EPROTO', 'EMULTIHOP', 'EBADMSG', 'EOVERFLOW', 'EILSEQ', 'EUSERS', 'ENOTSOCK', 'EDESTADDRREQ', 'EMSGSIZE', 'EPROTOTYPE', 'ENOPROTOOPT', 'EPROTONOSUPPORT', 'ESOCKTNOSUPPORT', 'EOPNOTSUPP', 'ENOTSUP', 'EPFNOSUPPORT', 'EAFNOSUPPORT', 'EADDRINUSE', 'EADDRNOTAVAIL', 'ENETDOWN', 'ENETUNREACH', 'ENETRESET', 'ECONNABORTED', 'ECONNRESET', 'ENOBUFS', 'EISCONN', 'ENOTCONN', 'ESHUTDOWN', 'ETOOMANYREFS', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTDOWN', 'EHOSTUNREACH', 'EALREADY', 'EINPROGRESS', 'ESTALE', 'EDQUOT', 'ECANCELED', 'EOWNERDEAD', 'ENOTRECOVERABLE', 'ENOMEDIUM', 'EMEDIUMTYPE', 'ENOKEY', 'EKEYEXPIRED', 'EKEYREVOKED', 'EKEYREJECTED', 'ERFKILL', 'EHWPOISON', 'ENOTUNIQ', 'EBADFD', 'EREMCHG', 'ELIBACC', 'ELIBBAD', 'ELIBSCN', 'ELIBMAX', 'ELIBEXEC', 'ERESTART', 'ESTRPIPE', 'EUCLEAN', 'ENOTNAM', 'ENAVAIL', 'EISNAM', 'EREMOTEIO', 'ECHRNG', 'EL2NSYNC', 'EL3HLT', 'EL3RST', 'ELNRNG', 'EUNATCH', 'ENOCSI', 'EL2HLT', 'EBADE', 'EBADR', 'EXFULL', 'ENOANO', 'EBADRQC', 'EBADSLT', 'EBFONT', 'ENONET', 'ENOPKG', 'EADV', 'ESRMNT', 'ECOMM', 'EDOTDOT', 'ENOTUNIQ2'];
 // Stable, unique values (Linux-style numbering) independent of the host OS.
@@ -68,9 +71,56 @@ class Bridge {
     this.worker.on('error', error => { this.failure = error; Atomics.store(this.control, 0, 2); Atomics.notify(this.control, 0); });
     this.lastErrno = 0;
     this.perFd = new Map();
+    // Lumen: nonblocking UDP fds skip the per-datagram round trip. Sends are queued here and posted
+    // as one 'sendbatch' message ahead of the next synchronous call (postMessage keeps the order);
+    // receives are fetched up to UDP_BATCH at a time by one 'recvmany' call and served locally.
+    this.udpFds = new Set();
+    this.udpRx = new Map(); // fd -> { items: [{ buf, ip, port }], head }
+    this.outbox = [];
+    this.outboxBytes = 0;
   }
+  queueSend(fd, ip, port, data) {
+    // Transfer the bytes to the I/O worker; copy unless this view owns its whole (small) buffer.
+    const own = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength && !(data.buffer instanceof SharedArrayBuffer) && data.byteLength <= 65536;
+    const buf = own ? data : data.slice();
+    this.outbox.push({ fd, ip, port, buf });
+    this.outboxBytes += buf.length;
+    if (this.outbox.length >= OUTBOX_MAX_ITEMS || this.outboxBytes >= OUTBOX_MAX_BYTES) this.flushOutbox();
+  }
+  flushOutbox() {
+    if (!this.outbox.length || this.failure) return;
+    const items = this.outbox;
+    this.outbox = [];
+    this.outboxBytes = 0;
+    this.worker.postMessage({ op: 'sendbatch', len: 0, items }, items.map(i => i.buf.buffer));
+  }
+  // Next queued datagram of a nonblocking UDP fd (fetching a batch when the local queue is empty);
+  // throws EAGAIN like recv when nothing has arrived.
+  nextDatagram(fd, max, peek) {
+    let q = this.udpRx.get(fd);
+    if (!q || q.head >= q.items.length) {
+      const out = this.call('recvmany', { fd, max, count: UDP_BATCH });
+      q = { items: [], head: 0 };
+      let off = 0;
+      for (let i = 0; i < out.rc; i++) {
+        const n = this.data[off] | (this.data[off + 1] << 8);
+        const port = this.data[off + 2] | (this.data[off + 3] << 8);
+        const ip = this.data.slice(off + 4, off + 8);
+        off += 8;
+        q.items.push({ buf: this.data.slice(off, off + n), ip, port });
+        off += n;
+      }
+      this.udpRx.set(fd, q);
+    }
+    const d = q.items[q.head];
+    if (!peek) { q.items[q.head] = null; q.head += 1; }
+    this.perFd.set(fd, 0);
+    return d;
+  }
+  hasQueuedDatagram(fd) { const q = this.udpRx.get(fd); return !!q && q.head < q.items.length; }
   call(op, args, payload) {
     if (this.failure) throw this.failure;
+    if (this.outbox.length) this.flushOutbox();
     const len = payload ? payload.length : 0;
     if (len > DATA_BYTES) throw sockError(ErrorCodes.EMSGSIZE);
     if (len) this.data.set(payload, 0);
@@ -93,24 +143,43 @@ function bridgeInstance() { if (!bridge) bridge = new Bridge(); return bridge; }
 const SocketsManager = {
   create(familyName, sockTypeName, flags) {
     const b = bridgeInstance();
-    return b.call('create', { family: familyName, type: sockTypeName, nonblock: !!(flags & SockFlags.SOCK_NONBLOCK) }).rc;
+    const fd = b.call('create', { family: familyName, type: sockTypeName, nonblock: !!(flags & SockFlags.SOCK_NONBLOCK) }).rc;
+    if (sockTypeName === 'sock_dgram' && (flags & SockFlags.SOCK_NONBLOCK)) b.udpFds.add(fd);
+    return fd;
   },
   bind(fd, addr) { bridgeInstance().call('bind', { fd, ip: bytesToIp(addr.bytes), port: addr.port }); },
   connect(fd, addr) { bridgeInstance().call('connect', { fd, ip: bytesToIp(addr.bytes), port: addr.port }); },
   listen(fd, backlog) { bridgeInstance().call('listen', { fd, backlog }); },
   accept4(fd) { return bridgeInstance().call('accept', { fd }).rc; },
   accept(fd) { return SocketsManager.accept4(fd, 0); },
-  close(fd) { bridgeInstance().call('close', { fd }); },
+  close(fd) {
+    const b = bridgeInstance();
+    b.call('close', { fd }); // flushes queued sends first
+    b.udpFds.delete(fd); b.udpRx.delete(fd);
+  },
   send(fd, data, flags) { return bridgeInstance().call('send', { fd, flags }, data).rc; },
-  sendTo(fd, data, flags, addr) { return bridgeInstance().call('send', { fd, flags, ip: bytesToIp(addr.bytes), port: addr.port }, data).rc; },
+  sendTo(fd, data, flags, addr) {
+    const b = bridgeInstance();
+    // A UDP send already answered "sent" before the datagram left (the reply never waited for
+    // dgram's callback), so queueing it changes no error the caller could see.
+    if (b.udpFds.has(fd)) { b.queueSend(fd, bytesToIp(addr.bytes), addr.port, data); return data.length; }
+    return b.call('send', { fd, flags, ip: bytesToIp(addr.bytes), port: addr.port }, data).rc;
+  },
   recv(fd, data, flags) {
     const b = bridgeInstance();
+    if (b.udpFds.has(fd)) { const d = b.nextDatagram(fd, data.length, !!(flags & MsgFlags.MSG_PEEK)); const n = Math.min(d.buf.length, data.length); data.set(d.buf.subarray(0, n)); return n; }
     const out = b.call('recv', { fd, max: data.length, peek: !!(flags & MsgFlags.MSG_PEEK) });
     data.set(b.data.subarray(0, out.len));
     return out.len;
   },
   recvFrom(fd, data, flags) {
     const b = bridgeInstance();
+    if (b.udpFds.has(fd)) {
+      const d = b.nextDatagram(fd, data.length, !!(flags & MsgFlags.MSG_PEEK));
+      const n = Math.min(d.buf.length, data.length);
+      data.set(d.buf.subarray(0, n));
+      return { bytesRead: n, peerAddress: new NetAddress('af_inet', d.ip, d.port) };
+    }
     const out = b.call('recv', { fd, max: data.length, peek: !!(flags & MsgFlags.MSG_PEEK), from: true });
     data.set(b.data.subarray(0, out.len));
     const peerAddress = out.aux[0] > 0 ? new NetAddress('af_inet', Uint8Array.from(out.aux.slice(1, 5)), out.aux[0]) : null;
@@ -118,9 +187,13 @@ const SocketsManager = {
   },
   poll(pollFds, timeout) {
     const b = bridgeInstance();
-    const out = b.call('poll', { fds: pollFds.map(p => ({ fd: p.fd, events: p.events })), timeout });
-    pollFds.forEach((p, i) => { p.revents = out.aux[i]; });
-    return out.rc;
+    // Datagrams already fetched by recvmany are readable here; the worker is then only probed.
+    const local = pollFds.map(p => ((p.events & (PollFlags.POLLIN | PollFlags.POLLRDNORM)) && b.hasQueuedDatagram(p.fd) ? p.events & (PollFlags.POLLIN | PollFlags.POLLRDNORM) : 0));
+    const anyLocal = local.some(Boolean);
+    const out = b.call('poll', { fds: pollFds.map(p => ({ fd: p.fd, events: p.events })), timeout: anyLocal ? 0 : timeout });
+    let count = 0;
+    pollFds.forEach((p, i) => { p.revents = out.aux[i] | local[i]; if (p.revents) count++; });
+    return count;
   },
   select(readSeq, writeSeq, exceptSeq, timeoutUSec) {
     const fds = new Map();

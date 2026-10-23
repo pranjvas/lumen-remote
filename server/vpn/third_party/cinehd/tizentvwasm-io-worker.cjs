@@ -186,6 +186,24 @@ const ops = {
   // Lumen: a poll that finishes (ready or timed out) takes its evaluate closure off every socket it
   // waited on, and registers at most once per socket. Without this, once poll really blocks (the
   // glue patch in tools/vpn/patch-wg-glue.cjs), an idle socket's waiter list grows ~50 entries/s.
+  // Lumen: up to m.count queued datagrams in one reply, packed as [u16le len][u16le port][4 ip bytes]
+  // [payload]...; rc = count. EAGAIN (or the socket's pending error) when none has arrived.
+  recvmany(m, s) {
+    if (s.type !== 'udp') return reply(-E.EOPNOTSUPP);
+    if (!s.rx.length) {
+      if (s.err) { const e = s.err; s.err = 0; return reply(-e); }
+      return reply(-E.EAGAIN);
+    }
+    const parts = []; let count = 0; let bytes = 0;
+    while (s.rx.length && count < m.count && bytes + 8 + m.max <= data.length) {
+      const d = s.rx.shift(); s.rxBytes -= d.buf.length;
+      const n = Math.min(m.max, d.buf.length);
+      const h = Buffer.allocUnsafe(8); h.writeUInt16LE(n, 0); h.writeUInt16LE(d.port, 2);
+      const ip = d.ip.split('.'); for (let i = 0; i < 4; i++) h[4 + i] = Number(ip[i]);
+      parts.push(h, d.buf.subarray(0, n)); count++; bytes += 8 + n;
+    }
+    reply(count, Buffer.concat(parts, bytes));
+  },
   poll(m) {
     let timer = null; let done = false;
     const watched = [];
@@ -239,6 +257,18 @@ const ops = {
 };
 
 parentPort.on('message', m => {
+  // Lumen: queued UDP sends from the shim. Nobody waits on this message, so it never replies.
+  if (m.op === 'sendbatch') {
+    for (const it of m.items) {
+      const s = sockets.get(it.fd);
+      if (!s || s.type !== 'udp') continue;
+      const buf = Buffer.from(it.buf.buffer, it.buf.byteOffset, it.buf.byteLength);
+      try {
+        ensureUdp(s, error => { if (!error) s.udp.send(buf, it.port, it.ip, err => { if (err) { s.err = errnoOf(err); wake(s); } }); });
+      } catch (error) { s.err = errnoOf(error); wake(s); }
+    }
+    return;
+  }
   if (DEBUG) dbg('op', JSON.stringify(m)); // Lumen: no JSON.stringify per call unless debugging
   const payload = m.len ? Buffer.from(data.slice(0, m.len).buffer) : null; // one copy, not two
   try {

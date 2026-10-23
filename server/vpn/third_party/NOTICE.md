@@ -87,3 +87,11 @@ Measured problems and numbers: `docs/build-notes/2026-10-23-browser-perf-measure
    `wg-core.wasm` 116201 bytes `057a44177827ba4285ef0806b3e61fc596304612ff61f9c94aa291caf31bde4e`;
    glue as emitted `cfe448a6d73df83ad71c76dd4e524493f3b6ee18e97ab40687f113634dfdf9ca`
    (128735 bytes, before the Lumen anchor); `src/lwipopts.h` is the file used.
+4. **Batched UDP.** Every WireGuard datagram in or out was one synchronous shim round trip. For
+   nonblocking UDP fds, `tizentvwasm-shim.cjs` now queues `sendTo` and posts the queue as one
+   `sendbatch` message ahead of the next synchronous call (or at 128 datagrams / 512 KB);
+   `recvFrom` is served from a local queue that one `recvmany` call fills with up to 64 datagrams;
+   `poll` reports POLLIN for fds with queued datagrams and then only probes the worker.
+   `tizentvwasm-io-worker.cjs` gains the `recvmany` op and the `sendbatch` message (never replied
+   to). A UDP send already answered "sent" before dgram's callback, so no visible error changes.
+   TCP paths and MSG_PEEK semantics are unchanged.
