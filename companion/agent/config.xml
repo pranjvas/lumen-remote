@@ -16,7 +16,11 @@
   <tizen:privilege name="http://tizen.org/privilege/tv.channel"/>
   <tizen:privilege name="http://developer.samsung.com/privilege/productinfo"/>
   <access origin="*" subdomains="true"/>
-  <tizen:content-security-policy>default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file: blob: data:; connect-src 'self' file: ws: http:; media-src 'self' blob: http:; object-src 'none'</tizen:content-security-policy>
+  <!-- The in-page player (hls.js / <video>) may only fetch from Lumen's TV-facing relay (lan.port, 8791 by
+       default; tools/agent/build.ps1 refuses another port unless it is listed here). Never the whole http:
+       scheme: a playlist URI the relay did not rewrite would then go from the TV straight to the stream
+       host, outside the VPN, and the agent page could reach any LAN http service. -->
+  <tizen:content-security-policy>default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file: blob: data:; connect-src 'self' file: ws: http://*:8791; media-src 'self' blob: http://*:8791; object-src 'none'</tizen:content-security-policy>
   <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="enable" encryption="disable" install-location="auto" hwkey-event="enable"/>
   <tizen:metadata key="http://samsung.com/tv/metadata/devel.api.version" value="5.5"/>
 </widget>

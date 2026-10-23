@@ -45,6 +45,52 @@ describe('relay', () => {
     }
   });
 
+  test('a playlist served without an HLS type or .m3u8 URL is still rewritten (the body starts with #EXTM3U); other bodies pass through intact', async () => {
+    const big = Buffer.alloc(200 * 1024, 7);
+    const upstream = http.createServer((req, res) => {
+      const port = upstream.address().port;
+      if (req.url === '/manifest?id=1') { res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(`#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n/hls/720p?sig=a\n`); return; }
+      if (req.url === '/hls/720p?sig=a') {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        // Split across writes so the sniffed head and the rest come in separate chunks.
+        res.write('﻿#EXT');
+        setTimeout(() => res.end(`M3U\n#EXT-X-KEY:METHOD=AES-128,URI="http://127.0.0.1:${port}/k"\n#EXTINF:6,\nhttp://127.0.0.1:${port}/seg\n`), 20);
+        return;
+      }
+      if (req.url === '/seg') { res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': big.length }); res.end(big); return; }
+      if (req.url === '/tiny') { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('hi'); return; }
+      res.writeHead(404); res.end();
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    let handler;
+    const front = http.createServer((req, res) => handler(req, res));
+    await new Promise((r) => front.listen(0, '127.0.0.1', r));
+    const lan = { address: '127.0.0.1', port: front.address().port, route: (prefix, { request }) => { handler = request; return () => {}; } };
+    const relay = createRelay({ log: createTestLog(), lan });
+    relay.start();
+    const relayed = (text) => text.split('\n').filter((l) => l && !l.startsWith('#'));
+    try {
+      const up = `http://127.0.0.1:${upstream.address().port}`;
+      const master = await fetch(relay.register(`${up}/manifest?id=1`).url);
+      assert.equal(master.headers.get('content-type'), 'application/vnd.apple.mpegurl');
+      const [variant] = relayed(await master.text());
+      assert.ok(variant.startsWith(`http://127.0.0.1:${lan.port}/relay/`), variant);
+      const media = await (await fetch(variant)).text();
+      assert.match(media, /URI="http:\/\/127\.0\.0\.1:\d+\/relay\//);
+      assert.ok(!media.includes(`${up}/`), 'no upstream URI is left for the TV to fetch itself');
+      const [seg] = relayed(media);
+      assert.ok(seg.startsWith(`http://127.0.0.1:${lan.port}/relay/`), seg);
+      const body = Buffer.from(await (await fetch(seg)).arrayBuffer());
+      assert.equal(body.length, big.length);
+      assert.ok(body.equals(big));
+      assert.equal(await (await fetch(relay.register(`${up}/tiny`).url)).text(), 'hi');
+    } finally {
+      relay.stop();
+      front.close();
+      upstream.close();
+    }
+  });
+
   test('CORS for the in-page player, HLS probe (fMP4, DRM), licence POSTs only where allowed, resolved per request, and blobs', async () => {
     const seen = [];
     const upstream = http.createServer((req, res) => {
