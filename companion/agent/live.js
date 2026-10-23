@@ -56,6 +56,7 @@
 
   function report(state, extra) {
     const msg = { t: 'screen-live', state: state };
+    if (state !== 'stats' && window.LumenBox) window.LumenBox.note('live-' + state, extra || null);
     if (extra) Object.keys(extra).forEach(function (k) { msg[k] = extra[k]; });
     send(msg);
   }

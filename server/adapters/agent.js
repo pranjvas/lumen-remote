@@ -344,6 +344,11 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
   const bufferedAmount = () => videoBacklog().bytes;
 
   async function onHello(msg) {
+    // The agent's black box: what happened on the TV before it was last cut off.
+    if (Array.isArray(msg.box) && msg.box.length) {
+      const entries = msg.box.slice(-40).map((e) => ({ t: typeof e?.t === 'number' ? new Date(e.t).toISOString().slice(11, 23) : null, k: String(e?.k ?? '').slice(0, 24), d: e?.d ?? null }));
+      log.info('agent black box', { count: msg.box.length, entries: JSON.stringify(entries).slice(0, 4000) });
+    }
     clearTimeout(launchTimer);
     const version = str(msg.agent, 40);
     const pcHost = str(msg.pcHost, 64);

@@ -251,8 +251,9 @@
       onMessage(event.data);
     };
     sock.onerror = function () {};
-    sock.onclose = function () {
+    sock.onclose = function (ev) {
       clearTimeout(openTimer);
+      if (opened && window.LumenBox) window.LumenBox.note('ws-close', { code: ev && ev.code, clean: !!(ev && ev.wasClean), reason: String((ev && ev.reason) || '').slice(0, 80) });
       if (ws !== sock) return;
       if (opened) lastLinkAt = Date.now();
       ws = null;
@@ -264,7 +265,9 @@
   async function sendHello(sock) {
     slow = await readSlow();
     if (ws !== sock) return;
-    greeted = send({ t: 'hello', agent: config.version, pcHost: config.pcHost, snapshot: snapshotWith(readFast()) });
+    // What happened before the last cut-off (black box), handed to the PC once.
+    const box = window.LumenBox ? window.LumenBox.take() : [];
+    greeted = send({ t: 'hello', agent: config.version, pcHost: config.pcHost, snapshot: snapshotWith(readFast()), box: box });
   }
 
   function scheduleRetry() {
