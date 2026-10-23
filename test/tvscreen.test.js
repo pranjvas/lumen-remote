@@ -16,7 +16,18 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
 
   before(async () => {
     web = http.createServer((req, res) => {
+      if (req.url.startsWith('/clip.m3u8')) {
+        res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        res.end(['#EXTM3U', '#EXTINF:4,', 'seg.ts', '#EXT-X-ENDLIST', ''].join('\n'));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'text/html' });
+      // A page with a big video whose playing state the test controls (headless Edge plays no HLS).
+      if (req.url.startsWith('/video')) {
+        res.end('<title>Video</title><video id="v" src="/clip.m3u8" style="width:100vw;height:80vh"></video>'
+          + '<script>let p = true; Object.defineProperty(v, "paused", { get: () => p }); v.pause = () => { p = true; }; window.startIt = () => { p = false; };</script>');
+        return;
+      }
       if (req.url.startsWith('/second')) res.end(`<title>Second</title><p>Search: ${new URL(req.url, 'http://x').searchParams.get('q') ?? ''}</p>`);
       else res.end('<title>Page</title><a href="/second">Go to second</a><form action="/second"><input name="q" placeholder="Search"></form><h1 style="height:3000px">Hello TV</h1>');
     });
@@ -74,5 +85,19 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     await waitFor(async () => (await callTool('browser_read', {}, ctx)).result.title === 'Second', { timeout: 15000, what: 'the linked page' });
     const look = await callTool('browser_look', {}, ctx);
     assert.equal(look.images[0].mimeType, 'image/jpeg');
+  });
+
+  test('a big video started on the page goes to the TV player by itself, and is paused on the page', async () => {
+    const ack = await b.send('browser.openOnTv', { url: `http://127.0.0.1:${web.address().port}/video` }, { timeout: 40000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    const page = stack.server.features.browser;
+    const plays = () => agent.screen.filter((m) => m.t === 'screen-play').length;
+    const before = plays();
+    await page.evaluate('startIt()');
+    await waitFor(() => plays() > before, { timeout: 15000, what: 'the video handed to the TV player' });
+    assert.match(agent.screen.filter((m) => m.t === 'screen-play').at(-1).url, /\/relay\//);
+    await waitFor(async () => (await page.evaluate('v.paused')) === true, { timeout: 5000, what: 'the page video paused' });
+    agent.sendScreenInput({ key: 'red' });
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
   });
 });

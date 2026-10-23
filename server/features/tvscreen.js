@@ -10,6 +10,17 @@ const STEP_MAX = 0.09;
 const STREAK_MS = 260; // presses closer than this accelerate
 const SCROLL_PX = 600;
 const EDGE = 0.002;
+// While the page is on the TV, a video the user starts on the page is handed to the TV's own player
+// (full quality, sound, DRM through the TV's CDM): Lumen's mirrored page has no sound and few frames,
+// and its headless browser cannot play DRM video at all.
+const AUTO_POLL_MS = 1500;
+const AUTO_MIN_AREA = 0.3; // fraction of the page: muted previews and thumbnails stay on the page
+const TV_VIDEO_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
+const PAGE_VIDEO_SCRIPT = `(() => {
+  const area = innerWidth * innerHeight;
+  return [...document.querySelectorAll('video')].some((v) => !v.paused && !v.ended && v.clientWidth * v.clientHeight >= area * ${AUTO_MIN_AREA});
+})()`;
+const PAUSE_PAGE_SCRIPT = `[...document.querySelectorAll('video')].forEach((v) => { try { v.pause(); } catch (e) {} })`;
 
 export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay, transcoder = () => null }) {
   const log = rootLog.child('tvscreen');
@@ -22,6 +33,8 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let lastKeyAt = 0;
   let queue = Promise.resolve();
   let current = null; // { pick, title, stage: 'direct' | 'copy' | 'encode', job }
+  let autoTimer = null;
+  let handing = false;
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
   const b = () => {
@@ -137,6 +150,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       removeSink = feature.addSink((bytes) => agent()?.sendFrame?.(bytes));
       unsubscribe = adapter.onScreen(onMessage);
       setState(true);
+      if (config.tvscreen?.autoPlayOnTv !== false) autoTimer = setInterval(() => { autoHandOff().catch(() => {}); }, AUTO_POLL_MS);
       log.info('browser shown on the TV', { url: store.get('browser.url')?.v ?? null });
     }
     sendCursor();
@@ -146,6 +160,8 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   async function close() {
     if (!on) return { value: { on: false } };
     on = false;
+    clearInterval(autoTimer);
+    autoTimer = null;
     removeSink?.();
     unsubscribe?.();
     removeSink = unsubscribe = null;
@@ -153,6 +169,24 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     await agent()?.request?.('screen', { on: false }).catch(() => {});
     log.info('browser screen closed on the TV');
     return { value: { on: false } };
+  }
+
+  // The user started a big video on the page: play it on the TV's player instead, and pause it on the
+  // page (so it does not keep loading, and does not start again when the TV returns to the page).
+  async function autoHandOff() {
+    if (!on || handing || TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v)) return;
+    const feature = browser();
+    if (!feature) return;
+    if (await feature.evaluate(PAGE_VIDEO_SCRIPT).catch(() => false) !== true) return;
+    handing = true;
+    try {
+      toast('Playing on the TV’s player…');
+      const result = await playVideo().catch((err) => { toast(err.message); return null; });
+      if (result) log.info('page video handed to the TV automatically');
+    } finally {
+      await feature.evaluate(PAUSE_PAGE_SCRIPT).catch(() => {});
+      handing = false;
+    }
   }
 
   // The page's own video first: the biggest (or playing) <video> with a real URL, then streams the page

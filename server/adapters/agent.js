@@ -244,9 +244,10 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     active.send(JSON.stringify(msg));
     return true;
   }
-  /** One JPEG frame for the browser screen; skipped while the socket is backed up. */
+  /** One JPEG frame for the browser screen; skipped while the socket is backed up (a few frames at
+   *  most, so control messages such as screen-play are not stuck behind seconds of video). */
   function sendFrame(bytes) {
-    if (!isOpen() || active.bufferedAmount > 2 * 1024 * 1024) return false;
+    if (!isOpen() || active.bufferedAmount > 384 * 1024) return false;
     active.send(bytes, { binary: true });
     return true;
   }
