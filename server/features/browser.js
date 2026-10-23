@@ -102,6 +102,16 @@ export function clampViewport(w, h) {
   };
 }
 
+// 'hls' | 'dash' | 'file' for a video stream a page can be handed off with; segments and audio are not.
+export function mediaKind(mime, url) {
+  const type = String(mime ?? '').toLowerCase();
+  const path = String(url ?? '').split('?')[0].toLowerCase();
+  if (/mpegurl/.test(type) || path.endsWith('.m3u8')) return 'hls';
+  if (/dash\+xml/.test(type) || path.endsWith('.mpd')) return 'dash';
+  if (/^video\/(mp4|webm|quicktime)/.test(type) && !/\.(m4s|ts)$/.test(path)) return 'file';
+  return null;
+}
+
 // Width and height from a JPEG's start-of-frame marker, or null when it cannot be found.
 export function jpegSize(buffer) {
   let i = 2;
@@ -205,6 +215,16 @@ function isAlive(pid) {
 export function createBrowser({ config, log: rootLog, store, hub, vpn = () => null }) {
   const log = rootLog.child('browser');
   const settings = { idleMs: 1_200_000, maxFps: 15, quality: 60, maxWidth: 1280, maxHeight: 800, ...config.browser };
+  // Lumen browser on TV (features/tvscreen.js): extra receivers of every frame as JPEG bytes. While one
+  // is attached the viewport is the TV's 16:9 and phones see a scaled copy.
+  const sinks = new Set();
+  const TV_VIEWPORT = Object.freeze({ w: 1280, h: 720 });
+  let requestedViewport = null;
+  // Video streams the page loaded (HLS/DASH manifests, whole files), newest first, with the request
+  // headers that fetched them (cookies, referer) so the TV can be handed the same stream.
+  let mediaSeen = [];
+  const mediaRequests = new Map(); // requestId → { url, type, headers }
+  const MEDIA_KEEP = 20;
   const { edgePath } = settings;
   const profileDir = path.join(config.dataDir, PROFILE_DIR);
 
@@ -301,6 +321,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     lastFrame = { ...frame, ...size };
     lastSentAt = Date.now();
     sendFrame(lastFrame);
+    if (sinks.size) {
+      const bytes = Buffer.from(lastFrame.data, 'base64');
+      for (const sink of sinks) {
+        try { sink(bytes, lastFrame); } catch (err) { log.debug('frame sink failed', { message: err.message }); }
+      }
+    }
   }
 
   // Frames are acked to Edge at once and fanned out at most maxFps per second (IDLE_FPS while the
@@ -332,7 +358,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   function armIdle() {
     clearIdle();
-    if (!child || watchers.size) return;
+    if (!child || watchers.size || sinks.size) return;
     idleTimer = setTimeout(() => {
       log.info('closing the browser: no viewer for a while', { idleMs: settings.idleMs });
       close().catch((err) => log.warn('idle close failed', err));
@@ -543,6 +569,29 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable'); // bindingCalled needs the domain on
     await cdp.send('Network.enable');
+    mediaSeen = [];
+    mediaRequests.clear();
+    cdp.on('Network.requestWillBeSent', (p) => {
+      if (p.type === 'Document' && p.frameId === mainFrameId) mediaSeen = [];
+      if (mediaRequests.size > 500) mediaRequests.clear();
+      mediaRequests.set(p.requestId, { url: p.request.url, type: p.type, headers: { ...p.request.headers } });
+    });
+    cdp.on('Network.requestWillBeSentExtraInfo', (p) => {
+      const r = mediaRequests.get(p.requestId);
+      if (r) r.headers = { ...r.headers, ...p.headers };
+    });
+    cdp.on('Network.responseReceived', (p) => {
+      const r = mediaRequests.get(p.requestId);
+      const kind = mediaKind(p.response.mimeType, p.response.url);
+      if (!kind || !r || p.response.status >= 400) return;
+      const lower = Object.fromEntries(Object.entries(r.headers).map(([k, v]) => [k.toLowerCase(), v]));
+      const entry = { url: p.response.url, kind, mime: p.response.mimeType, at: Date.now(),
+        headers: { cookie: lower.cookie ?? null, referer: lower.referer ?? null, origin: lower.origin ?? null, userAgent: lower['user-agent'] ?? null } };
+      mediaSeen = [entry, ...mediaSeen.filter((m) => m.url !== entry.url)].slice(0, MEDIA_KEEP);
+      publish('media', mediaSeen.length);
+    });
+    cdp.on('Network.loadingFinished', (p) => mediaRequests.delete(p.requestId));
+    cdp.on('Network.loadingFailed', (p) => mediaRequests.delete(p.requestId));
     if (!config.browser?.allowLoopback) await cdp.send('Network.setBlockedURLs', { urls: LOOPBACK_PATTERNS });
     mainFrameId = (await cdp.send('Page.getFrameTree')).frameTree.frame.id;
     await cdp.send('Runtime.addBinding', { name: TITLE_BINDING });
@@ -698,6 +747,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   async function setViewport(w, h) {
+    requestedViewport = clampViewport(w, h);
+    if (sinks.size) return { value: { ...viewport } }; // the TV's viewport holds while it watches
     const next = clampViewport(w, h);
     const changed = next.w !== viewport.w || next.h !== viewport.h;
     viewport = next;
@@ -725,8 +776,37 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return {};
   }
 
+  /** Adds a frame receiver (bytes, frame) and locks the TV viewport; → a function that removes it. */
+  function addSink(fn) {
+    sinks.add(fn);
+    clearIdle();
+    const wasLocked = sinks.size > 1;
+    if (!wasLocked) {
+      requestedViewport ??= { ...viewport };
+      viewport = { ...TV_VIEWPORT };
+      if (ready && page) page.send('Emulation.setDeviceMetricsOverride', metrics()).catch(() => {});
+    }
+    if (lastFrame && ready) fn(Buffer.from(lastFrame.data, 'base64'), lastFrame);
+    return () => {
+      if (!sinks.delete(fn) || sinks.size) return;
+      viewport = requestedViewport ?? viewport;
+      if (ready && page) page.send('Emulation.setDeviceMetricsOverride', metrics()).catch(() => {});
+      if (!watchers.size) armIdle();
+    };
+  }
+
+  /** Video streams the current page loaded, newest first. */
+  const media = () => mediaSeen.map((m) => ({ ...m, headers: { ...m.headers } }));
+
+  /** The size frames arrive in (input coordinates are in frame pixels). */
+  const frameSize = () => ({ w: lastFrame?.w ?? viewport.w, h: lastFrame?.h ?? viewport.h });
+
   return {
     applyProxy,
+    addSink,
+    media,
+    frameSize,
+    ensureRunning,
     open,
     nav,
     input,

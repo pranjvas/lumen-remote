@@ -49,6 +49,7 @@
   }
 
   function hideSoon() {
+    if (window.LumenScreen && window.LumenScreen.isActive()) return;
     clearTimeout(hideTimer);
     hideTimer = setTimeout(function () { read(function () { app.hide(); }); }, HIDE_AFTER_MS);
   }
@@ -212,7 +213,11 @@
       setStatus('connected to ' + config.pcHost);
       sendHello(sock);
     };
-    sock.onmessage = function (event) { onMessage(event.data); };
+    sock.binaryType = 'arraybuffer';
+    sock.onmessage = function (event) {
+      if (typeof event.data !== 'string') { if (window.LumenScreen) window.LumenScreen.frame(event.data); return; }
+      onMessage(event.data);
+    };
     sock.onerror = function () {};
     sock.onclose = function () {
       clearTimeout(openTimer);
@@ -275,6 +280,7 @@
   function onMessage(raw) {
     let msg = null;
     try { msg = JSON.parse(raw); } catch (e) { return; }
+    if (msg && typeof msg.t === 'string' && msg.t.indexOf('screen-') === 0) { if (window.LumenScreen) window.LumenScreen.message(msg); return; }
     if (!msg || msg.t !== 'req' || typeof msg.rid !== 'string') return;
     handleRequest(msg).then(
       function (data) { send({ t: 'reply', rid: msg.rid, ok: true, data: data }); },
@@ -288,11 +294,26 @@
     if (msg.type === 'open-url') return openUrl(msg.url);
     if (msg.type === 'launch') return launchApp(msg.appId, msg.operation, msg.data);
     if (msg.type === 'meta') return appMeta(msg.appId);
+    if (msg.type === 'screen') return screenMode(msg.on === true);
     if (msg.type === 'exit') {
       setTimeout(quit, 200);
       return null;
     }
     throw new Error('unknown request: ' + msg.type);
+  }
+
+  // ---- screen: Lumen's browser shown full screen on the TV (screen.js); the PC brings the agent to the
+  // front with a launch, and while the screen is on the agent stays visible ----
+
+  function screenMode(on) {
+    if (!window.LumenScreen) throw new Error('this agent has no screen module');
+    clearTimeout(hideTimer);
+    if (on) window.LumenScreen.start();
+    else {
+      window.LumenScreen.stop();
+      hideSoon();
+    }
+    return { on: on };
   }
 
   // ---- meta: an app's declared metadata (partner apps put their deep-link template here,
@@ -479,12 +500,14 @@
 
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) return;
-    // Opened again from the Apps screen or relaunched by the PC: retry at once, then step aside.
+    // Opened again from the Apps screen or relaunched by the PC: retry at once, then step aside
+    // (unless the PC asked for the browser screen, which stays in front).
     if (config) connectNow();
-    hideSoon();
+    if (!(window.LumenScreen && window.LumenScreen.isActive())) hideSoon();
   });
 
   setStatus('starting');
+  if (window.LumenScreen) window.LumenScreen.init(send);
   hideSoon();
   loadConfig().then(function (c) {
     config = c;
