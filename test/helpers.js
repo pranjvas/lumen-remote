@@ -150,8 +150,10 @@ export async function startStack({ mock: mockOptions, config, seed } = {}) {
  * A browser-like client of WS /live (right Host and Origin by default). It mirrors the flat state
  * from hello + patches and collects acks, toasts, changedOnTv and ai events.
  */
-export function connectBrowser(port, { origin = `http://127.0.0.1:${port}`, host = '127.0.0.1', headers = {} } = {}) {
-  const ws = new WebSocket(`ws://${host}:${port}/live`, { origin, headers });
+export function connectBrowser(port, { origin = `http://127.0.0.1:${port}`, host = '127.0.0.1', headers = {}, binaryFrames = false } = {}) {
+  // binaryFrames: browser frames as binary messages, as the web UI asks for them; recorded as
+  // { t: 'browser.frame', seq, w, h, bytes, binary: true }.
+  const ws = new WebSocket(`ws://${host}:${port}/live${binaryFrames ? '?frames=bin' : ''}`, { origin, headers });
   const messages = [];
   const listeners = new Set();
   const state = {};
@@ -169,8 +171,10 @@ export function connectBrowser(port, { origin = `http://127.0.0.1:${port}`, host
   opened.catch((err) => rejectHello(err));
   ws.on('error', () => {});
 
-  ws.on('message', (data) => {
-    const msg = JSON.parse(String(data));
+  ws.on('message', (data, isBinary) => {
+    const msg = isBinary
+      ? { t: data[0] === 1 ? 'browser.frame' : 'binary', seq: data.readUInt32BE(4), w: data.readUInt16BE(8), h: data.readUInt16BE(10), bytes: data.subarray(data[1]), binary: true }
+      : JSON.parse(String(data));
     messages.push(msg);
     if (msg.t === 'hello') {
       Object.assign(state, msg.state);

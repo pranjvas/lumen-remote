@@ -32,7 +32,9 @@ const VIEW_NAME = /^[a-z][a-z-]{0,23}$/;
 const ITEM_ID = /^[\w-]{1,64}$/;
 const READ_SOURCES = new Set(['live', 'agent']);
 // Commands that stream while the user moves a pointer: they share the roomier pointer rate bucket.
-const STREAMED = new Set(['pointer.move', 'browser.input', 'browser.pointer', 'browser.ack']);
+// browser.ack (one per frame received) has a bucket of its own (safety.js), so a fast trackpad
+// cannot make an ack bounce and leave frames counted as unacked.
+const STREAMED = new Set(['pointer.move', 'browser.input', 'browser.pointer']);
 const BROWSER_INPUT_KINDS = ['move', 'down', 'up', 'click', 'wheel', 'key', 'text'];
 const BROWSER_POINTER_ACTIONS = ['move', 'click', 'wheel'];
 const MOUSE_BUTTONS = ['left', 'right', 'middle'];
@@ -228,10 +230,11 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
   }
 
   // Sends to the clients currently showing `view` with a visible tab (browser frames, §11.3);
-  // `shouldSend(client)` can drop individual clients.
+  // `shouldSend(client)` can drop individual clients. `msg` may be a function of the client, for
+  // messages that come in more than one encoding (binary browser frames).
   function sendToView(view, msg, shouldSend = () => true) {
     for (const [client, presence] of clients) {
-      if (presence.visible && presence.view === view && shouldSend(client)) send(client, msg);
+      if (presence.visible && presence.view === view && shouldSend(client)) send(client, typeof msg === 'function' ? msg(client) : msg);
     }
   }
 

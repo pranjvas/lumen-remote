@@ -313,7 +313,9 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
     if (pathname !== '/live') return refuse(socket, 404, 'Not Found');
     if (!allowedHosts.has(String(req.headers.host ?? '').toLowerCase())) return refuse(socket, 421, 'Misdirected Request');
     if (!allowedOrigins.has(req.headers.origin)) return refuse(socket, 403, 'Forbidden');
-    wss.handleUpgrade(req, socket, head, connect);
+    // /live?frames=bin: the web UI takes browser frames as binary messages (JPEG bytes, no base64).
+    const binaryFrames = new URL(req.url, 'http://lumen').searchParams.get('frames') === 'bin';
+    wss.handleUpgrade(req, socket, head, (ws) => connect(ws, { binaryFrames }));
   }
 
   async function onMessage(client, data, isBinary) {
@@ -330,17 +332,20 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
     client.send({ t: 'ack', id: ackId(msg.id), ...result });
   }
 
-  function connect(ws) {
+  function connect(ws, { binaryFrames = false } = {}) {
     const client = {
       id: randomUUID(),
       kind: 'browser',
+      binaryFrames,
+      // A Buffer goes out as a binary message (browser frames), anything else as JSON.
       send(msg) {
         if (ws.readyState !== WebSocket.OPEN) return;
         if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
           ws.terminate();
           return;
         }
-        ws.send(JSON.stringify(msg));
+        if (Buffer.isBuffer(msg)) ws.send(msg, { binary: true });
+        else ws.send(JSON.stringify(msg));
       },
       close: (code = 1000, reason = '') => ws.close(code, reason),
     };

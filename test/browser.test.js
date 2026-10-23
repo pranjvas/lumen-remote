@@ -35,6 +35,13 @@ html,body{margin:0;background:#fff;font:16px sans-serif}
 // Busy: repaints every 40 ms so the screencast keeps producing frames.
 const BUSY = page('Busy page', '<div id="n" style="font:bold 120px sans-serif;padding:40px">0</div>'
   + '<script>let n=0;setInterval(()=>{n++;document.getElementById("n").textContent=n;document.body.style.background="hsl("+(n*7%360)+" 60% 70%)"},40)</script>');
+// Anim: repaints on every animation frame (60+ per second, more than the fan-out rate).
+const ANIM = page('Anim page', '<div id="n" style="font:bold 120px sans-serif;padding:40px">0</div>'
+  + '<script>let n=0;const f=()=>{n++;document.getElementById("n").textContent=n;document.body.style.background="hsl("+(n*7%360)+" 60% 70%)";requestAnimationFrame(f)};requestAnimationFrame(f)</script>');
+// Burst: still until burst(ms) repaints it every 16 ms for ms; that resolves with the time of the last change.
+const BURST = page('Burst page', '<div id="n" style="font:bold 120px sans-serif;padding:40px">0</div>'
+  + '<script>let n=0;window.burst=(ms)=>new Promise((res)=>{const end=performance.now()+ms;const step=()=>{n++;document.getElementById("n").textContent=n;'
+  + 'document.body.style.background="hsl("+(n*13%360)+" 60% 70%)";const at=Date.now();if(performance.now()<end)setTimeout(step,16);else res(at)};step()})</script>');
 const LINK_AT = [160, 80];
 const FIELD_AT = [190, 190];
 
@@ -50,6 +57,8 @@ async function pageServer() {
       case '/': return html(HOME);
       case '/second': return html(page('Second page', '<h1>Second</h1>'));
       case '/busy': return html(BUSY);
+      case '/anim': return html(ANIM);
+      case '/burst': return html(BURST);
       case '/slow': return held.push(() => html(page('Slow page', 'late')));
       case '/search': { const q = url.searchParams.get('q') ?? ''; return html(page(`Search: ${q}`, esc(q))); }
       default: res.writeHead(404); return res.end();
@@ -129,13 +138,15 @@ const near = (a, b, tolerance = 0.02) => Math.abs(a - b) <= b * tolerance;
 const at = (frame, [vx, vy]) => ({ x: Math.round((vx * frame.w) / VIEW.w), y: Math.round((vy * frame.h) / VIEW.h) });
 const okAck = (ack) => assert.equal(ack.ok, true, JSON.stringify(ack.error));
 const invalidAck = (ack, what) => { assert.equal(ack.ok, false, `${what} was accepted`); assert.equal(ack.error.code, 'INVALID', what); };
-/** Acks every frame like the UI does after painting it. */
+/** Acks every frame as it arrives, like the UI does. */
 const autoAck = (client) => client.onMessage((m) => { if (m.t === 'browser.frame') client.fire('browser.ack', { seq: m.seq }); });
+/** The hub's message for a plain (JSON) client: browser.js passes per-client encodings as a function. */
+const asJson = (msg) => (typeof msg === 'function' ? msg({}) : msg);
 
 function assertFrame(frame, expectedAspect) {
   assert.equal(frame.t, 'browser.frame');
   assert.equal(typeof frame.seq, 'number');
-  const buf = Buffer.from(frame.data, 'base64');
+  const buf = frame.binary ? frame.bytes : Buffer.from(frame.data, 'base64');
   assert.deepEqual(jpegSize(buf), { w: frame.w, h: frame.h }, 'w × h match the JPEG');
   assert.ok(frame.w <= 1280 && frame.h <= 800, `${frame.w}×${frame.h} is within 1280×800`);
   assert.ok(near(aspect(frame), expectedAspect), `aspect ${aspect(frame).toFixed(3)} ≈ ${expectedAspect.toFixed(3)}`);
@@ -263,7 +274,7 @@ describe('browser: Lumen clients ↔ hub ↔ headless Edge', { skip }, () => {
     invalidAck(await viewer.send('browser.viewport', { w: 'wide', h: 400 }), 'a non-numeric viewport');
   });
 
-  test('frames are gated per client: acked clients keep receiving at ≤ 15 fps, a silent client is skipped after 2 frames until it acks, a hidden tab gets nothing more', async () => {
+  test('frames are gated per client: acked clients keep receiving at ≤ maxFps, a silent client is skipped after 4 frames until it acks (or its acks expire), a hidden tab gets nothing more', async () => {
     const lazy = stack.browser();
     const hidden = stack.browser();
     try {
@@ -276,20 +287,46 @@ describe('browser: Lumen clients ↔ hub ↔ headless Edge', { skip }, () => {
       const hiddenHad = frames(hidden).length;
 
       const mark = frames(viewer).length;
-      await sleep(1500);
+      await sleep(1000);
       const got = frames(viewer).length - mark;
-      assert.ok(got >= 5, `the acking viewer keeps receiving (${got} frames in 1.5 s)`);
-      assert.ok(got <= 15 * 1.5 + 3, `at most 15 frames/s per client (${got} in 1.5 s)`);
-      assert.ok(frames(lazy).length >= 1 && frames(lazy).length <= 3, `the silent client got ${frames(lazy).length} frame(s)`);
+      assert.ok(got >= 5, `the acking viewer keeps receiving (${got} frames in 1 s)`);
+      assert.ok(got <= 24 + 3, `at most 24 frames/s per client (${got} in 1 s)`);
+      assert.ok(frames(lazy).length >= 1 && frames(lazy).length <= 4, `the silent client got ${frames(lazy).length} frame(s)`);
       assert.equal(frames(hidden).length, hiddenHad, 'a hidden browser tab gets no more frames');
       assert.equal(frames(other).length, 0, 'the remote view gets no frames');
 
       const had = frames(lazy).length;
       okAck(await lazy.send('browser.ack', { seq: frames(lazy).at(-1).seq }));
       await waitFor(() => frames(lazy).length > had, { timeout: 3000, message: 'frames resume after the ack' });
+      // Acks lost on the way do not freeze it: unacked frames stop counting after 1.5 s.
+      const silent = frames(lazy).length;
+      await sleep(400);
+      const stuck = frames(lazy).length;
+      assert.ok(stuck - silent <= 4, `no more than the window while silent (${stuck - silent})`);
+      await waitFor(() => frames(lazy).length > stuck, { timeout: 4000, message: 'frames again once the unacked ones expired' });
     } finally {
       lazy.close();
       hidden.close();
+    }
+  });
+
+  test('a client that asks for binary frames (/live?frames=bin, as the web UI does) gets the JPEG bytes behind a 12-byte header; acks keep it flowing', async () => {
+    const bin = stack.browser({ binaryFrames: true });
+    try {
+      await bin.hello;
+      autoAck(bin);
+      await bin.send('view', { name: 'browser', visible: true });
+      await waitFor(() => frames(bin).length >= 5, { timeout: 5000, message: 'binary frames' });
+      const frame = frames(bin).at(-1);
+      assert.equal(frame.binary, true);
+      assertFrame(frame, VIEW.w / VIEW.h);
+      assert.ok(frames(viewer).at(-1).data, 'the JSON client still gets base64 frames');
+      const seqs = frames(bin).map((f) => f.seq);
+      assert.ok(seqs.every((s, i) => i === 0 || s > seqs[i - 1]), `seq increases: ${seqs.join()}`);
+      // The header's seq is what the ack names: the newest one gets acked like any other.
+      okAck(await bin.send('browser.ack', { seq: frame.seq }));
+    } finally {
+      bin.close();
     }
   });
 
@@ -382,7 +419,7 @@ describe('browser: createBrowser on its own (evaluate, idle timer, stop)', { ski
     store = createStore({ cachePath: path.join(dir, 'state-cache.json'), log: log.child('store') });
     lan = await createTestLan();
     sent = [];
-    const hub = { sendToView: (view, msg) => sent.push({ view, msg }), broadcast() {} };
+    const hub = { sendToView: (view, msg) => sent.push({ view, msg: asJson(msg) }), broadcast() {} };
     browser = createBrowser({ config, data: createDataStore(dir), log, store, lan, hub });
     await browser.start?.();
   });
@@ -437,6 +474,37 @@ describe('browser: createBrowser on its own (evaluate, idle timer, stop)', { ski
     assertFrame(tall, 320 / 800);
   });
 
+  test('source pacing: on a page that paints every animation frame, Edge captures about one frame per frame sent', async () => {
+    await browser.open(web.url('/anim'));
+    await waitFor(() => store.get('browser.title')?.v === 'Anim page', { timeout: 10000, message: 'the anim page' });
+    await sleep(1000);
+    const mark = sent.length;
+    await sleep(2000);
+    const seqs = sent.slice(mark).map((s) => s.msg).filter((m) => m.t === 'browser.frame').map((m) => m.seq);
+    assert.ok(seqs.length >= 20, `frames keep flowing (${seqs.length} in 2 s)`);
+    assert.ok(seqs.length <= 2 * 24 + 4, `at most maxFps (${seqs.length} in 2 s)`);
+    // seq counts Edge's frames; unpaced, Edge sends every painted frame (60+ per second).
+    const perSent = (seqs.at(-1) - seqs[0]) / (seqs.length - 1);
+    assert.ok(perSent < 1.6, `Edge frames per frame sent: ${perSent.toFixed(2)}`);
+  });
+
+  test('pacing never leaves a still page on a stale frame: after each burst of paints its last state is sent', async () => {
+    await browser.open(web.url('/burst'));
+    await waitFor(() => store.get('browser.title')?.v === 'Burst page', { timeout: 10000, message: 'the burst page' });
+    const captured = []; // when Edge captured each frame sent (ms, wall clock)
+    const remove = browser.addSink((bytes, frame) => captured.push(frame.ts));
+    try {
+      await sleep(800);
+      for (let i = 0; i < 4; i += 1) {
+        const last = await browser.evaluate('burst(300)');
+        await waitFor(() => captured.some((ts) => ts >= last - 1), { timeout: 2000, message: `a frame of the final state after burst ${i + 1}` });
+        await sleep(300);
+      }
+    } finally {
+      remove();
+    }
+  });
+
   test('viewers(empty) starts the idle timer: the session closes after idleMs and Edge exits; a later open relaunches', async (t) => {
     browser.viewers(new Set());
     const left = Date.now();
@@ -453,6 +521,24 @@ describe('browser: createBrowser on its own (evaluate, idle timer, stop)', { ski
   test('stop() closes Edge', async (t) => {
     await browser.stop();
     await edgeGone(marker, t);
+  });
+});
+
+describe('browser: binary frame messages', () => {
+  test("encodeFrame (server) and decodeBinary (web/js/core/live.js) agree on the 12-byte header; anything else is not a frame", async () => {
+    const { encodeFrame } = await import('../server/features/browser.js');
+    const { decodeBinary } = await import('../web/js/core/live.js');
+    const jpeg = Buffer.from([0xff, 0xd8, 1, 2, 3, 4, 0xff, 0xd9]);
+    const out = encodeFrame({ seq: 70000, w: 1280, h: 720 }, jpeg);
+    assert.equal(out.length, 12 + jpeg.length);
+    const buffer = out.buffer.slice(out.byteOffset, out.byteOffset + out.length);
+    const msg = decodeBinary(buffer);
+    assert.deepEqual({ ...msg, bytes: [...msg.bytes] }, { t: 'browser.frame', seq: 70000, w: 1280, h: 720, bytes: [...jpeg] });
+    assert.equal(decodeBinary(new ArrayBuffer(5)), null, 'too short');
+    const other = new Uint8Array(buffer.slice(0));
+    other[0] = 2;
+    assert.equal(decodeBinary(other.buffer), null, 'an unknown type');
+    assert.equal(decodeBinary('{"t":"browser.frame"}'), null, 'text');
   });
 });
 

@@ -6,6 +6,8 @@ import { isAllowedKey } from './catalog/keys.js';
 const RATE = { burst: 30, perSecond: 30 };
 // Touchpad movement streams far faster than button presses, so it has its own bucket.
 const POINTER_RATE = { burst: 120, perSecond: 120 };
+// Browser frame acks: one per frame a client receives (the server sends at most browser.maxFps).
+const FRAME_ACK_RATE = { burst: 120, perSecond: 120 };
 
 function createBucket({ burst, perSecond }) {
   let tokens = burst;
@@ -61,10 +63,10 @@ export function createSafety({ config }) {
       const owner = client && typeof client === 'object' ? client : anonymous;
       let entry = buckets.get(owner);
       if (!entry) {
-        entry = { main: createBucket(RATE), pointer: createBucket(POINTER_RATE) };
+        entry = { main: createBucket(RATE), pointer: createBucket(POINTER_RATE), frameAck: createBucket(FRAME_ACK_RATE) };
         buckets.set(owner, entry);
       }
-      const take = cmd === 'pointer.move' ? entry.pointer : entry.main;
+      const take = cmd === 'pointer.move' ? entry.pointer : cmd === 'browser.ack' ? entry.frameAck : entry.main;
       if (!take()) throw new LumenError('RATE_LIMIT', 'Too many commands; slow down');
     },
   };
