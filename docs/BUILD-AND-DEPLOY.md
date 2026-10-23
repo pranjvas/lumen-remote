@@ -80,6 +80,12 @@ The shortcut runs `node tools/start-hidden.js`, which starts the server with no 
 The server reads `web/` into memory when it starts, so **any change to `server/` or `web/` needs a restart**:
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\restart.ps1 -KeepTvPage   # stop, start hidden, wait for health, reopen the page (on the TV if it was there)
+```
+
+Or by hand:
+
+```powershell
 # stop the running server
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
   Where-Object { $_.CommandLine -match 'lumen-remote\\server\\index.js' } |

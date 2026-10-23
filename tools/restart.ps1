@@ -1,0 +1,72 @@
+<#
+.SYNOPSIS
+  Restarts the Lumen server (hidden, like the Startup shortcut) and waits until it answers.
+
+.DESCRIPTION
+  Stops the node process running server/index.js, starts it again with tools/start-hidden.js, and
+  polls /api/health. With -KeepTvPage, the page Lumen's browser showed on the TV (or on its own) is
+  opened again afterwards, since a restart closes the browser and the TV screen.
+#>
+[CmdletBinding()]
+param(
+  [switch]$KeepTvPage,
+  [int]$Port = 8790,
+  [int]$TimeoutSec = 45
+)
+
+$ErrorActionPreference = 'Stop'
+$Root = Split-Path -Parent $PSScriptRoot
+
+function Send-Hub([string]$Cmd, [hashtable]$CmdArgs = @{}) {
+  # One command over the /live WebSocket (the same protocol as the web UI); returns the ack's value.
+  $script = @"
+const ws = new WebSocket('ws://127.0.0.1:$Port/live', { headers: { Origin: 'http://127.0.0.1:$Port' } });
+const args = JSON.parse(process.env.LUMEN_CMD_ARGS || '{}');
+ws.addEventListener('open', () => ws.send(JSON.stringify({ t: 'cmd', id: 'r1', cmd: '$Cmd', ...args })));
+ws.addEventListener('message', (ev) => { const m = JSON.parse(ev.data); if (m.t === 'ack' && m.id === 'r1') { console.log(JSON.stringify(m)); ws.close(); } });
+setTimeout(() => process.exit(0), 60000);
+"@
+  # Through the environment: Windows PowerShell mangles the quotes of JSON passed as an argument.
+  $env:LUMEN_CMD_ARGS = ($CmdArgs | ConvertTo-Json -Compress)
+  try { node -e $script } finally { Remove-Item Env:LUMEN_CMD_ARGS -ErrorAction SilentlyContinue }
+}
+
+function Get-State([string]$Key) {
+  $script = @"
+const ws = new WebSocket('ws://127.0.0.1:$Port/live', { headers: { Origin: 'http://127.0.0.1:$Port' } });
+ws.addEventListener('message', (ev) => { const m = JSON.parse(ev.data); if (m.t === 'hello') { console.log(JSON.stringify(m.state['$Key']?.v ?? null)); ws.close(); } });
+setTimeout(() => process.exit(0), 10000);
+"@
+  node -e $script
+}
+
+$restore = $null
+if ($KeepTvPage) {
+  try {
+    $url = Get-State 'browser.url' | ConvertFrom-Json
+    $onTv = Get-State 'tvscreen.on' | ConvertFrom-Json
+    if ($url) { $restore = @{ url = $url; tv = [bool]$onTv } }
+  } catch { Write-Host 'Lumen was not answering; nothing to restore.' }
+}
+
+$procs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'lumen-remote\\server\\index.js' }
+foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+if ($procs) { Write-Host "Stopped Lumen (pid $(@($procs.ProcessId) -join ', '))." }
+Start-Sleep -Seconds 1
+
+node (Join-Path $Root 'tools\start-hidden.js')
+
+$deadline = (Get-Date).AddSeconds($TimeoutSec)
+$health = $null
+while ((Get-Date) -lt $deadline -and -not $health) {
+  Start-Sleep -Seconds 1
+  try { $health = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/api/health" -TimeoutSec 3).Content } catch { }
+}
+if (-not $health) { throw "Lumen did not answer on port $Port within $TimeoutSec s; see data/logs/stdout.log" }
+Write-Host "Healthy: $health"
+
+if ($restore) {
+  $cmd = if ($restore.tv) { 'browser.openOnTv' } else { 'browser.open' }
+  $ack = Send-Hub $cmd @{ url = $restore.url } | ConvertFrom-Json
+  Write-Host ("Reopened the page{0}: {1}" -f ($(if ($restore.tv) { ' on the TV' } else { '' })), $(if ($ack.ok) { 'ok' } else { $ack.error.message }))
+}

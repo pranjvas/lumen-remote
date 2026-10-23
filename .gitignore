@@ -15,5 +15,6 @@ test/fixtures/vpn/bin/
 companion/eyes/bin/
 companion/eyes/obj/
 
-# agent worktrees and local Claude state
-.claude/
+# agent worktrees and local Claude state; project skills are shared
+.claude/*
+!.claude/skills/
