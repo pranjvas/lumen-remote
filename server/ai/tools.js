@@ -501,6 +501,19 @@ const TOOLS = [
     },
   },
   {
+    name: 'free_tv_memory',
+    description: 'Free memory on the TV by closing apps running in the background (never the one on screen; they start fresh next time). Use when the TV is slow or low on memory.',
+    inputSchema: object({}, []),
+    async run(_args, { hub }) {
+      const r = await send(hub, { cmd: 'tv.freeMemory' });
+      const names = (r?.closed ?? []).map((c) => c.name);
+      return {
+        ok: true, closed: names, freedMb: r?.freedMb ?? null, availableMb: r?.after?.availableMb ?? null,
+        summary: names.length ? `Closed ${names.join(', ')}` : 'No apps were running in the background',
+      };
+    },
+  },
+  {
     name: 'open_netflix',
     description: 'Open a specific title in the Netflix app. Give the official title id (the number in netflix.com/title/<id>) or a netflix.com title link. Find the id with web search first; never guess it. To open Netflix without a title use launch_app.',
     inputSchema: object({

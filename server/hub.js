@@ -747,6 +747,13 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return { value: await call('eyes', 'processes') };
     },
 
+    // Closes apps running in the background (not on screen) to free the TV's memory (features/memory.js).
+    'tv.freeMemory': async () => {
+      requireTvOn();
+      if (!features.memory) throw new LumenError('UNAVAILABLE', 'Freeing memory is not available');
+      return { value: await features.memory.free() };
+    },
+
     // One still of the TV screen via Lumen Eyes; the PNG is served at /api/screen.png.
     'screen.capture': async ({ mode }) => {
       requireTvOn();

@@ -332,6 +332,9 @@
 .health-item { display: grid; grid-template-columns: 70px minmax(60px, 140px) 1fr; align-items: center; gap: 12px; font-size: 13px; }
 .health-item .meter { width: 100%; }
 .health-item .silk { font-size: 9.5px; color: var(--ink-3); }
+.health-wrap { display: grid; gap: 12px; width: 100%; }
+.health-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.health-actions .row-note { margin: 0; font-size: 12px; color: var(--ink-2); }
 
 .seg button.is-connected::after {
   content: "";
@@ -921,6 +924,7 @@
   .browser-head,
   .browser-bar .browser-navgroup,
   .browser-bar .browser-tv,
+  .browser-bar .browser-tvx,
   .browser-bar .browser-close { display: none; }
   .browser-address-box { height: 44px; }
   .browser-status { min-height: 24px; padding: 0 4px; }

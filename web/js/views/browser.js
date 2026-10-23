@@ -243,7 +243,7 @@ export function mountBrowser(root, ctx) {
         h('p', { class: 'view-sub', text: 'Pages render in Edge on this PC and stream here · Open on TV hands them to the TV' }))),
     h('div', { class: 'browser-bar' },
       h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload),
-      form, vpnButtons[0], tvButton('primary'), tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
+      form, vpnButtons[0], tvButton('primary'), tvExtra('browser-tvx', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('browser-tvx', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
     h('div', { class: 'browser-status' }, dot, statusText, meta, closeButtons[1]),
     vpnRow,
     stage,

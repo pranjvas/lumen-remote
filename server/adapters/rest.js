@@ -286,6 +286,22 @@ export function createRest({ config, data, log: rootLog, store }) {
     return { value: { id, visible: visibleNow } };
   }
 
+  // Closes a running app (the same as quitting it on the TV); it starts fresh next time.
+  async function close(id) {
+    checkId(id);
+    if (power === 'off' || power === 'standby') throw new LumenError('TV_OFF', 'The TV is off');
+    let res;
+    try {
+      res = await run('DELETE', `/api/v2/applications/${encodeURIComponent(id)}/`, { priority: 'user', timeoutMs: APP_TIMEOUT_MS });
+    } catch (err) {
+      throw networkError(err);
+    }
+    if (res.status === 404) throw new LumenError('UNAVAILABLE', 'That app is not installed on this TV');
+    if (res.status < 200 || res.status >= 300) throw new LumenError('FAILED', `The TV refused to close it (HTTP ${res.status})`);
+    log.info(`closed ${id}`);
+    return { value: { id, closed: String(res.body).trim() === 'true' } };
+  }
+
   async function getDevice() {
     return { value: await readDevice('user') };
   }
@@ -316,6 +332,7 @@ export function createRest({ config, data, log: rootLog, store }) {
     getDevice,
     getApp,
     launch,
+    close,
     foregroundCheck,
     getWakeMac: () => wakeMac,
   };

@@ -448,7 +448,25 @@ function healthRow(ctx, { watch }) {
   const cpu = meter('CPU');
   const mem = meter('Memory');
   const disk = meter('Storage');
-  const row = rowShell({ key: 'system.cpuLoad', label: 'System health', hint: 'From the TV agent', type: 'readonly' }, h('div', { class: 'health' }, cpu.el, mem.el, disk.el));
+  // Free memory: closes apps running in the background (not on screen); they start fresh next time.
+  const freeBtn = h('button', { class: 'btn sm', type: 'button', text: 'Free memory', title: 'Closes apps running in the background on the TV (not the one on screen). They start fresh next time.' });
+  const freeNote = h('p', { class: 'row-note silk', hidden: true });
+  freeBtn.addEventListener('click', async () => {
+    freeBtn.classList.add('is-busy');
+    const ack = await ctx.cmd('tv.freeMemory', {}, { el: freeBtn, timeoutMs: 90000 });
+    freeBtn.classList.remove('is-busy');
+    if (!ack.ok) return;
+    const { closed = [], freedMb, after } = ack.value ?? {};
+    const names = closed.map((c) => c.name).join(', ');
+    const msg = closed.length
+      ? `Closed ${names}${freedMb > 0 ? ` · about ${freedMb} MB freed` : ''}${after ? ` · ${after.availableMb} MB available` : ''}`
+      : 'No apps were running in the background';
+    freeNote.textContent = msg;
+    freeNote.hidden = false;
+    toast(msg, { level: closed.length ? 'ok' : 'info' });
+  });
+  const row = rowShell({ key: 'system.cpuLoad', label: 'System health', hint: 'From the TV agent and Lumen Eyes', type: 'readonly' },
+    h('div', { class: 'health-wrap' }, h('div', { class: 'health' }, cpu.el, mem.el, disk.el), h('div', { class: 'health-actions' }, freeBtn, freeNote)));
   const paint = (m, frac, text) => {
     const pct = Number.isFinite(frac) ? Math.round(frac * 100) : null;
     m.fill.style.setProperty('--pct', `${pct ?? 0}%`);
@@ -456,13 +474,21 @@ function healthRow(ctx, { watch }) {
     m.fill.parentElement.classList.toggle('bad', pct !== null && pct >= 93);
     m.value.textContent = text;
   };
-  watch(['system.*'], () => {
+  watch(['system.*', 'tv.memory'], () => {
     const v = (k) => ctx.state.value(`system.${k}`, null);
     const load = v('cpuLoad');
     paint(cpu, load, Number.isFinite(load) ? `${Math.round(load * 100)}%` : '—');
-    const total = v('memTotal');
-    const avail = v('memAvailable');
-    paint(mem, total ? 1 - avail / total : null, total ? `${bytes(avail)} free of ${bytes(total)}` : '—');
+    // Eyes reads what the TV can actually use (MemAvailable, counting reclaimable cache); the agent's
+    // web-API figure is closer to completely unused memory and reads much lower.
+    const real = ctx.state.value('tv.memory', null);
+    if (real && Number.isFinite(real.availableMb) && real.totalMb) {
+      paint(mem, 1 - real.availableMb / real.totalMb, `${bytes(real.availableMb * 1048576)} free of ${bytes(real.totalMb * 1048576)}`);
+      mem.value.title = Number.isFinite(real.swapFreeMb) ? `Usable memory, counting cache the TV can reclaim · swap ${real.swapFreeMb} MB free` : '';
+    } else {
+      const total = v('memTotal');
+      const avail = v('memAvailable');
+      paint(mem, total ? 1 - avail / total : null, total ? `${bytes(avail)} free of ${bytes(total)}` : '—');
+    }
     const st = v('storageTotal');
     const sf = v('storageFree');
     paint(disk, st ? 1 - sf / st : null, st ? `${bytes(sf)} free` : '—');

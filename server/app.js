@@ -26,6 +26,7 @@ import { createVpn } from './features/vpn.js';
 import { createRelay } from './features/relay.js';
 import { createTvScreen } from './features/tvscreen.js';
 import { createTranscoder } from './features/transcode.js';
+import { createMemory } from './features/memory.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -101,6 +102,7 @@ export async function startServer(overrides = {}, seams = {}) {
       // Page links from Cast open in the Browser view, which is created after the hub (it sends frames through it).
       cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser, agent: () => agent }),
       transcode: createTranscoder(ctx),
+      memory: createMemory({ ...ctx, rest, eyes: () => eyes }),
       relay: createRelay({ ...ctx, vpn: () => features.vpn, transcoder: () => features.transcode }),
     };
     const hub = createHub({ ...ctx, adapters, features });
