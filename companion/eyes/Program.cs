@@ -8,7 +8,11 @@
 // Protocol: text {t:'hello', version} on connect; text {t:'capture', id, mode?} → binary frame
 // [4-byte big-endian header length][header JSON {t:'frame', id, ok, w, h, format:'nv12', ms}][Y w*h][UV w*h/2]
 // or text {t:'frame', id, ok:false, error}; text {t:'bye'} → the app exits.
+// Also: {t:'bluetooth', id} → adapter + bonded devices; {t:'procs', id} → memory, running apps, processes.
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -29,7 +33,7 @@ namespace LumenEyes
 
     class App : CoreUIApplication
     {
-        const string Version = "0.3.1";
+        const string Version = "0.3.2";
         const int BufSize = 0x7e900;              // the library's own buffer size; frames come back at 720x540
         const int GiveUpAfterMs = 10 * 60 * 1000; // exit when Lumen has been unreachable this long
         static readonly Regex LumenUrl = new Regex(@"^ws://[0-9.]{7,15}:\d{1,5}/eyes\?key=[0-9a-f]{16,128}$");
@@ -101,6 +105,7 @@ namespace LumenEyes
                             if (type == "bye") { Exit(); return; }
                             if (type == "capture") await Capture(ws, Field(msg, "id"), Number(Field(msg, "mode"), 0), token);
                             if (type == "bluetooth") await SendText(ws, BluetoothJson(Field(msg, "id")), token);
+                            if (type == "procs") await SendText(ws, await ProcsJson(Field(msg, "id")), token);
                         }
                     }
                 }
@@ -187,6 +192,75 @@ namespace LumenEyes
             {
                 sb.Append("\"ok\":false,\"error\":" + Quote(ex.GetType().Name + ": " + ex.Message) + "}");
             }
+            return sb.ToString();
+        }
+
+        // Memory: /proc/meminfo totals, running apps (app framework) with RSS/PSS, and every process whose
+        // /proc entry this app may read, largest first. Read-only; nothing is stopped from here.
+        static async Task<string> ProcsJson(string id)
+        {
+            var sb = new StringBuilder("{\"t\":\"procs\",\"id\":" + Quote(id ?? "") + ",\"ok\":true,\"meminfo\":{");
+            try
+            {
+                int n = 0;
+                foreach (var line in File.ReadAllLines("/proc/meminfo"))
+                {
+                    var m = Regex.Match(line, @"^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Shmem|SReclaimable|CmaTotal|CmaFree):\s+(\d+)");
+                    if (!m.Success) continue;
+                    if (n++ > 0) sb.Append(',');
+                    sb.Append(Quote(m.Groups[1].Value) + ":" + m.Groups[2].Value);
+                }
+            }
+            catch (Exception) { }
+            sb.Append("},\"apps\":[");
+            try
+            {
+                var apps = (await ApplicationManager.GetRunningApplicationsAsync()).ToList();
+                var pids = apps.Select(a => a.ProcessId).ToList();
+                Tizen.System.ProcessMemoryUsage usage = null;
+                try { usage = new Tizen.System.ProcessMemoryUsage(pids); } catch (Exception) { }
+                int n = 0;
+                foreach (var a in apps)
+                {
+                    if (n++ > 0) sb.Append(',');
+                    int rss = -1, pss = -1;
+                    try { if (usage != null) { rss = usage.GetRss(a.ProcessId); pss = usage.GetPss(a.ProcessId); } } catch (Exception) { }
+                    sb.Append("{\"id\":" + Quote(a.ApplicationId ?? "") + ",\"pid\":" + a.ProcessId + ",\"state\":" + Quote(a.State.ToString()) + ",\"rssKb\":" + rss + ",\"pssKb\":" + pss + "}");
+                }
+            }
+            catch (Exception ex) { sb.Append("{\"error\":" + Quote(ex.GetType().Name + ": " + ex.Message) + "}"); }
+            sb.Append("],\"procs\":[");
+            try
+            {
+                var list = new List<Tuple<int, string, long, string>>();
+                int unreadable = 0;
+                foreach (var dir in Directory.GetDirectories("/proc"))
+                {
+                    var name = Path.GetFileName(dir);
+                    if (!int.TryParse(name, out int pid)) continue;
+                    try
+                    {
+                        string comm = null; long rss = 0;
+                        foreach (var line in File.ReadAllLines(dir + "/status"))
+                        {
+                            if (line.StartsWith("Name:")) comm = line.Substring(5).Trim();
+                            else if (line.StartsWith("VmRSS:")) long.TryParse(Regex.Match(line, @"\d+").Value, out rss);
+                        }
+                        string cmd = "";
+                        try { cmd = File.ReadAllText(dir + "/cmdline").Replace('\0', ' ').Trim(); } catch (Exception) { }
+                        list.Add(Tuple.Create(pid, comm ?? "", rss, cmd.Length > 160 ? cmd.Substring(0, 160) : cmd));
+                    }
+                    catch (Exception) { unreadable++; }
+                }
+                int k = 0;
+                foreach (var p in list.OrderByDescending(p => p.Item3).Take(80))
+                {
+                    if (k++ > 0) sb.Append(',');
+                    sb.Append("{\"pid\":" + p.Item1 + ",\"name\":" + Quote(p.Item2) + ",\"rssKb\":" + p.Item3 + ",\"cmd\":" + Quote(p.Item4) + "}");
+                }
+                sb.Append("],\"seen\":" + list.Count + ",\"unreadable\":" + unreadable + "}");
+            }
+            catch (Exception ex) { sb.Append("],\"procsError\":" + Quote(ex.GetType().Name + ": " + ex.Message) + "}"); }
             return sb.ToString();
         }
 

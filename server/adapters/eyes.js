@@ -100,7 +100,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
       log.info('eyes connected', { version });
       for (const resolve of waiters) resolve();
       waiters.clear();
-    } else if (msg?.t === 'bluetooth') {
+    } else if (msg?.t === 'bluetooth' || msg?.t === 'procs') {
       const entry = btPending.get(String(msg.id));
       if (entry) { btPending.delete(String(msg.id)); clearTimeout(entry.timer); entry.resolve(msg); }
     } else if (msg?.t === 'frame' && msg.ok === false) {
@@ -246,6 +246,21 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     return value;
   }
 
+  // ---- memory (TV web apps see only totals; Eyes reads apps and processes through Tizen .NET) ----
+
+  /** → { meminfo (kB), apps [{ id, pid, state, rssKb, pssKb }], procs [{ pid, name, rssKb, cmd }], seen, unreadable } */
+  async function processes() {
+    await ensureOnline();
+    const id = randomUUID();
+    const msg = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', 'Lumen Eyes did not answer about memory (it needs Eyes 0.3.2)')); }, 10000);
+      btPending.set(id, { resolve, timer });
+      active.send(JSON.stringify({ t: 'procs', id }));
+    });
+    const { t, id: _id, ...rest } = msg;
+    return rest;
+  }
+
   // ---- watching (the Screen view) ----
 
   function setError(err) {
@@ -321,6 +336,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     },
     capture,
     bluetooth,
+    processes,
     latest: () => latest,
     status: () => ({ online: online(), version, lastCaptureAt: latest?.at ?? null }),
   };
