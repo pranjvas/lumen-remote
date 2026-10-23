@@ -764,6 +764,13 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
     view,
 
+    // A relay URL the TV can play a stream from (fetched through the VPN when it is on).
+    'stream.relay': async ({ url, referer }) => {
+      text(url, 'url', { max: 4096 });
+      if (referer !== undefined) text(referer, 'referer', { max: 2048 });
+      return { value: await feature('relay', 'register', url, { referer }) };
+    },
+
     'cast.url': async ({ url }) => {
       text(url, 'url', { max: 2048 });
       let parsed;

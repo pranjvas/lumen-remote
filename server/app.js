@@ -23,6 +23,7 @@ import { createMacros } from './features/macros.js';
 import { createCast } from './features/cast.js';
 import { createBrowser } from './features/browser.js';
 import { createVpn } from './features/vpn.js';
+import { createRelay } from './features/relay.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -97,6 +98,7 @@ export async function startServer(overrides = {}, seams = {}) {
       macros: createMacros({ ...ctx, remote }),
       // Page links from Cast open in the Browser view, which is created after the hub (it sends frames through it).
       cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser, agent: () => agent }),
+      relay: createRelay({ ...ctx, vpn: () => features.vpn }),
     };
     const hub = createHub({ ...ctx, adapters, features });
     let http = null;
