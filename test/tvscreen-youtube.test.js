@@ -238,15 +238,15 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
     assert.equal(launches().length, n, 'a muted preview below the YouTube minimum stays');
     assert.equal(page.pauses, 0);
 
-    // Off YouTube the minimum is bigger: a fifth of the page stays there.
+    // Off YouTube the minimum is bigger: a sixth of the page stays there.
     setPage('https://news.example.com/another-story', 'Another story');
-    page.videoArea = 0.2;
+    page.videoArea = 0.16;
     page.lastInput = Date.now();
     const at = page.minAreas.length;
     await checks(2, 'two page video checks on another site');
     assert.equal(launches().length, n);
     assert.equal(plays(), before, 'nothing goes to the agent\'s player');
-    assert.deepEqual([...new Set(page.minAreas.slice(at))], [0.3], 'another site checks against the general minimum area');
+    assert.deepEqual([...new Set(page.minAreas.slice(at))], [0.18], 'another site checks against the general minimum area');
     assert.equal(page.pauses, 0);
 
     // Someone tapped play on a Short-sized player (a fifth of the page) on YouTube: it goes to the app.

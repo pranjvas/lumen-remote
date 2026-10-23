@@ -20,7 +20,7 @@ const EDGE = 0.002;
 const AUTO_POLL_MS = 1500;
 const USER_START_MS = 10000; // a page video is handed to the TV only if someone acted this recently
 const FRONT_EVERY_MS = 5000; // at most this often, the trackpad brings Lumen's page back in front of another app
-const AUTO_MIN_AREA = 0.3; // fraction of the page: muted previews and thumbnails stay on the page
+const AUTO_MIN_AREA = 0.18; // fraction of the page: a watch page's player (Dailymotion's is ~23% beside its sidebar) counts; previews and thumbnails stay
 const AUTO_MIN_AREA_YOUTUBE = 0.15; // a YouTube video page: Shorts' portrait player is about a third of a 16:9 page
 const TV_VIDEO_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
 const pageVideoScript = (minArea) => `(() => {
