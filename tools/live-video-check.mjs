@@ -44,9 +44,17 @@ async function main() {
     console.log('first init after', Date.now() - t0, 'ms');
     const startAt = Date.now();
     const seen = agent.frames.length;
+    let lastStats = 0;
+    let decoded = 0;
     while (Date.now() - startAt < SECS * 1000) {
       await new Promise((r) => setTimeout(r, 500));
       if (!playing && agent.frames.slice(seen).some((f) => f.toString('latin1', 0, 3) === 'LVM')) { playing = true; agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'playing', w: 0, h: 0 })); }
+      // A healthy TV's report every 2 s, as live.js sends it; without it the PC falls back to frames.
+      if (playing && Date.now() - lastStats >= 2000) {
+        lastStats = Date.now();
+        decoded += 60;
+        agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'stats', lag: 0.4, buffered: 1, dropped: 0, decoded, stalls: 0, rate: 1 }));
+      }
     }
     const msgs = agent.frames.map((f) => parseMessage(f) ?? { kind: 'jpeg', data: f });
     const inits = msgs.filter((m) => m.kind === 'init');
