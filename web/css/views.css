@@ -989,7 +989,11 @@
 }
 .browser-pointer .icon { width: 22px; height: 22px; fill: color-mix(in oklab, var(--accent) 35%, transparent); }
 @media (max-width: 979px) {
-  .browser-pad { width: 100%; height: clamp(130px, 21dvh, 200px); border-radius: 18px; }
+  .browser-pad { width: 100%; height: clamp(110px, 18dvh, 190px); border-radius: 18px; }
+  /* With the pad open the column is tall: the VPN details step aside and the page may shrink further,
+     so the toolbar under them never ends up behind the tab bar. */
+  .browser-view:has(.browser-pad:not([hidden])) .browser-vpn-row { display: none; }
+  .browser-view:has(.browser-pad:not([hidden])) .browser-stage { min-height: 96px; }
 }
 
 /* Browser VPN (follow-up 3): the switch, its status row, "Use a config file". */
