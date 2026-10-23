@@ -7,14 +7,14 @@ follow-up 3 (Part A, `vpn-tunnel`); the porting plan is `docs/build-notes/follow
 
 | File here | Source in the worktree | Bytes | SHA-256 | Change |
 |---|---|---:|---|---|
-| `wg-core/wg-core.cjs` | `wasm/dist/node/wg-core.js` | 128735 | `cae989c4fafd05f638c0b9ce7815f96de71ab33f1e3ace5de414a90b3c53760c` | rebuilt for Lumen with more streams (see below); renamed `.js` → `.cjs` |
+| `wg-core/wg-core.cjs` | `wasm/dist/node/wg-core.js` | 128735 | `cae989c4fafd05f638c0b9ce7815f96de71ab33f1e3ace5de414a90b3c53760c` | rebuilt for Lumen with more streams (see below); renamed `.js` → `.cjs`; Lumen poll anchor (see the last section) |
 | `wg-core/wg-core.wasm` | `wasm/dist/node/wg-core.wasm` | 116185 | `4ed046b3bb7195342081f69c0ee57a918f487acc408ec39dbeef902323ad715a` | rebuilt for Lumen with more streams (see below) |
 | `wg-core/src/mux.h` | `core/mux.h` | 1483 | `127875d1456b61e4c8bc7b69a9958ab243a6334fcce16e2b76ba59ce7c85ee45` | `MUX_MAX_STREAMS` 32 → 260 (reference: mux constants) |
 | `wg-core/src/tunnel.h` | `core/tunnel.h` | 1441 | `ff5fb35e72a9c713db4aa81e4a1d10497e4f03f7e7b612ce76044b27e8c06b84` | none (reference: exports) |
 | `wg-core/src/config.h` | `core/config.h` | 1393 | `ed33fff075afb98893197bc334d8599d0a3e395a413c5b796266e62589294343` | none (reference: error codes) |
 | `wg-core/src/lwipopts.h` | `core/lwipopts.h` | 2979 | `78c0c8a0f6180686f78182c2ae047c888b9561027f56218df8809d839e9ca595` | `MEMP_NUM_TCP_PCB` 32 → 300, `MEMP_NUM_TCP_SEG` 1024 → 6144, `PBUF_POOL_SIZE` 2048 → 6144, `MEM_SIZE` 4 → 12 MiB (reference: buffer sizes) |
 | `cinehd/tizentvwasm-shim.cjs` | `testing/tizentvwasm-shim.js` | 11013 → 11014 | source `873d10a7f3ec8bbb04e1a149d1700a0fa79a8f1fefc3aabd42be9ec971954e16` | renamed `.cjs`; line 57 loads `tizentvwasm-io-worker.cjs` instead of `.js` |
-| `cinehd/tizentvwasm-io-worker.cjs` | `testing/tizentvwasm-io-worker.js` | 10457 | `832d1b70f682ff5607ac6df452040f116eae3a1956966b83d024bfabbfd281b8` | renamed `.cjs` |
+| `cinehd/tizentvwasm-io-worker.cjs` | `testing/tizentvwasm-io-worker.js` | 10457 | `832d1b70f682ff5607ac6df452040f116eae3a1956966b83d024bfabbfd281b8` | renamed `.cjs`; Lumen performance edits (see the last section) |
 | `licenses/lwip-COPYING` | `third_party/lwip/COPYING` | 1450 | `d51980b934e4411a8e0d80ce61afa28978bf0d49c50d0ee93f705679cb8a6042` | none |
 | `licenses/wireguard-lwip-LICENSE` | `third_party/wireguard-lwip/LICENSE` | 1602 | `3bdbcf303414b7c8b6cb16877f41721c0ae0d97e965c1e7699bf7fc815b05965` | none |
 | `licenses/x25519-MIT` | `third_party/wireguard-lwip/src/crypto/refc/x25519-license.txt` | 1120 | `c7090f593080b4ca211ce5229ccb5bc4f14c7a8a1eb21c8b46f921262dd94208` | none |
@@ -47,7 +47,7 @@ from `wasm/runtime-exports.json`; the glue was then post-processed by `tools/pat
 `server/vpn/wireguard.js` starts a `worker_threads` Worker that `require()`s `cinehd/tizentvwasm-shim.cjs`
 (which provides the `tizentvwasm` sockets namespace the Samsung glue expects, backed by an I/O worker that
 owns the real `node:dgram` / `node:net` sockets) and then `wg-core/wg-core.cjs`, which instantiates
-`wg-core.wasm`. None of these files are edited beyond the renames listed above.
+`wg-core.wasm`. Edits beyond the renames are listed in the last section.
 
 ## Lumen rebuild (2026-10-23): more concurrent streams (160, then 260 with Lumen capping at 250)
 
@@ -57,3 +57,17 @@ A web page through the Browser view's VPN opens far more than 32 connections (Ed
 `git archive`, the worktree untouched) with only the constants listed above changed, using the same
 Samsung Emscripten SDK and `node work/wg-tunnel/wasm/build.cjs --target node`. An unmodified rebuild
 first reproduced the shipped `wg-core.wasm` byte for byte (`ec9a835f…`), so the toolchain is the same.
+
+## Lumen performance edits (2026-10-23, branch `perf/vpn`)
+
+Measured problems and numbers: `docs/build-notes/2026-10-23-browser-perf-measurements.json`
+(`vpnTunnel`, `pageLoad`). Edits to the vendored files, in order:
+
+1. **Blocking poll.** `wg-core.cjs` gets a 10th glue anchor, applied after CineHD's 9 by
+   `node tools/vpn/patch-wg-glue.cjs server/vpn/third_party/wg-core/wg-core.cjs` (idempotent; rerun it
+   after every rebuild). `___syscall168` was a busy-wait that probed each fd with `poll(timeout 0)`
+   until the timeout ran out (about 28,000 shim round trips a second at idle, one core pinned); a
+   socket-only fd set now goes to the glue's own blocking `SOCKFS.callPoll`. Idle CPU with the tunnel
+   up: 1.05 → 0.03 cores. `tizentvwasm-io-worker.cjs` `ops.poll` now removes its waiter from every
+   socket when it finishes and registers once per socket, so waiter lists stay bounded now that
+   poll blocks.

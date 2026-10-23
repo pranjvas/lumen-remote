@@ -176,16 +176,31 @@ const ops = {
     };
     attempt();
   },
+  // Lumen: a poll that finishes (ready or timed out) takes its evaluate closure off every socket it
+  // waited on, and registers at most once per socket. Without this, once poll really blocks (the
+  // glue patch in tools/vpn/patch-wg-glue.cjs), an idle socket's waiter list grows ~50 entries/s.
   poll(m) {
     let timer = null; let done = false;
+    const watched = [];
+    const finish = (count, revents) => {
+      done = true;
+      if (timer) clearTimeout(timer);
+      for (const s of watched) { const i = s.waiters.indexOf(evaluate); if (i >= 0) s.waiters.splice(i, 1); }
+      reply(count, null, revents);
+    };
     const evaluate = () => {
       if (done) return;
       let count = 0; const revents = [];
       for (const f of m.fds) { const r = readiness(sockets.get(f.fd), f.events); revents.push(r); if (r) count++; }
-      if (count > 0 || m.timeout === 0) { done = true; if (timer) clearTimeout(timer); return reply(count, null, revents); }
-      for (const f of m.fds) { const s = sockets.get(f.fd); if (s) s.waiters.push(evaluate); }
+      if (count > 0 || m.timeout === 0) return finish(count, revents);
+      for (const f of m.fds) {
+        const s = sockets.get(f.fd);
+        if (!s || s.waiters.includes(evaluate)) continue;
+        s.waiters.push(evaluate);
+        if (!watched.includes(s)) watched.push(s);
+      }
     };
-    if (m.timeout > 0) timer = setTimeout(() => { if (!done) { done = true; reply(0, null, m.fds.map(() => 0)); } }, m.timeout);
+    if (m.timeout > 0) timer = setTimeout(() => { if (!done) finish(0, m.fds.map(() => 0)); }, m.timeout);
     evaluate();
   },
   sockname(m, s) {
