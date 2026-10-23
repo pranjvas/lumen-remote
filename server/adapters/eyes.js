@@ -33,7 +33,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   let watchEveryMs = 0; // the Screen view's cadence (hub setDemand); 0 = nobody is watching
   let watchTimer = null;
   let watchBusy = false;
-  const btPending = new Map(); // id → { resolve, timer }
+  const btPending = new Map(); // id → { resolve, reject, timer }
   let btAt = 0;
 
   function setConn(state) {
@@ -147,6 +147,12 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
 
   function failPending(message) {
     for (const id of [...pending.keys()]) settle(id, null, new LumenError('UNAVAILABLE', message));
+    // Bluetooth and memory requests too, so they do not wait out their timeouts after a disconnect.
+    for (const [id, entry] of [...btPending]) {
+      btPending.delete(id);
+      clearTimeout(entry.timer);
+      entry.reject(new LumenError('UNAVAILABLE', message));
+    }
   }
 
   // ---- launch on demand ----
@@ -225,7 +231,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     const id = randomUUID();
     const msg = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', 'Lumen Eyes did not answer about Bluetooth')); }, 8000);
-      btPending.set(id, { resolve, timer });
+      btPending.set(id, { resolve, reject, timer });
       active.send(JSON.stringify({ t: 'bluetooth', id }));
     });
     btAt = Date.now();
@@ -254,7 +260,7 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     const id = randomUUID();
     const msg = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', 'Lumen Eyes did not answer about memory (it needs Eyes 0.3.2)')); }, 10000);
-      btPending.set(id, { resolve, timer });
+      btPending.set(id, { resolve, reject, timer });
       active.send(JSON.stringify({ t: 'procs', id }));
     });
     const { t, id: _id, ...rest } = msg;

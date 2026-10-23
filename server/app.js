@@ -102,7 +102,7 @@ export async function startServer(overrides = {}, seams = {}) {
       // Page links from Cast open in the Browser view, which is created after the hub (it sends frames through it).
       cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser, agent: () => agent }),
       transcode: createTranscoder(ctx),
-      memory: createMemory({ ...ctx, rest, eyes: () => eyes }),
+      memory: createMemory({ ...ctx, rest, eyes: () => eyes, agent: () => agent }),
       relay: createRelay({ ...ctx, vpn: () => features.vpn, transcoder: () => features.transcode }),
     };
     const hub = createHub({ ...ctx, adapters, features });
