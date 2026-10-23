@@ -776,7 +776,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       .catch((err) => log.warn('cleanup after browser exit failed', err));
   }
 
-  const metrics = () => ({ width: viewport.w, height: viewport.h, deviceScaleFactor: sinks.size ? tvScale : 1, mobile: false });
+  // The screen is the viewport too: headless Edge otherwise reports a tiny screen (89×66), and video
+  // players that size their full-screen mode from screen.width/height then fail or shrink.
+  const metrics = () => ({ width: viewport.w, height: viewport.h, deviceScaleFactor: sinks.size ? tvScale : 1, mobile: false,
+    screenWidth: viewport.w, screenHeight: viewport.h });
   // While the TV plays the page as live video and no phone watches, the JPEG frames are only a
   // fallback: Edge makes one every LIVE_NTH_FRAME frames instead of every frame.
   const LIVE_NTH_FRAME = 20;

@@ -22,7 +22,9 @@ export const TEST_PAGE = `<!DOCTYPE html><title>Live test</title><body style="ma
 const ac=new AudioContext();const o=ac.createOscillator();o.frequency.value=440;const g=ac.createGain();g.gain.value=0.2;o.connect(g).connect(ac.destination);o.start();</script>`;
 
 async function main() {
-  const web = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(TEST_PAGE); });
+  // --audio-gaps: the tone stops and starts again every second (like a page between videos or ads).
+  const page = process.argv.includes('--audio-gaps') ? TEST_PAGE.replace('o.start();', 'o.start();setInterval(()=>{ac.state=="running"?ac.suspend():ac.resume()},1000);') : TEST_PAGE;
+  const web = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(page); });
   await new Promise((r) => web.listen(0, '127.0.0.1', r));
   const stack = await startStack({ config: { browser: { allowLoopback: true, idleMs: 120000 }, liveVideo: { enabled: true, maxHeight: MAX_HEIGHT }, log: { level: 'info', console: true } } });
   const b = stack.browser();

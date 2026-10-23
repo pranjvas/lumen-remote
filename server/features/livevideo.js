@@ -109,6 +109,7 @@ export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMEN
   let firstVideoAt = null;
   let seq = 1;
   let audioNext = null;
+  let videoNext = null; // where the video sent so far ends (90 kHz)
   let lastVideoTime = -1;
   let batch = null; // { video: [{ time, data, key }], audio: [{ time, data }], since }
   let flushTimer = null;
@@ -143,12 +144,19 @@ export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMEN
     batch = null;
     if (!b || (!b.video.length && !b.audio.length)) return;
     const nominal = Math.round(VIDEO_TIMESCALE / (vcfg?.fps || 30));
-    const video = b.video.map((s, i) => ({ data: s.data, key: s.key, duration: i + 1 < b.video.length ? Math.max(1, b.video[i + 1].time - s.time) : nominal }));
+    // The video runs on without seams: a fragment starts where the last one ended (the last frame of a
+    // fragment only has a nominal duration, and a page captured at a low rate is further apart than
+    // that). This TV's player stalls at even a short gap, and its recovery seeks can kill its page.
+    let start = b.video.length ? b.video[0].time : 0;
+    if (b.video.length && videoNext !== null && Math.abs(start - videoNext) < VIDEO_TIMESCALE) start = videoNext;
+    const video = b.video.map((s, i) => ({ data: s.data, key: s.key,
+      duration: i + 1 < b.video.length ? Math.max(1, b.video[i + 1].time - (i === 0 ? start : s.time)) : nominal }));
+    if (video.length) videoNext = start + video.reduce((sum, v) => sum + v.duration, 0);
     const tracks = [];
-    if (video.length) tracks.push({ track: VIDEO_TRACK, time: b.video[0].time, samples: video });
+    if (video.length) tracks.push({ track: VIDEO_TRACK, time: start, samples: video });
     if (b.audio.length) tracks.push({ track: AUDIO_TRACK, time: b.audio[0].time, samples: b.audio.map((s) => ({ data: s.data, key: true, duration: 1024 })) });
     const key = !!b.video[0]?.key;
-    const time = b.video.length ? b.video[0].time / VIDEO_TIMESCALE : b.audio[0].time / (acfg?.sampleRate || 48000);
+    const time = b.video.length ? start / VIDEO_TIMESCALE : b.audio[0].time / (acfg?.sampleRate || 48000);
     emit({ kind: 'media', key, time, buf: fragmentBatch({ seq: seq++, tracks }) });
   }
 
