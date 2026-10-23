@@ -771,6 +771,93 @@ const TOOLS = [
     },
   },
   {
+    name: 'browser_open',
+    description: 'Open a web page in Lumen\'s own browser (it runs on the PC, behind the VPN when that is on). Use it for anything on the web: reading, searching sites, watching web videos. Set onTv to show it full screen on the TV (the TV remote then drives it). Prefer this over the TV\'s built-in browser, which cannot open modern sites.',
+    inputSchema: object({
+      url: urlProp('The page (http or https); a search phrase is not a URL — use https://duckduckgo.com/?q=… for searches'),
+      onTv: { type: 'boolean', description: 'Also show the browser full screen on the TV' },
+    }, ['url']),
+    async run({ url, onTv = false }, { hub }) {
+      await send(hub, { cmd: onTv ? 'tvscreen.open' : 'browser.open', url });
+      return { ok: true, onTv, summary: onTv ? `Showing ${url} on the TV` : `Opened ${url} in Lumen's browser` };
+    },
+  },
+  {
+    name: 'browser_read',
+    description: 'Read the page open in Lumen\'s browser: title, URL, visible text, and the links, buttons and fields on screen, numbered for browser_click. Read again after anything that changes the page.',
+    inputSchema: object(),
+    async run(_, { browser }) {
+      const b = browser?.();
+      if (!b?.snapshot) fail('Lumen\'s browser is not available', 'UNAVAILABLE');
+      const snap = await b.snapshot();
+      return {
+        ok: true, url: snap.url, title: snap.title, scroll: `${snap.scrollY} of ${snap.pageHeight}px`,
+        text: snap.text, elements: snap.elements.map((e) => ({ i: e.i, tag: e.tag, text: e.text, ...(e.href && { href: e.href }) })),
+        summary: `Read "${snap.title}" (${snap.elements.length} things to click)`,
+      };
+    },
+  },
+  {
+    name: 'browser_click',
+    description: 'Click something on the page in Lumen\'s browser: give its number from browser_read (preferred) or its visible text.',
+    inputSchema: object({
+      index: { type: 'integer', minimum: 1, maximum: 500, description: 'Element number from browser_read' },
+      text: { type: 'string', minLength: 1, maxLength: 80, description: 'Visible text of the link or button' },
+    }),
+    async run({ index, text }, { browser }) {
+      const b = browser?.();
+      if (!b?.clickElement) fail('Lumen\'s browser is not available', 'UNAVAILABLE');
+      if (!index && !text) fail('Give index or text');
+      const res = await b.clickElement({ index, text });
+      await sleep(1200);
+      return { ok: true, summary: `Clicked ${res.value.clicked}` };
+    },
+  },
+  {
+    name: 'browser_type',
+    description: 'Type into the focused field of the page in Lumen\'s browser (click the field first), optionally pressing Enter.',
+    inputSchema: object({
+      text: { type: 'string', minLength: 1, maxLength: 500, description: 'Text to type' },
+      submit: { type: 'boolean', description: 'Press Enter afterwards' },
+    }, ['text']),
+    async run({ text, submit = false }, { hub }) {
+      await send(hub, { cmd: 'browser.input', kind: 'text', text });
+      if (submit) await send(hub, { cmd: 'browser.input', kind: 'key', key: 'Enter' });
+      await sleep(submit ? 1500 : 200);
+      return { ok: true, summary: `Typed ${text.length} characters${submit ? ' and pressed Enter' : ''}` };
+    },
+  },
+  {
+    name: 'browser_scroll',
+    description: 'Scroll the page in Lumen\'s browser.',
+    inputSchema: object({ direction: { type: 'string', enum: ['up', 'down'], description: 'Which way' } }, ['direction']),
+    async run({ direction }, { hub }) {
+      await send(hub, { cmd: 'browser.input', kind: 'wheel', x: 400, y: 300, deltaY: direction === 'down' ? 600 : -600 });
+      await sleep(400);
+      return { ok: true, summary: `Scrolled ${direction}` };
+    },
+  },
+  {
+    name: 'browser_look',
+    description: 'See the page in Lumen\'s browser as a picture (layout, images, video players). Use browser_read for text.',
+    inputSchema: object(),
+    async run(_, { browser }) {
+      const b = browser?.();
+      if (!b?.screenshot) fail('Lumen\'s browser is not available', 'UNAVAILABLE');
+      const jpeg = await b.screenshot();
+      return { ok: true, summary: 'Looked at the page', image: { data: jpeg.toString('base64'), mimeType: 'image/jpeg' } };
+    },
+  },
+  {
+    name: 'browser_play_video_on_tv',
+    description: 'Play the video of the page open in Lumen\'s browser on the TV\'s own player (full screen, full quality, with sound, through the VPN when it is on). Start the video on the page first (click its play button) so Lumen can see its stream. Works for normal web video; protected (DRM) streams cannot be handed over.',
+    inputSchema: object(),
+    async run(_, { hub }) {
+      const res = await send(hub, { cmd: 'tvscreen.playVideo' });
+      return { ok: true, summary: `Playing ${res?.title ? `"${res.title}"` : 'the video'} on the TV` };
+    },
+  },
+  {
     name: 'find_title',
     description: 'Where a film or show streams in India (JustWatch), on which services, and whether it is included or rent/buy. Use when the user asks where something is, or before choosing an app yourself.',
     inputSchema: object({

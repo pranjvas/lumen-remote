@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import { startStack, waitFor } from './helpers.js';
+import { callTool } from '../server/ai/tools.js';
 
 const EDGE = process.env.LUMEN_EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const skip = !fs.existsSync(EDGE) && `headless Edge is not installed at ${EDGE}`;
@@ -14,7 +15,11 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
   let stack, b, agent, web;
 
   before(async () => {
-    web = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Page</title><h1 style="height:3000px">Hello TV</h1>'); });
+    web = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      if (req.url.startsWith('/second')) res.end(`<title>Second</title><p>Search: ${new URL(req.url, 'http://x').searchParams.get('q') ?? ''}</p>`);
+      else res.end('<title>Page</title><a href="/second">Go to second</a><form action="/second"><input name="q" placeholder="Search"></form><h1 style="height:3000px">Hello TV</h1>');
+    });
     await new Promise((r) => web.listen(0, '127.0.0.1', r));
     stack = await startStack({ config: { browser: { edgePath: EDGE, idleMs: 120000, allowLoopback: true } } });
     b = stack.browser();
@@ -48,5 +53,26 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
     assert.ok(agent.requests.some((r) => r.type === 'screen' && r.on === false));
+  });
+
+  test('the AI reads the page, clicks by text, and types into a field in Lumen browser', async () => {
+    const ctx = { hub: stack.server.hub, store: stack.server.store, browser: () => stack.server.features.browser };
+    const base = `http://127.0.0.1:${web.address().port}`;
+    const opened = await callTool('browser_open', { url: `${base}/` }, ctx);
+    assert.equal(opened.isError, false, opened.text);
+    await waitFor(async () => (await callTool('browser_read', {}, ctx)).result.title === 'Page', { timeout: 15000, what: 'the page' });
+    const read = await callTool('browser_read', {}, ctx);
+    assert.ok(read.result.elements.some((e) => e.text === 'Go to second'));
+    const search = read.result.elements.find((e) => e.tag === 'input');
+    assert.equal((await callTool('browser_click', { index: search.i }, ctx)).isError, false);
+    const typed = await callTool('browser_type', { text: 'lumen', submit: true }, ctx);
+    assert.equal(typed.isError, false, typed.text);
+    await waitFor(async () => (await callTool('browser_read', {}, ctx)).result.text.includes('Search: lumen'), { timeout: 15000, what: 'the search result page' });
+    await callTool('browser_open', { url: `${base}/` }, ctx);
+    await waitFor(async () => (await callTool('browser_read', {}, ctx)).result.title === 'Page', { timeout: 15000, what: 'the page again' });
+    assert.equal((await callTool('browser_click', { text: 'go to second' }, ctx)).isError, false);
+    await waitFor(async () => (await callTool('browser_read', {}, ctx)).result.title === 'Second', { timeout: 15000, what: 'the linked page' });
+    const look = await callTool('browser_look', {}, ctx);
+    assert.equal(look.images[0].mimeType, 'image/jpeg');
   });
 });

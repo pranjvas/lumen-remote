@@ -45,10 +45,10 @@ export function withHistory(turns, request) {
 }
 
 // backends: { api?, agentSdk? } replaces the real ones (tests).
-export function createAi({ config, data, log, store, hub, adapters, backends }) {
+export function createAi({ config, data, log, store, hub, adapters, browser, backends }) {
   const logger = log.child('ai');
   const toolContext = {
-    hub, store, eyes: adapters?.eyes,
+    hub, store, eyes: adapters?.eyes, browser: browser ?? (() => null),
     titles: createTitles({ log }),
     skills: createSkills({ dataDir: config.dataDir ?? data?.dir, log }),
     catalog: { settings: SETTINGS, keys: KEYS, apps: APPS, isAllowedKey },

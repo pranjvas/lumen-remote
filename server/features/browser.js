@@ -795,6 +795,55 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     };
   }
 
+  // ---------- for the AI: read, look, click ----------
+
+  // Visible text plus the interactive elements on screen, numbered; positions are CSS pixels.
+  const SNAPSHOT_SCRIPT = `(() => {
+    const vis = (el) => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+      return r.width > 2 && r.height > 2 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity) > 0.05; };
+    const label = (el) => (el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || el.title || el.alt || el.name || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+    const els = [...document.querySelectorAll('a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=tab], [role=menuitem], [onclick], video')]
+      .filter(vis).slice(0, 120).map((el) => { const r = el.getBoundingClientRect();
+        return { tag: el.tagName.toLowerCase(), type: el.type || el.getAttribute('role') || '', text: label(el), href: el.href ? String(el.href).slice(0, 160) : undefined,
+          x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })
+      .filter((e) => e.text || e.tag === 'input' || e.tag === 'textarea' || e.tag === 'video');
+    return { url: location.href, title: document.title, scrollY: Math.round(scrollY), pageHeight: document.documentElement.scrollHeight, viewport: { w: innerWidth, h: innerHeight },
+      text: (document.body ? document.body.innerText : '').replace(/\\n{3,}/g, '\\n\\n').slice(0, 6000), elements: els };
+  })()`;
+  let lastSnapshot = null;
+
+  /** Page text and numbered interactive elements (the numbering is what click() takes). */
+  async function snapshot() {
+    await ensureRunning();
+    const value = await evaluate(SNAPSHOT_SCRIPT);
+    value.elements = value.elements.map((e, i) => ({ i: i + 1, ...e }));
+    lastSnapshot = value;
+    return value;
+  }
+
+  /** A JPEG screenshot of the page as the browser shows it. */
+  async function screenshot() {
+    const cdp = requireReady();
+    const { data } = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70 });
+    return Buffer.from(data, 'base64');
+  }
+
+  /** Clicks element number `index` from the last snapshot, or the first element whose text matches. */
+  async function clickElement({ index, text }) {
+    if (!lastSnapshot || (text && !index)) await snapshot();
+    const list = lastSnapshot.elements;
+    const wanted = text ? String(text).toLowerCase() : null;
+    const el = index ? list.find((e) => e.i === index)
+      : list.find((e) => e.text.toLowerCase() === wanted) ?? list.find((e) => e.text.toLowerCase().includes(wanted));
+    if (!el) throw new LumenError('NOT_FOUND', text ? `Nothing on screen says "${String(text).slice(0, 40)}"` : `There is no element ${index}`);
+    const size = frameSize();
+    const sx = size.w / (lastSnapshot.viewport.w || size.w);
+    const sy = size.h / (lastSnapshot.viewport.h || size.h);
+    await input({ kind: 'click', x: el.x * sx, y: el.y * sy });
+    lastSnapshot = null;
+    return { value: { clicked: el.text || el.tag, tag: el.tag } };
+  }
+
   /** Video streams the current page loaded, newest first. */
   const media = () => mediaSeen.map((m) => ({ ...m, headers: { ...m.headers } }));
 
@@ -806,6 +855,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     addSink,
     media,
     frameSize,
+    snapshot,
+    screenshot,
+    clickElement,
     ensureRunning,
     open,
     nav,
