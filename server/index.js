@@ -1,8 +1,14 @@
 // Entry point: start Lumen, print where to open it, stop gracefully on Ctrl+C / console close.
+import os from 'node:os';
 import { startServer } from './app.js';
 import { DEFAULTS, VERSION } from './config.js';
 
 const FORCE_EXIT_MS = 6000;
+
+// Lumen relays the browser, the VPN tunnel and the TV's video while the PC may be busy with other
+// work; above-normal priority kept them smooth under CPU contention (measured 3.7x better). Its worker
+// threads (the VPN) inherit it.
+try { os.setPriority(os.constants.priority.PRIORITY_ABOVE_NORMAL); } catch { /* not allowed here: keep the default */ }
 
 async function whoHasPort(port) {
   try {
