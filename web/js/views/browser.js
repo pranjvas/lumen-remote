@@ -120,9 +120,24 @@ export function mountBrowser(root, ctx) {
 
   const tvButton = (cls) => {
     const b = cls === 'tool'
-      ? h('button', { class: 'btn ghost browser-tv', type: 'button', 'aria-label': 'Open on TV' }, icon('tv'), h('span', { text: 'On TV' }))
-      : h('button', { class: 'btn primary browser-tv', type: 'button', title: 'Open this page in the TV’s browser' }, icon('tv'), 'Open on TV');
+      ? h('button', { class: 'btn ghost browser-tv', type: 'button', 'aria-label': 'Show on TV' }, icon('tv'), h('span', { text: 'On TV' }))
+      : h('button', { class: 'btn primary browser-tv', type: 'button', title: 'Show this page on the TV in Lumen’s browser (the remote drives it)' }, icon('tv'), 'Show on TV');
     b.addEventListener('click', () => openOnTv(b));
+    tvButtons.push(b);
+    return b;
+  };
+  const tvButtons = [];
+  // While the TV shows Lumen's browser: hand the page's video to the TV's player, or close it.
+  const tvExtras = [];
+  const tvExtra = (cls, label, iconName, cmd, done) => {
+    const b = h('button', { class: `btn ghost ${cls}`.trim(), type: 'button', hidden: true, 'aria-label': label }, icon(iconName), h('span', { text: label }));
+    b.addEventListener('click', async () => {
+      b.classList.add('is-busy');
+      const ack = await ctx.cmd(cmd, {}, { el: b, timeoutMs: 20000 });
+      b.classList.remove('is-busy');
+      if (ack.ok) toast(done, { level: 'ok' });
+    });
+    tvExtras.push(b);
     return b;
   };
   const closeButton = (cls) => {
@@ -228,11 +243,12 @@ export function mountBrowser(root, ctx) {
         h('p', { class: 'view-sub', text: 'Pages render in Edge on this PC and stream here · Open on TV hands them to the TV' }))),
     h('div', { class: 'browser-bar' },
       h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload),
-      form, vpnButtons[0], tvButton('primary'), closeButtons[0]),
+      form, vpnButtons[0], tvButton('primary'), tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
     h('div', { class: 'browser-status' }, dot, statusText, meta, closeButtons[1]),
     vpnRow,
     stage,
-    h('div', { class: 'browser-tools' }, phoneNav.back, phoneNav.forward, phoneNav.reload, keyboardBtn, vpnButtons[1], tvButton('tool')),
+    h('div', { class: 'browser-tools' }, phoneNav.back, phoneNav.forward, phoneNav.reload, keyboardBtn, vpnButtons[1], tvButton('tool'),
+      tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV')),
   );
 
   /* ---------- commands ---------- */
@@ -253,10 +269,16 @@ export function mountBrowser(root, ctx) {
     const typed = toUrl(address.value);
     if (!current && !typed) { toast('Enter an address first', { level: 'info' }); address.focus(); return; }
     el.classList.add('is-busy');
-    const ack = await ctx.cmd('browser.openOnTv', current ? {} : { url: typed }, { el, timeoutMs: 20000 });
+    const ack = await ctx.cmd('browser.openOnTv', current ? {} : { url: typed }, { el, timeoutMs: 45000 });
     el.classList.remove('is-busy');
-    if (ack.ok) toast('Opened on the TV', { level: 'ok' });
+    if (ack.ok) toast('On the TV · arrows move, OK clicks, Yellow plays the video', { level: 'ok' });
   }
+
+  ctx.state.watch('tvscreen.on', () => {
+    const on = ctx.state.value('tvscreen.on', false) === true;
+    for (const b of tvExtras) b.hidden = !on;
+    for (const b of tvButtons) b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
 
   function retry() {
     open(lastUrl || url() || toUrl(address.value) || SUGGESTIONS[0][1]);

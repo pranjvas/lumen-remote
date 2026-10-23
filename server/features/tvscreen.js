@@ -105,8 +105,19 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     }
   }
 
+  // Starts the TV agent when it is not running (installs, restarts) and waits for it to connect.
+  async function ensureAgent() {
+    if (store.get('conn.agent')?.v === 'online') return;
+    const adapter = agent();
+    if (!adapter?.launch) throw new LumenError('UNAVAILABLE', 'The TV agent is not available');
+    await adapter.launch().catch(() => {});
+    const deadline = Date.now() + 20000;
+    while (store.get('conn.agent')?.v !== 'online' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 300));
+  }
+
   /** Shows Lumen's browser on the TV, optionally opening `url` first. */
   async function open({ url } = {}) {
+    await ensureAgent();
     const adapter = a();
     const feature = b();
     if (url) await feature.open(url);
