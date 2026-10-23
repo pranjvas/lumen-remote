@@ -261,6 +261,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let browser = null; // CDP connection to the browser target
   let browserPid = null;
   let page = null; // CDP connection to the one tab
+  let lastUserInput = 0;
   let mainFrameId = null;
   let titleFromPage = null; // the current document's title as reported by PAGE_SCRIPT
   let ready = false;
@@ -687,6 +688,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   async function open(input) {
     const url = validateUrl(input, { allowLoopback: !!config.browser?.allowLoopback });
+    lastUserInput = Date.now();
     await ensureRunning();
     const cdp = requireReady();
     publish('loading', true);
@@ -697,6 +699,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   async function nav(action) {
+    lastUserInput = Date.now();
     if (action === 'home') return open(HOME_URL);
     const cdp = requireReady();
     switch (action) {
@@ -757,6 +760,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   async function input(event) {
+    if (event.kind !== 'move' && event.kind !== 'wheel') lastUserInput = Date.now();
     const cdp = requireReady();
     const button = BUTTON_BITS[event.button] ? event.button : 'left';
     switch (event.kind) {
@@ -901,6 +905,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     addSink,
     media,
     frameSize,
+    // When someone last clicked, typed or navigated (tvscreen hands only videos people start to the TV).
+    lastInputAt: () => lastUserInput,
     snapshot,
     screenshot,
     clickElement,

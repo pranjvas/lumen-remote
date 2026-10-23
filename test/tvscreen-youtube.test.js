@@ -78,6 +78,7 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
       addSink: () => () => {},
       media: () => [],
       frameSize: () => ({ w: 1280, h: 720 }),
+      lastInputAt: () => page.lastInput ?? 0,
       async evaluate(expression) {
         const src = String(expression);
         page.evaluated.push(src);
@@ -195,7 +196,7 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
     assert.equal(page.pauses, 1);
   });
 
-  test('On TV: a YouTube video that starts playing on the page goes to the app by itself, once', async () => {
+  test('On TV: a YouTube video someone starts on the page goes to the app by itself, once; autoplay stays', async () => {
     const other = 'jNQXAC9IVRw'; // not handed off by the tests above (those would count as a repeat)
     setPage(`https://www.youtube.com/watch?v=${other}`);
     const opened = await b.send('tvscreen.open', {}, { timeout: 15000 });
@@ -205,6 +206,11 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
     page.player = { id: other, t: 3.2 };
     await sleep(1800); // a paused page is left alone
     assert.equal(launches().length, n);
+    page.playing = true; // started by itself (autoplay, a preview): stays on the page
+    await sleep(1800);
+    assert.equal(launches().length, n);
+    page.playing = false;
+    page.lastInput = Date.now(); // someone tapped play
     page.playing = true;
     await waitFor(() => launches().length > n, { timeout: 8000, what: 'YouTube launched on the TV' });
     assert.equal(launches().at(-1).body, `v=${other}&t=3`);

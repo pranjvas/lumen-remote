@@ -18,6 +18,8 @@ const EDGE = 0.002;
 // (full quality, sound, DRM through the TV's CDM): Lumen's mirrored page has no sound and few frames,
 // and its headless browser cannot play DRM video at all.
 const AUTO_POLL_MS = 1500;
+const USER_START_MS = 10000; // a page video is handed to the TV only if someone acted this recently
+const FRONT_EVERY_MS = 5000; // at most this often, the trackpad brings Lumen's page back in front of another app
 const AUTO_MIN_AREA = 0.3; // fraction of the page: muted previews and thumbnails stay on the page
 const AUTO_MIN_AREA_YOUTUBE = 0.15; // a YouTube video page: Shorts' portrait player is about a third of a 16:9 page
 const TV_VIDEO_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
@@ -76,6 +78,8 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let current = null; // { pick, title, stage: 'direct' | 'copy' | 'encode', job }
   let autoTimer = null;
   let handing = false;
+  let bringingFront = 0;
+  let lastRemoteInput = 0; // OK / clicks from the TV remote or the trackpad
   let lastYoutube = null; // { id, at } of the last video opened in the TV's YouTube app
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
@@ -124,6 +128,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
 
   async function onKey(key) {
     const now = Date.now();
+    if (key === 'enter' || key === 'yellow') lastRemoteInput = now;
     streak = now - lastKeyAt < STREAK_MS ? streak + 1 : 0;
     lastKeyAt = now;
     const step = Math.min(STEP * (1 + streak * 0.45), STEP_MAX);
@@ -153,6 +158,8 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       y: Math.min(1 - EDGE, Math.max(EDGE, y ?? cursor.y + dy)),
     };
     const moved = next.x !== cursor.x || next.y !== cursor.y;
+    if (action === 'click') lastRemoteInput = Date.now();
+    if (on) bringToFront();
     if (moved || action !== 'move') {
       const feature = b();
       cursor = next;
@@ -164,7 +171,18 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { value: { x: cursor.x, y: cursor.y, tv: on } };
   }
 
+  // Another app (say the TV's YouTube app after a hand-off) is in front of Lumen's page: using the
+  // trackpad brings the page, and its pointer, back.
+  function bringToFront() {
+    const fg = store.get('app.foreground')?.v;
+    if (!fg?.id || fg.id === appId || !appId || !rest || Date.now() - bringingFront < FRONT_EVERY_MS) return;
+    bringingFront = Date.now();
+    log.info('bringing Lumen’s page back in front', { from: fg.name ?? fg.id });
+    rest.launch(appId).then(() => sendCursor()).catch((err) => log.debug('agent bring-to-front failed', { message: err.message }));
+  }
+
   async function onPointer({ x, y }, click) {
+    if (click) lastRemoteInput = Date.now();
     cursor = { x: Math.min(1, Math.max(0, Number(x) || 0)), y: Math.min(1, Math.max(0, Number(y) || 0)) };
     sendCursor();
     await b().input({ kind: click ? 'click' : 'move', ...at() });
@@ -239,17 +257,22 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (!on || handing || TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v)) return;
     const feature = browser();
     if (!feature) return;
-    const yt = youtubeVideo(store.get('browser.url')?.v);
-    if (await feature.evaluate(pageVideoScript(yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA)).catch(() => false) !== true) return;
-    handing = true;
+    // Only a video someone started (a click, a key, opening a link) goes to the TV: videos that start
+    // by themselves (previews, autoplay) stay on the page instead of taking the TV over.
+    if (Date.now() - Math.max(feature.lastInputAt?.() ?? 0, lastRemoteInput) > USER_START_MS) return;
+    handing = true; // before the page check: a slow page must not let the next tick start a second hand-off
+    let playing = false;
     try {
+      const yt = youtubeVideo(store.get('browser.url')?.v);
+      playing = await feature.evaluate(pageVideoScript(yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA)).catch(() => false) === true;
+      if (!playing) return;
       // The same YouTube video starting again on the page right after it went to the app: just pause it.
       if (yt && lastYoutube?.id === yt.id && Date.now() - lastYoutube.at < YOUTUBE_REPEAT_MS) return;
       toast(yt ? 'Opening in YouTube on the TV…' : 'Playing on the TV’s player…');
       const result = await playVideo().catch((err) => { toast(err.message); return null; });
       if (result) log.info('page video handed to the TV automatically');
     } finally {
-      await feature.evaluate(PAUSE_PAGE_SCRIPT).catch(() => {});
+      if (playing) await feature.evaluate(PAUSE_PAGE_SCRIPT).catch(() => {});
       handing = false;
     }
   }
