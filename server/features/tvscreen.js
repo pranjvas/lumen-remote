@@ -101,7 +101,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       else if (msg.pointer) enqueue(() => onPointer(msg.pointer, msg.click === true));
     } else if (msg.t === 'screen-video') {
       store.set('tvscreen.video', typeof msg.state === 'string' ? msg.state.slice(0, 20) : null, { src: 'derived', via: 'tvscreen' });
-      if (msg.state === 'error') log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 120) });
+      if (msg.state === 'error') log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 200) });
     }
   }
 
@@ -139,11 +139,27 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { value: { on: false } };
   }
 
-  /** Plays the video the page loaded on the TV's own player, through the relay. */
-  async function playVideo() {
+  // The page's own video first: the biggest (or playing) <video> with a real URL, then streams the page
+  // loaded from its own site, then any stream; ad players are what usually loads from other sites.
+  async function pickMedia(explicit) {
+    const feature = b();
+    const media = feature.media();
+    const pageUrl = store.get('browser.url')?.v ?? '';
+    const site = (u) => { try { return new URL(u).hostname.split('.').slice(-2).join('.'); } catch { return ''; } };
+    const headersFor = (url) => media.find((m) => m.url === url)?.headers ?? { referer: pageUrl };
+    if (explicit) return { url: explicit, kind: /\.m3u8/i.test(explicit) ? 'hls' : 'file', headers: headersFor(explicit) };
+    const videos = await feature.evaluate(`[...document.querySelectorAll('video')].map((v) => ({ src: v.currentSrc || v.src || '', area: v.clientWidth * v.clientHeight, playing: !v.paused }))`).catch(() => []);
+    const direct = (videos ?? []).filter((v) => /^https?:/.test(v.src)).sort((x, y) => (y.playing - x.playing) || (y.area - x.area))[0];
+    if (direct) return { url: direct.src, kind: /\.m3u8/i.test(direct.src) ? 'hls' : 'file', headers: headersFor(direct.src) };
+    const own = media.filter((m) => site(m.url) === site(pageUrl));
+    const rank = (list) => list.find((m) => m.kind === 'hls') ?? list.find((m) => m.kind === 'file') ?? list.find((m) => m.kind === 'dash');
+    return rank(own) ?? rank(media) ?? null;
+  }
+
+  /** Plays the page's video (or `url`) on the TV's own player, through the relay. */
+  async function playVideo({ url: explicit } = {}) {
     const adapter = a();
-    const media = b().media();
-    const pick = media.find((m) => m.kind === 'hls') ?? media.find((m) => m.kind === 'file') ?? media.find((m) => m.kind === 'dash');
+    const pick = await pickMedia(explicit);
     if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
     const { url } = relay().register(pick.url, pick.headers);

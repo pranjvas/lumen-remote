@@ -168,6 +168,7 @@ export function createRelay({ log: rootLog, lan, vpn = () => null }) {
       return;
     }
     session.at = Date.now();
+    log.info('relay request', { host: target.hostname, method: req.method, range: req.headers.range ?? null });
     const headers = { 'user-agent': session.userAgent, ...(session.referer && { referer: session.referer }), ...(session.origin && { origin: session.origin }) };
     // The page's cookies go only to the site that set them, never to other hosts in the playlist.
     if (session.cookie && siteOf(target.hostname) === session.cookieSite) headers.cookie = session.cookie;

@@ -107,26 +107,33 @@
     stopVideo(false);
     video = { url: url, title: title || '', state: 'loading' };
     root.className = 'screen video';
+    document.body.classList.add('video');
     showHint((title ? title + ' · ' : '') + 'OK play/pause · ◀ ▶ 10 s · Back returns to the page', 7000);
+    let stage = 'webapis';
     try {
+      if (typeof webapis === 'undefined' || !webapis.avplay) throw new Error('webapis.avplay is missing');
+      stage = 'open';
       webapis.avplay.open(url);
+      stage = 'setDisplayRect';
       webapis.avplay.setDisplayRect(0, 0, 1920, 1080);
+      stage = 'setListener';
       webapis.avplay.setListener({
         onbufferingcomplete: function () { report('playing'); },
         onstreamcompleted: function () { report('ended'); stopVideo(true); },
-        onerror: function (err) { report('error', String(err)); toast('The TV could not play this video'); stopVideo(true); },
+        onerror: function (err) { report('error', 'onerror: ' + String(err)); toast('The TV could not play this video'); stopVideo(true); },
         oncurrentplaytime: function () {},
       });
+      stage = 'prepareAsync';
       webapis.avplay.prepareAsync(function () {
         read(function () { webapis.avplay.play(); });
         report('playing');
       }, function (err) {
-        report('error', String(err && (err.name || err.message) || err));
+        report('error', 'prepare: ' + String(err && (err.name + ' ' + (err.message || '')) || err));
         toast('The TV could not play this video');
         stopVideo(true);
       });
     } catch (e) {
-      report('error', String(e && (e.name || e.message) || e));
+      report('error', stage + ': ' + String(e && (e.name + ' ' + (e.message || '')) || e));
       toast('The TV player is not available');
       stopVideo(true);
     }
@@ -146,6 +153,7 @@
     read(function () { webapis.avplay.close(); });
     send({ t: 'screen-video', state: 'stopped' });
     video = null;
+    document.body.classList.remove('video');
     root.className = active ? 'screen' : 'screen off';
     if (backToPage) showHint('Back to the page', 2500);
   }
