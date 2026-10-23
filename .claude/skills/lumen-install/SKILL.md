@@ -18,16 +18,7 @@ The full reference is `docs/BUILD-AND-DEPLOY.md` (prerequisites, every command, 
 
 ## 1. Fresh install (new PC or clean checkout)
 
-1. Check prerequisites (doc §1): Node 22+, Edge, Claude Code login (for Ask Lumen), Tizen Studio CLI with the `Q95T` certificate profile, .NET 8 SDK, WSL Ubuntu with the Tizen SDK's `sdb`, and the TV in developer mode with this PC as host.
-2. Install and start:
-   ```powershell
-   npm ci
-   node tools/start-hidden.js           # or: npm start (foreground)
-   ```
-   Then create or verify `data/config.json`: `tv.host`; `http.lanAccess` if phones should reach it.
-3. Pair the TV: Settings → Connection → **Pair**, and the IP Control pairing. The owner presses **Allow** on the TV.
-4. Install the TV agent (§3) and Lumen Eyes (§4), then **Connect TV agent**.
-5. Optional: start at sign-in with `tools/install-autostart.ps1`.
+Use the **lumen-setup** skill (`docs/SETUP.md`). This skill takes over once Lumen is set up and paired.
 
 ## 2. Deploying changes: work out what changed
 

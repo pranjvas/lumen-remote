@@ -9,7 +9,7 @@ Lumen has four parts. Each builds and deploys on its own:
 | **Lumen Eyes** (`org.lumen.eyes`, Tizen .NET) | the TV | `companion/eyes/` | `tools/eyes/build.ps1` + `tools/eyes/install.sh` |
 | **VPN core** (WireGuard in WebAssembly, from CineHD) | the PC, inside the server | `server/vpn/third_party/wg-core/` | rebuilt rarely; ships with the server |
 
-The paths below are this PC's. Adjust them if your tools live elsewhere.
+The paths below are this PC's. Adjust them if your tools live elsewhere. For a first-time setup in order (development setup, then the TV), start with [SETUP.md](SETUP.md).
 
 ---
 

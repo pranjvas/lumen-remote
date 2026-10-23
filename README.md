@@ -26,7 +26,11 @@ npm ci
 npm start                     # then open http://127.0.0.1:8790
 ```
 
-First run: Settings → Connection → **Pair** (press **Allow** on the TV), then **Connect TV agent**. The TV agent and Lumen Eyes must be installed on the TV first; see [docs/BUILD-AND-DEPLOY.md](docs/BUILD-AND-DEPLOY.md).
+First run: Settings → Connection → **Pair** (press **Allow** on the TV), then **Connect TV agent**. The TV agent and Lumen Eyes must be installed on the TV first.
+
+- **Setting up from scratch** (a development setup with no TV, then connecting a real one): [docs/SETUP.md](docs/SETUP.md).
+- **Building and deploying changes:** [docs/BUILD-AND-DEPLOY.md](docs/BUILD-AND-DEPLOY.md).
+- **Claude Code skills in this repo:** `lumen-setup` (first-time setup) and `lumen-install` (deploying changes).
 
 Only one copy runs at a time. Logs go to `data/logs/` (`lumen.log`, `stdout.log`).
 
@@ -63,8 +67,8 @@ Design, research and notes: `docs/design/2026-10-23-ux-pass.md`, `docs/superpowe
 
 ## Known limits
 
-- The TV agent and Lumen Eyes need the TV in **developer mode** and a Samsung certificate; they rely on partner-level and undocumented TV features, so Lumen is a personal tool, not a store app.
-- Live video of the browser is new: on the Q95T the agent has dropped during long sessions; it falls back to still frames by itself.
+- The TV agent and Lumen Eyes need the TV in **developer mode**. The agent can be installed with Apps2Samsung, with no certificate of your own (not yet confirmed on the Q95T), or signed with your own Samsung certificate. Each build carries this PC's address and key, and the apps use undocumented TV features, so Lumen is a personal tool, not a store app.
+- Live video of the browser runs at 1080p60, or 4K30 with `maxHeight: 2160`, on the Q95T. The agent has still been cut off once on a heavy page (no cause found yet). When that happens, live video falls back to still frames by itself.
 - Cloudflare's "verify you are human" refuses Lumen's headless browser; Google sign-in may do the same.
 - The VPN's DNS (Proton NetShield) blocks ad hosts; a few hosts with very large DNS answers fail inside the tunnel.
 - Ask Lumen uses this PC's Claude Code login. Anthropic doesn't allow claude.ai logins in products offered to others; a shared Lumen must use an API key (`ANTHROPIC_API_KEY`).
