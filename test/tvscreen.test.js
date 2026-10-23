@@ -48,6 +48,12 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
           + 'addEventListener("contextmenu", (e) => { e.preventDefault(); log.push(["right", e.clientX, e.clientY]); });</script>');
         return;
       }
+      // Repaints on every animation frame, so frames keep coming.
+      if (req.url.startsWith('/anim')) {
+        res.end('<title>Anim</title><div id="n" style="font:bold 120px sans-serif">0</div><script>let n = 0;'
+          + 'const f = () => { n++; document.getElementById("n").textContent = n; document.body.style.background = "hsl(" + (n * 7 % 360) + " 60% 70%)"; requestAnimationFrame(f); }; requestAnimationFrame(f);</script>');
+        return;
+      }
       if (req.url.startsWith('/second')) res.end(`<title>Second</title><p>Search: ${new URL(req.url, 'http://x').searchParams.get('q') ?? ''}</p>`);
       else res.end('<title>Page</title><a href="/second">Go to second</a><form action="/second"><input name="q" placeholder="Search"></form><h1 style="height:3000px">Hello TV</h1>');
     });
@@ -72,6 +78,23 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     const frame = agent.frames.at(-1);
     assert.deepEqual([frame[0], frame[1]], [0xff, 0xd8], 'a JPEG');
     assert.ok(agent.screen.some((m) => m.t === 'screen-cursor'));
+  });
+
+  test('a TV that stops reading gets no backlog of old frames: one frame at a time is on its way (confirmed by ping/pong)', async () => {
+    const base = `http://127.0.0.1:${web.address().port}`;
+    assert.equal((await b.send('browser.open', { url: `${base}/anim` }, { timeout: 20000 })).ok, true);
+    await waitFor(() => agent.frames.length > 10, { timeout: 15000, what: 'frames from the animated page' });
+    const socket = agent.ws._socket;
+    socket.pause(); // the TV is busy: nothing more is read from the network
+    await new Promise((r) => setTimeout(r, 1500));
+    const before = agent.frames.length;
+    socket.resume();
+    await new Promise((r) => setTimeout(r, 60));
+    const burst = agent.frames.length - before;
+    // Unpaced, the socket buffers held 1.5 s of frames (about 20 here) that would now arrive at once.
+    assert.ok(burst <= 4, `${burst} frames arrived at once after the pause`);
+    await waitFor(() => agent.frames.length > before + 6, { timeout: 5000, what: 'frames flowing again' });
+    assert.equal((await b.send('browser.open', { url: `${base}/` }, { timeout: 20000 })).ok, true);
   });
 
   test('the remote moves the pointer; Yellow without a video says so; Red closes', async () => {
