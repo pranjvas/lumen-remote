@@ -105,7 +105,12 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   const checkLive = (ctx) => { if (ctx?.auto && (ctx.gen !== generation || !on)) throw cancelled(); };
   // The page's own video is paused once the TV plays it: it would download the same stream a second
   // time (through the VPN) and keep sending frames the TV does not show.
-  const pausePage = async () => { await browser()?.evaluate?.(PAUSE_PAGE_SCRIPT).catch(() => {}); };
+  // The page's videos, and those of its embedded players, stop once the TV plays the video.
+  const pausePage = async () => {
+    const feature = browser();
+    await feature?.evaluate?.(PAUSE_PAGE_SCRIPT).catch(() => {});
+    await feature?.evaluateFrames?.(PAUSE_PAGE_SCRIPT).catch(() => {});
+  };
 
   function serialHandOff(fn) {
     handOffBusy += 1;
@@ -325,6 +330,18 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   // page (so it does not keep loading, and does not start again when the TV returns to the page).
   // A hand-off that failed leaves the page's video playing (the user can still watch it there), and
   // the same page is not tried again by itself for a while.
+  // A big video playing on the page itself, or inside one of its frames (an embedded player such as
+  // Dailymotion's fills the page from an iframe). Sizes count against the whole page.
+  async function pageVideoPlaying(feature, minArea) {
+    if (await feature.evaluate(pageVideoScript(minArea)).catch(() => false) === true) return true;
+    if (!feature.evaluateFrames) return false;
+    const vp = await feature.evaluate('[innerWidth, innerHeight]').catch(() => null);
+    if (!Array.isArray(vp) || !(vp[0] > 0) || !(vp[1] > 0)) return false;
+    const minPx = Math.round(minArea * vp[0] * vp[1]);
+    const found = await feature.evaluateFrames(`[...document.querySelectorAll('video')].some((v) => !v.paused && !v.ended && v.clientWidth * v.clientHeight >= ${minPx})`).catch(() => []);
+    return found.some((v) => v === true);
+  }
+
   async function autoHandOff() {
     // Busy: a slow page check or a hand-off in flight must not let the next tick start a second one.
     if (!on || handOffBusy || videoActive() || Date.now() - lastManualAt < MANUAL_GRACE_MS) return null;
@@ -339,7 +356,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const run = serialHandOff(async () => {
       if (ctx.gen !== generation || !on) return null;
       const yt = youtubeVideo(pageUrl);
-      const playing = await feature.evaluate(pageVideoScript(yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA)).catch(() => false) === true;
+      const playing = await pageVideoPlaying(feature, yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA);
       if (!playing || ctx.gen !== generation || !on) return null;
       // The same YouTube video starting again on the page right after it went to the app: just pause it.
       if (yt && lastYoutube?.id === yt.id && Date.now() - lastYoutube.at < YOUTUBE_REPEAT_MS) { await pausePage(); return null; }

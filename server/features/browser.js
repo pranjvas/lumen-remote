@@ -296,6 +296,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let mainPage = null; // the page itself while a pop-up is on show
   let popup = null; // { id, cdp } a sized pop-up the page opened (a sign-in window)
   let mainTargetId = null;
+  const frameContexts = new Set(); // default execution contexts of the page's frames (its own and in-process iframes)
   let lastUserInput = 0;
   let mainFrameId = null;
   let titleFromPage = null; // the current document's title as reported by PAGE_SCRIPT
@@ -715,6 +716,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     });
     cdp.on('Page.navigatedWithinDocument', ({ frameId }) => { if (frameId === mainFrameId) refreshHistory(cdp); });
     cdp.on('Page.loadEventFired', () => refreshHistory(cdp));
+    // Every frame's own context, so a check can look inside embedded players (Dailymotion's player is
+    // an iframe filling the page).
+    frameContexts.clear();
+    cdp.on('Runtime.executionContextCreated', ({ context }) => { if (context.auxData?.isDefault) frameContexts.add(context.id); });
+    cdp.on('Runtime.executionContextDestroyed', ({ executionContextId }) => frameContexts.delete(executionContextId));
+    cdp.on('Runtime.executionContextsCleared', () => frameContexts.clear());
     // Dialogs would block the page: alerts and beforeunload are accepted, confirms and prompts cancelled.
     cdp.on('Page.javascriptDialogOpening', ({ type }) => {
       cdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
@@ -968,6 +975,16 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   // For tests: runs an expression in the page and returns its value.
+  // `expression` in every frame of the page (each frame's own document), values in no special order;
+  // frames that fail or are gone are skipped. On the page itself, not a pop-up on show.
+  async function evaluateFrames(expression) {
+    const cdp = mainPage ?? requireReady();
+    const ids = [...frameContexts].slice(0, 60);
+    const results = await Promise.all(ids.map((contextId) => cdp.send('Runtime.evaluate', { expression: String(expression), contextId, returnByValue: true })
+      .then((r) => (r.exceptionDetails ? undefined : r.result?.value)).catch(() => undefined)));
+    return results.filter((v) => v !== undefined);
+  }
+
   async function evaluate(expression) {
     const cdp = requireReady();
     const { result, exceptionDetails } = await cdp.send('Runtime.evaluate', { expression: String(expression), awaitPromise: true, returnByValue: true });
@@ -1080,6 +1097,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     ack,
     close,
     evaluate,
+    evaluateFrames,
 
     start() {
       setSession('off');

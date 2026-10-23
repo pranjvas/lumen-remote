@@ -24,6 +24,11 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
       }
       res.writeHead(200, { 'content-type': 'text/html' });
       // A page with a big video whose playing state the test controls (headless Edge plays no HLS).
+      // An embedded player filling the page (as Dailymotion's does), its video inside the iframe.
+      if (req.url.startsWith('/framed')) {
+        res.end('<title>Framed</title><style>body{margin:0}</style><iframe id="pf" src="/video" style="width:100vw;height:90vh;border:0"></iframe>');
+        return;
+      }
       if (req.url.startsWith('/video')) {
         res.end('<title>Video</title><video id="v" src="/clip.m3u8" style="width:100vw;height:80vh"></video>'
           + '<script>let p = true; Object.defineProperty(v, "paused", { get: () => p }); v.pause = () => { p = true; }; window.startIt = () => { p = false; };</script>');
@@ -128,6 +133,20 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     await waitFor(() => plays() > before, { timeout: 15000, what: 'the video handed to the TV player' });
     assert.match(agent.screen.filter((m) => m.t === 'screen-play').at(-1).url, /\/relay\//);
     await waitFor(async () => (await page.evaluate('v.paused')) === true, { timeout: 5000, what: 'the page video paused' });
+    agent.sendScreenInput({ key: 'red' });
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
+  });
+
+  test('a video playing inside an embedded player (an iframe) goes to the TV player too, and is paused there', async () => {
+    const ack = await b.send('browser.openOnTv', { url: `http://127.0.0.1:${web.address().port}/framed` }, { timeout: 40000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    const page = stack.server.features.browser;
+    const plays = () => agent.screen.filter((m) => m.t === 'screen-play').length;
+    const before = plays();
+    await waitFor(async () => (await page.evaluateFrames('typeof startIt === "function"')).includes(true), { timeout: 10000, what: 'the embedded player loaded' });
+    await page.evaluateFrames('typeof startIt === "function" && startIt()');
+    await waitFor(() => plays() > before, { timeout: 15000, what: 'the framed video handed to the TV player' });
+    await waitFor(async () => (await page.evaluateFrames('typeof v === "object" ? v.paused : null')).includes(true), { timeout: 5000, what: 'the framed video paused' });
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
   });
