@@ -74,7 +74,7 @@ function cpuSeconds(pattern) {
 }
 
 async function main() {
-  const stack = await startStack({ config: { browser: { allowLoopback: true, idleMs: 120000 }, liveVideo: { enabled: !JPEG, maxHeight: MAX_HEIGHT }, log: { level: 'info', console: true } } });
+  const stack = await startStack({ config: { browser: { allowLoopback: true, idleMs: 120000 }, liveVideo: { enabled: !JPEG, maxHeight: MAX_HEIGHT }, log: { level: process.env.LV_LOG ?? 'info', console: true } } });
   const agentConfig = JSON.stringify({ pcHost: '127.0.0.1', pcPort: stack.lanPort, key: stack.server.agentKey, version: '0.8.1' });
   const web = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');

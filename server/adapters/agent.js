@@ -191,7 +191,7 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
       touch(ws);
       handleMessage(msg);
     });
-    ws.on('pong', (data) => onFramePong(ws, data));
+    ws.on('pong', (data) => { onFramePong(ws, data); onVideoPong(ws, data); });
     ws.on('close', () => {
       clearTimeout(frameQueues.get(ws)?.timer);
       if (ws === active) log.info('agent disconnected');
@@ -302,14 +302,46 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     writeFrame(ws, queue);
   }
 
-  /** Live video (features/livevideo.js): one init segment or fragment message. Not sent while more
-   *  than `limit` bytes wait in the socket (the caller then skips to the next key frame). */
+  /** Live video (features/livevideo.js): one init segment or fragment message, followed by a ping
+   *  ('V' + id) whose pong says the TV's page has taken everything before it. Not sent while more than
+   *  `limit` bytes are on their way (the caller then skips to the next key frame). */
+  const videoFlights = new WeakMap(); // agent socket → { list: [{ id, at, bytes }], lastId, pongs }
+  function videoFlight(ws) {
+    let f = videoFlights.get(ws);
+    if (!f) videoFlights.set(ws, (f = { list: [], lastId: 0, pongs: false }));
+    return f;
+  }
+  function videoBacklog() {
+    if (!isOpen()) return { bytes: 0, oldestMs: 0 };
+    const f = videoFlight(active);
+    // Without pongs (a TV that never answers) only the socket's own queue is known.
+    if (!f.pongs) return { bytes: active.bufferedAmount, oldestMs: 0 };
+    const now = Date.now();
+    f.list = f.list.filter((x) => now - x.at < 30000);
+    return { bytes: f.list.reduce((n, x) => n + x.bytes, 0), oldestMs: f.list.length ? now - f.list[0].at : 0 };
+  }
   function sendVideo(bytes, { limit = Infinity } = {}) {
-    if (!isOpen() || active.bufferedAmount > limit) return false;
-    active.send(bytes, { binary: true });
+    if (!isOpen() || videoBacklog().bytes > limit) return false;
+    const ws = active;
+    const f = videoFlight(ws);
+    ws.send(bytes, { binary: true });
+    f.lastId = (f.lastId + 1) >>> 0;
+    const id = Buffer.alloc(5);
+    id[0] = 0x56; // 'V'
+    id.writeUInt32BE(f.lastId, 1);
+    f.list.push({ id: f.lastId, at: Date.now(), bytes: bytes.length });
+    ws.ping(id);
     return true;
   }
-  const bufferedAmount = () => (isOpen() ? active.bufferedAmount : 0);
+  function onVideoPong(ws, data) {
+    if (!Buffer.isBuffer(data) || data.length !== 5 || data[0] !== 0x56) return;
+    const f = videoFlight(ws);
+    const id = data.readUInt32BE(1);
+    f.pongs = true;
+    f.list = f.list.filter((x) => x.id > id);
+  }
+  /** Bytes of live video sent but not yet taken by the TV (or waiting in the socket). */
+  const bufferedAmount = () => videoBacklog().bytes;
 
   async function onHello(msg) {
     clearTimeout(launchTimer);

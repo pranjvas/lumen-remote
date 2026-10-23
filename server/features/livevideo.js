@@ -33,6 +33,9 @@ export const FRAGMENT_MS = 160; // media per fragment (one WebSocket message): ~
 const STATS_LATE_MS = 5000;
 const STATS_GONE_MS = 12000;
 const STATS_GRACE_MS = 10000; // the start: before the TV's player is up
+// Video on its way to the TV (sent, its pong not back) beyond this many seconds is congestion: one
+// fragment plus the round trip is normal.
+const QUEUE_LIMIT_SEC = 0.6;
 
 // ---------- the ladder ----------
 
@@ -376,7 +379,7 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
     get bitrate() { return bitrate; },
     tick({ drops = 0, queueSec = 0, stalls = 0, dropRatio = 0, refused = false, statsLate = false } = {}) {
       ticks += 1;
-      const trouble = refused || drops > 0 || queueSec > 0.35 || stalls > 0 || dropRatio > 0.1 || statsLate;
+      const trouble = refused || drops > 0 || queueSec > QUEUE_LIMIT_SEC || stalls > 0 || dropRatio > 0.1 || statsLate;
       // A probe step goes at its first trouble, for good.
       if (probing && trouble) {
         blocked.add(index);
@@ -397,7 +400,7 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
         if (next >= 0) return moveTo(next, 'decode');
         decodeBad = 0;
       }
-      const congested = drops > 0 || queueSec > 0.35 || stalls > 0 || statsLate;
+      const congested = drops > 0 || queueSec > QUEUE_LIMIT_SEC || stalls > 0 || statsLate;
       const { min, max } = ladder[index].bitrate;
       if (congested) {
         good = 0;
@@ -499,7 +502,8 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   const publish = (value) => store.set('tvscreen.live', value, { src: 'derived', via: 'livevideo' });
   const fanout = createFanout({
     requestKey: () => sendPage({ t: 'key' }),
-    limitBytes: () => Math.max(256 * 1024, Math.round(((rate?.bitrate ?? 8e6) / 8) * 0.3)),
+    // Bytes on their way to the TV (sent, not yet confirmed by the TV's pong): about 0.6 s of video.
+    limitBytes: () => Math.max(384 * 1024, Math.round(((rate?.bitrate ?? 5e6) / 8) * 0.6)),
   });
 
   function sendPage(msg) {
@@ -726,7 +730,10 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
         log.info('live video step', { step: step.name, codec: step.codec.family, bitrate: rate.bitrate, why: signals });
         browser()?.setTvScale?.(step.scale);
         sendPage(stepConfig(step, rate.bitrate));
-      } else if (change?.bitrate) sendPage({ t: 'bitrate', bitrate: rate.bitrate });
+      } else if (change?.bitrate) {
+        log.debug('live video bitrate', { bitrate: rate.bitrate, why: signals });
+        sendPage({ t: 'bitrate', bitrate: rate.bitrate });
+      }
     }
     publishState();
   }
