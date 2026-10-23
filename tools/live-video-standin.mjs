@@ -19,6 +19,7 @@ const SECS = Number(arg('secs', 20));
 const MAX_HEIGHT = Number(arg('max-height', 1080));
 const CODECS = arg('codecs', null);
 const SHOT = arg('shot', null);
+const JPEG = process.argv.includes('--jpeg'); // baseline: live video off, the still frames only (CPU numbers)
 const EDGE = process.env.LUMEN_EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const AGENT_DIR = fileURLToPath(new URL('../companion/agent/', import.meta.url));
 const med = (list) => { const s = [...list].sort((a, b) => a - b); return s.length ? Math.round(s[s.length >> 1]) : null; };
@@ -72,7 +73,7 @@ function cpuSeconds(pattern) {
 }
 
 async function main() {
-  const stack = await startStack({ config: { browser: { allowLoopback: true, idleMs: 120000 }, liveVideo: { enabled: true, maxHeight: MAX_HEIGHT }, log: { level: 'info', console: true } } });
+  const stack = await startStack({ config: { browser: { allowLoopback: true, idleMs: 120000 }, liveVideo: { enabled: !JPEG, maxHeight: MAX_HEIGHT }, log: { level: 'info', console: true } } });
   const agentConfig = JSON.stringify({ pcHost: '127.0.0.1', pcPort: stack.lanPort, key: stack.server.agentKey, version: '0.8.0' });
   const web = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -105,15 +106,15 @@ async function main() {
     const t0 = Date.now();
     const ack = await b.send('browser.openOnTv', { url: `http://127.0.0.1:${web.address().port}/test` }, { timeout: 60000 });
     if (!ack.ok) throw new Error(JSON.stringify(ack.error));
-    await waitFor(async () => (await evaluate(page, `document.getElementById('screen').classList.contains('live')`)) === true, { timeout: 40000, what: 'live video playing on the stand-in' });
+    if (!JPEG) await waitFor(async () => (await evaluate(page, `document.getElementById('screen').classList.contains('live')`)) === true, { timeout: 40000, what: 'live video playing on the stand-in' });
     const startup = Date.now() - t0;
-    await evaluate(page, COUNT_FRAMES);
+    if (!JPEG) await evaluate(page, COUNT_FRAMES);
     await sleep(2000);
     const lumenProfile = path.join(stack.dataDir, 'browser-profile');
     const cpu0 = cpuSeconds(lumenProfile), cpuTv0 = cpuSeconds(prof), node0 = process.cpuUsage();
     const smi = spawn('nvidia-smi', ['--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder', '--format=csv,noheader,nounits', '-lms', '500'], { stdio: ['ignore', 'pipe', 'ignore'] });
     let smiOut = ''; smi.stdout.on('data', (d) => { smiOut += d; });
-    const first = await evaluate(page, PROBE);
+    const first = JPEG ? null : await evaluate(page, PROBE);
     const samples = [];
     const states = [];
     const tStart = Date.now();
@@ -121,7 +122,7 @@ async function main() {
       await sleep(250);
       const tl = stack.server.features.livevideo.timeline().baseWallMs;
       if (tl) await evaluate(page, `window.__timeline = ${tl}`);
-      const s = await evaluate(page, PROBE);
+      const s = JPEG ? null : await evaluate(page, PROBE);
       if (s) samples.push(s);
       states.push(stack.server.store.get('tvscreen.live')?.v);
     }
@@ -132,6 +133,10 @@ async function main() {
     if (SHOT) {
       const shot = await page.send('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(SHOT, Buffer.from(shot.data, 'base64'));
+    }
+    if (JPEG) {
+      console.log(JSON.stringify({ mode: 'jpeg frames only', cpu: { lumenEdgePctOfOneCore: Math.round(((cpu1 - cpu0) / wall) * 100), standinTvEdgePct: Math.round(((cpuTv1 - cpuTv0) / wall) * 100), lumenNodePct: Math.round(((node1.user + node1.system) / 1e6 / wall) * 100) } }));
+      return;
     }
     const lats = samples.map((s) => s.lat).filter((l) => l < 10000).sort((a, b) => a - b);
     const rows = smiOut.trim().split(/\r?\n/).map((l) => l.split(',').map(Number)).filter((x) => x.length === 3 && !x.some(Number.isNaN));
