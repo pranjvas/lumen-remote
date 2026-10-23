@@ -129,8 +129,34 @@
 @media (max-width: 720px) {
   .screen-lower { grid-template-columns: 1fr; }
   .screen-steer { justify-content: center; }
-  .screen-controls { justify-content: center; }
+  /* One row under the picture: how often to look on the left, Save and Full screen as icons. */
+  .screen-stage { margin: 0 0 var(--sp-6); }
+  .screen-controls { flex-wrap: nowrap; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-5); }
+  .screen-controls .seg { flex: none; }
+  .screen-actions { flex-wrap: nowrap; gap: var(--sp-1); }
+  .screen-actions .btn.ghost { width: 44px; height: 44px; padding: 0; border-radius: 50%; }
+  .screen-actions .btn.ghost span { display: none; }
+  .screen-actions .btn.ghost .icon { width: 20px; height: 20px; }
+  .screen-steer { grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 56px); }
+  .steer-key { width: 64px; }
 }
+
+/* Full screen without the Fullscreen API (iPhone): the frame fills the window over everything. */
+.screen-frame.is-immersive {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  width: auto;
+  aspect-ratio: auto;
+  border-radius: 0;
+  background: #000;
+  box-shadow: none;
+  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
+  cursor: zoom-out;
+  animation: fadeIn var(--dur-panel) var(--ease-out);
+}
+.screen-frame.is-immersive::after { display: none; }
+.screen-frame.is-immersive .screen-overlay { bottom: calc(12px + var(--safe-bottom)); }
 
 /* The Now card's mini TV shows the latest still while it is recent. */
 .tv-screen .tv-still { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }

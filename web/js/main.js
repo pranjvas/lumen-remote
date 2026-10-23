@@ -44,7 +44,10 @@ initBadges(state, (key) => ctx.isLocked(key), (key) => ctx.setting(key)?.type ==
 const app = $('.app');
 $('#power-slot').replaceWith(powerButton(ctx));
 $('#chain-slot').replaceWith(connectionChain(ctx));
-$('#theme-slot').replaceWith(themeToggle());
+// Phones keep the header for Power, the TV and Ask; the theme switch lives in More there.
+const headerTheme = themeToggle();
+headerTheme.classList.add('only-desktop');
+$('#theme-slot').replaceWith(headerTheme);
 $('#help-btn').addEventListener('click', openHelp);
 mountBanners($('#banners'), ctx);
 const nav = mountNav($('#nav'), ctx);

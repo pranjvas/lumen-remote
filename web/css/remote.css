@@ -32,9 +32,9 @@
     var(--panel-glass);
   -webkit-backdrop-filter: blur(20px) saturate(140%);
   backdrop-filter: blur(20px) saturate(140%);
-  transition: --tint var(--dur-tint) var(--ease-io);
+  transition: --tint var(--dur-tint) var(--ease-io), transform var(--dur-press) var(--ease-out), border-color var(--dur-state);
 }
-.now-strip:hover { border-color: var(--hair-strong); }
+@media (hover: hover) { .now-strip:hover { border-color: var(--hair-strong); } }
 .now-text { flex: 1; min-width: 0; }
 .now-app {
   font-family: var(--font-display);
@@ -162,7 +162,7 @@
   padding: 0 8px;
   pointer-events: none;
 }
-.halo-readout .silk { font-size: 9px; color: var(--ink-3); }
+.halo-readout .silk { font-size: var(--fs-2xs); color: var(--ink-3); }
 .halo-readout .num {
   font-size: 15px;
   font-weight: 500;
@@ -253,7 +253,7 @@
 .dpad-seg.down::before { background: radial-gradient(60% 40% at 50% 100%, color-mix(in oklab, var(--tint) 45%, transparent), transparent 70%); }
 .dpad-seg.left::before { background: radial-gradient(40% 60% at 0% 50%, color-mix(in oklab, var(--tint) 45%, transparent), transparent 70%); }
 .dpad-seg.right::before { background: radial-gradient(40% 60% at 100% 50%, color-mix(in oklab, var(--tint) 45%, transparent), transparent 70%); }
-.dpad-seg:hover { color: var(--ink); }
+@media (hover: hover) { .dpad-seg:hover { color: var(--ink); } }
 .dpad-seg.is-pressed { color: var(--accent); }
 .dpad-seg.is-pressed::before { opacity: 1; }
 .dpad-seg:focus-visible { outline: none; }
@@ -341,7 +341,7 @@
   color: var(--ink-2);
   transition: color var(--dur-state), background var(--dur-state);
 }
-.rocker button:hover { color: var(--ink); }
+@media (hover: hover) { .rocker button:hover { color: var(--ink); } }
 .rocker .rocker-btn { height: 46px; flex: none; }
 .rocker .rocker-btn .icon { width: 20px; height: 20px; stroke-width: 2.1; }
 .rocker .rocker-btn.is-pressed {
@@ -358,7 +358,7 @@
   border-top: 1px solid var(--hair);
   border-bottom: 1px solid var(--hair);
 }
-.rocker-mid .silk { font-size: 9px; color: var(--ink-3); }
+.rocker-mid .silk { font-size: var(--fs-2xs); color: var(--ink-3); }
 .rocker-val {
   font-size: 28px;
   font-weight: 300;
@@ -396,7 +396,7 @@
 .cluster-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .cluster .key { width: 48px; height: 48px; min-width: 0; min-height: 0; }
 .cluster .key .icon { width: 20px; height: 20px; }
-.cluster .silk { font-size: 8.5px; color: var(--ink-3); letter-spacing: 0.1em; }
+.cluster .silk { font-size: var(--fs-2xs); color: var(--ink-2); letter-spacing: 0.08em; }
 .cluster .key.is-on { color: var(--accent); box-shadow: var(--shadow-key), 0 0 0 1px color-mix(in oklab, var(--accent) 40%, transparent); }
 .cluster .key.is-on .icon { color: var(--accent); }
 
@@ -432,6 +432,10 @@
 
 
 @media (max-height: 720px) and (max-width: 979px) {
+  /* A phone with its browser bars showing: the whole instrument still fits above the tab bar. */
+  .halo { --d: clamp(196px, 33dvh, 300px); }
+  .instrument { padding-top: 2px; padding-bottom: 4px; }
+  .instrument-body { gap: 6px; }
   .rocker { height: 138px; }
   .rocker .rocker-btn { height: 40px; }
   .rocker-val { font-size: 24px; }

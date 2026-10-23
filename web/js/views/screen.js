@@ -47,7 +47,7 @@ export function mountScreen(root, ctx) {
   });
   const save = h('a', { class: 'btn ghost screen-save', href: '/api/screen.png', download: 'tv-screen.png', 'aria-label': 'Save this still' },
     icon('photo', 'sm'), h('span', { text: 'Save still' }));
-  const full = h('button', { class: 'btn ghost', type: 'button', onclick: () => fullscreen() }, icon('aspect', 'sm'), h('span', { text: 'Full screen' }));
+  const full = h('button', { class: 'btn ghost screen-full', type: 'button', 'aria-label': 'Full screen', onclick: () => fullscreen() }, icon('aspect', 'sm'), h('span', { text: 'Full screen' }));
   const connect = h('button', { class: 'btn primary sm', type: 'button', hidden: true, onclick: async () => {
     connect.classList.add('is-pending');
     await ctx.cmd('agent.connect', {}, { el: connect, timeoutMs: 30000 });
@@ -184,10 +184,20 @@ export function mountScreen(root, ctx) {
   setInterval(() => { if (visible()) paintAll(); }, 1000);
 
   // ---- full screen ----
+  // iPhone Safari has no element full screen, so there the frame fills the window instead (tap it or
+  // press Escape to leave).
   function fullscreen() {
-    if (document.fullscreenElement) document.exitFullscreen?.();
-    else frame.requestFullscreen?.().catch(() => {});
+    if (frame.classList.contains('is-immersive')) { immersive(false); return; }
+    if (document.fullscreenElement) { document.exitFullscreen?.(); return; }
+    if (document.fullscreenEnabled && frame.requestFullscreen) frame.requestFullscreen().catch(() => immersive(true));
+    else immersive(true);
   }
+  function immersive(on) {
+    frame.classList.toggle('is-immersive', on);
+  }
+  frame.addEventListener('click', () => { if (frame.classList.contains('is-immersive')) immersive(false); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && frame.classList.contains('is-immersive')) immersive(false); });
+  ctx.on('view', (name) => { if (name !== 'screen') immersive(false); });
 
   paintAll();
 }

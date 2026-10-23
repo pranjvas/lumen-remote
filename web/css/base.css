@@ -145,9 +145,9 @@ img { display: block; }
   grid-area: top;
   display: flex;
   align-items: center;
-  gap: 12px;
-  height: calc(60px + var(--safe-top));
-  padding: var(--safe-top) 16px 0;
+  gap: 10px;
+  height: calc(var(--header-h) + var(--safe-top));
+  padding: var(--safe-top) 12px 0;
   min-width: 0;
 }
 
@@ -233,7 +233,7 @@ img { display: block; }
   color: var(--ink-2);
   transition: background var(--dur-state), color var(--dur-state);
 }
-.icon-btn:hover { background: var(--hair); color: var(--ink); }
+@media (hover: hover) { .icon-btn:hover { background: var(--hair); color: var(--ink); } }
 .icon-btn:active { transform: translateY(1px); }
 .icon-btn.only-desktop { display: none; }
 
@@ -393,6 +393,15 @@ img { display: block; }
 }
 .view-sub { margin: 4px 0 0; color: var(--ink-3); font-size: 13px; }
 
+/* Phones: the tab already names the view, so the heading is a quiet label, not a poster. */
+@media (max-width: 979px) {
+  .view { padding: var(--sp-1) var(--gutter) var(--sp-7); }
+  .view-head { gap: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0 var(--sp-4); align-items: center; }
+  .view-head > div:first-child { flex-basis: 180px; }
+  .view-title { font-size: var(--fs-xl); letter-spacing: -0.02em; }
+  .view-sub { margin-top: 2px; font-size: 12.5px; line-height: 1.4; }
+}
+
 /* ---------- Ask bar ---------- */
 
 .askbar {
@@ -422,6 +431,7 @@ img { display: block; }
   border: 0;
   background: transparent;
   font-size: 14.5px;
+  text-overflow: ellipsis;
 }
 .askbar input::placeholder { color: var(--ink-3); }
 .askbar .kbd { margin-right: 6px; }
@@ -430,7 +440,7 @@ img { display: block; }
   color: var(--accent-ink);
   background: var(--accent);
 }
-.askbar .send:hover { background: color-mix(in oklab, var(--accent) 85%, white); color: var(--accent-ink); }
+@media (hover: hover) { .askbar .send:hover { background: color-mix(in oklab, var(--accent) 85%, white); color: var(--accent-ink); } }
 
 .kbd {
   display: inline-grid;
@@ -452,42 +462,57 @@ img { display: block; }
   grid-area: nav;
   display: flex;
   justify-content: space-around;
-  padding: 4px 8px calc(6px + var(--safe-bottom));
+  padding: 4px 6px calc(4px + var(--safe-bottom));
   border-top: 1px solid var(--hair);
-  background: color-mix(in oklab, var(--chassis) 88%, transparent);
-  -webkit-backdrop-filter: blur(20px);
-  backdrop-filter: blur(20px);
+  background: color-mix(in oklab, var(--chassis) 86%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  backdrop-filter: blur(24px) saturate(150%);
 }
+/* Five destinations plus More: each slot is an equal share, the icon sits on a pill when current. */
 .nav-item {
   position: relative;
+  isolation: isolate;
   display: flex;
+  flex: 1 1 0;
   flex-direction: column;
   align-items: center;
-  gap: 3px;
-  min-width: 56px;
-  padding: 6px 6px 4px;
-  border-radius: 12px;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  height: 50px;
+  padding: 3px 0 2px;
+  border-radius: 14px;
   color: var(--ink-3);
-  font-size: 10.5px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.02em;
   text-decoration: none;
-  transition: color var(--dur-state), background var(--dur-state);
+  -webkit-touch-callout: none;
+  transition: color var(--dur-state), transform var(--dur-press) var(--ease-out);
 }
-.nav-item:hover { color: var(--ink-2); }
+.nav-item > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-item .icon { width: 22px; height: 22px; }
+@media (hover: hover) { .nav-item:hover { color: var(--ink-2); } }
+.nav-item:active { transform: scale(0.94); }
 .nav-item[aria-current="page"] { color: var(--ink); }
-.nav-item[aria-current="page"]::before {
+.nav-item[aria-current="page"] .icon { color: var(--accent); }
+.nav-item::before {
   content: "";
   position: absolute;
-  top: -5px;
+  z-index: -1;
+  top: 2px;
   left: 50%;
-  width: 18px;
-  height: 2px;
-  margin-left: -9px;
-  border-radius: 2px;
-  background: var(--accent);
-  box-shadow: 0 0 10px var(--accent);
+  width: 54px;
+  height: 28px;
+  margin-left: -27px;
+  border-radius: 14px;
+  background: color-mix(in oklab, var(--accent) 17%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 22%, transparent);
+  opacity: 0;
+  transform: scaleX(0.6);
+  transition: opacity var(--dur-state) var(--ease-out), transform var(--dur-panel) var(--ease-out);
 }
+.nav-item[aria-current="page"]::before { opacity: 1; transform: none; }
 .nav-item[data-rank="2"] { display: none; }
 
 /* ---------- Tablet / desktop console ---------- */
@@ -563,16 +588,9 @@ img { display: block; }
     margin-bottom: 14px;
     color: var(--accent);
   }
-  .nav-item { min-width: 0; width: 100%; padding: 10px 4px 8px; font-size: 10.5px; }
-  .nav-item:hover { background: var(--hair); }
-  .nav-item[aria-current="page"] { background: color-mix(in oklab, var(--accent) 10%, transparent); }
-  .nav-item[aria-current="page"]::before {
-    top: 50%;
-    left: -10px;
-    width: 2px;
-    height: 22px;
-    margin: -11px 0 0;
-  }
+  .nav-item { flex: none; min-width: 0; width: 100%; height: auto; padding: 8px 2px 8px; font-size: 10.5px; }
+  @media (hover: hover) { .nav-item:hover { background: var(--hair); } }
+  .nav-item::before { top: 6px; }
   .nav-item[data-rank="2"] { display: flex; }
   .nav-item[data-rank="more"] { display: none; }
 }
@@ -586,27 +604,49 @@ img { display: block; }
   .nav-logo { display: none; }
 }
 
-@media (max-height: 700px) and (max-width: 979px) {
+/* Phones: Lumen AI has one entry per screen, the header Ask pill. The ask bar stays only on the
+   Remote (the home screen) when the phone is tall enough for the whole instrument plus the bar. */
+@media (max-width: 979px) {
+  .app:not([data-view="remote"]) .askbar { display: none; }
+  .askbar { margin: 0 var(--gutter) var(--sp-2); }
+}
+@media (max-height: 759px) and (max-width: 979px) {
   .app[data-view="remote"] .askbar { display: none; }
 }
 
 /* Lumen AI button: in the header on every phone screen (desktop keeps the ask bar in view). */
 .ai-btn {
+  position: relative;
   display: none;
   align-items: center;
   gap: 6px;
-  height: 36px;
-  padding: 0 14px 0 11px;
+  height: 38px;
+  padding: 0 15px 0 12px;
   border-radius: var(--r-pill);
   color: var(--accent-ink, #1a1206);
-  font-weight: 600;
-  font-size: 14px;
-  letter-spacing: 0.01em;
-  background: linear-gradient(135deg, color-mix(in oklab, var(--accent) 92%, white), var(--accent));
-  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 60%, transparent), 0 6px 22px -6px color-mix(in oklab, var(--accent) 70%, transparent);
+  font-weight: 650;
+  font-size: 14.5px;
+  letter-spacing: 0.005em;
+  -webkit-touch-callout: none;
+  background: linear-gradient(135deg, color-mix(in oklab, var(--accent) 88%, white), var(--accent) 60%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 0 1px color-mix(in oklab, var(--accent) 55%, transparent),
+    0 8px 22px -8px color-mix(in oklab, var(--accent) 80%, transparent);
+  transition: transform var(--dur-press) var(--ease-out), box-shadow var(--dur-state);
 }
 .ai-btn .icon { color: currentColor; }
-.ai-btn:active { transform: scale(0.96); }
+.ai-btn:active { transform: scale(0.95); }
+/* A slow shimmer across the pill says "this one is alive" without moving anything else. */
+.ai-btn::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 35%, rgba(255, 255, 255, 0.38) 50%, transparent 65%) -150% 0 / 250% 100% no-repeat;
+  animation: aiSheen 7s var(--ease-io) 1.5s infinite;
+}
+@keyframes aiSheen { 0%, 70% { background-position: -150% 0; } 100% { background-position: 250% 0; } }
+@media (prefers-reduced-motion: reduce) { .ai-btn::after { animation: none; display: none; } }
 @media (max-width: 979px) {
   .ai-btn { display: inline-flex; }
   .app[data-view="ask"] .ai-btn { display: none; }

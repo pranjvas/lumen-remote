@@ -9,18 +9,19 @@ import { reapplyTint, activeTheme } from '../ui/tint.js';
 import { refreshBadges } from '../ui/badge.js';
 import { pairButton, agentButton } from './settings.js';
 
+// Rank 1 = a phone tab (five, plus More); rank 2 = in the phone's More sheet. The desktop rail shows all.
 export const VIEWS = [
   { id: 'remote', label: 'Remote', icon: 'remote', rank: 1 },
   { id: 'screen', label: 'Screen', icon: 'eye', rank: 1 },
   { id: 'apps', label: 'Apps', icon: 'apps', rank: 1 },
-  { id: 'cast', label: 'Cast', icon: 'cast', rank: 1 },
   { id: 'browser', label: 'Browser', icon: 'globe', rank: 1 },
   { id: 'settings', label: 'Settings', icon: 'settings', rank: 1 },
-  { id: 'keys', label: 'Keys', icon: 'numpad', rank: 2 },
-  { id: 'mouse', label: 'Mouse', icon: 'mouse', rank: 1 },
-  { id: 'touch', label: 'Touch', icon: 'touch', rank: 2, title: 'Touch & Text' },
-  { id: 'scenes', label: 'Scenes', icon: 'scenes', rank: 2 },
-  { id: 'ask', label: 'Ask', icon: 'spark', rank: 2, title: 'Ask Lumen' },
+  { id: 'cast', label: 'Cast', icon: 'cast', rank: 2, hint: 'Links and files' },
+  { id: 'mouse', label: 'Mouse', icon: 'mouse', rank: 2, hint: 'TV pointer' },
+  { id: 'touch', label: 'Touch', icon: 'touch', rank: 2, title: 'Touch & Text', hint: 'Swipe and type' },
+  { id: 'keys', label: 'Keys', icon: 'numpad', rank: 2, hint: 'Number pad' },
+  { id: 'scenes', label: 'Scenes', icon: 'scenes', rank: 2, hint: 'Looks and sleep' },
+  { id: 'ask', label: 'Ask', icon: 'spark', rank: 2, title: 'Ask Lumen', hint: 'Chat and skills' },
 ];
 
 /* ---------- Power ---------- */
@@ -246,14 +247,17 @@ function openMore(ctx) {
     title: 'More',
     build(body, sheet) {
       const grid = h('div', { class: 'more-grid' }, VIEWS.filter((v) => v.rank === 2).map((v) =>
-        h('a', { class: 'more-item', href: `#/${v.id}`, onClick: () => sheet.close() }, icon(v.icon, 'lg'), h('span', { text: v.title || v.label }))));
+        h('a', { class: 'more-item', href: `#/${v.id}`, 'aria-current': ctx.viewName === v.id ? 'page' : null, onClick: () => sheet.close() },
+          h('span', { class: 'more-icon' }, icon(v.icon)),
+          h('span', { class: 'more-label', text: v.title || v.label }),
+          v.hint ? h('span', { class: 'more-hint', text: v.hint }) : null)));
       const theme = themeToggle();
       theme.classList.add('more-theme');
       const rows = [h('div', { class: 'more-row' }, h('span', { text: 'Theme' }), theme)];
       if (hapticsSupported()) {
         const sw = h('button', { class: 'switch', type: 'button', role: 'switch', 'aria-checked': hapticsEnabled() ? 'true' : 'false', 'aria-label': 'Vibration' });
         sw.addEventListener('click', () => { setHaptics(!hapticsEnabled()); sw.setAttribute('aria-checked', hapticsEnabled() ? 'true' : 'false'); });
-        rows.push(h('div', { class: 'more-row' }, h('span', { text: 'Vibration on key press' }), sw));
+        rows.push(h('div', { class: 'more-row' }, h('span', { text: 'Haptics on key press' }), sw));
       }
       body.append(grid, ...rows);
     },

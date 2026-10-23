@@ -105,7 +105,30 @@ export function mountSettings(root, ctx) {
         g.note ? h('p', { class: 'section-note', text: g.note }) : null,
         h('div', { class: 'rows card' }, rows));
       sections.push(section);
-      index.append(h('button', { class: 'chip', type: 'button', text: g.short, onClick: () => section.scrollIntoView({ behavior: 'smooth', block: 'start' }) }));
+      const chip = h('button', { class: 'chip', type: 'button', text: g.short, dataset: { section: id }, onClick: () => section.scrollIntoView({ behavior: 'smooth', block: 'start' }) });
+      index.append(chip);
+    }
+
+    // The index follows the reading position: the section at the top lights its chip, and the chip
+    // scrolls into view inside the strip.
+    if ('IntersectionObserver' in window) {
+      const seen = new Map();
+      const io = new IntersectionObserver((entries) => {
+        for (const e of entries) seen.set(e.target.id, e.isIntersecting ? e.boundingClientRect.top : null);
+        const top = sections.filter((s) => s.id && seen.get(s.id) != null).sort((a, b) => seen.get(a.id) - seen.get(b.id))[0];
+        if (!top) return;
+        for (const c of index.children) {
+          const on = c.dataset.section === top.id;
+          if (on && c.getAttribute('aria-current') !== 'true') {
+            const left = c.offsetLeft - (index.clientWidth - c.offsetWidth) / 2;
+            index.scrollTo({ left, behavior: 'smooth' });
+          }
+          if (on) c.setAttribute('aria-current', 'true');
+          else c.removeAttribute('aria-current');
+        }
+      }, { root, rootMargin: '-64px 0px -55% 0px' });
+      for (const s of sections) if (s.id) io.observe(s);
+      scope.own(() => io.disconnect());
     }
 
     if (!ctx.catalog.settings.length) {
