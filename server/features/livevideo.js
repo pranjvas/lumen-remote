@@ -747,6 +747,8 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     publish(state === 'off' ? { state: 'off' } : {
       state, step: step?.name ?? null, codec: step?.codec.family ?? null, bitrate: rate?.bitrate ?? null,
       kbps: first?.kbps ?? null, lagMs: first?.lagMs ?? null, fps: lastStats ? Math.round((lastStats.frames + lastStats.repeats) / 2) : null,
+      // Loudest captured sample over the last 2 s (0..1); 0 for a silent page; null without sound.
+      audioPeak: typeof lastStats?.audioPeak === 'number' ? Math.round(lastStats.audioPeak * 1000) / 1000 : null,
     });
   }
 

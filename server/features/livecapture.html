@@ -21,7 +21,8 @@ let stream = null, vtrack = null, atrack = null;
 let venc = null, aenc = null, cfg = null, encoded = null; // cfg: { codec, width, height, fps, bitrate, gop, format }
 let lastFrame = null, lastEncodeAt = 0, forceKey = true, framesSinceKey = 0, vOffset = null, aOffset = null;
 let repeatTimer = null, statsTimer = null, stopped = false;
-const stats = { frames: 0, repeats: 0, skipped: 0, bytes: 0, captured: 0 };
+const stats = { frames: 0, repeats: 0, skipped: 0, bytes: 0, captured: 0, audioPeak: 0 };
+let audioChunks = 0;
 
 function header(kind, key, ts, data) {
   const out = new Uint8Array(12 + data.byteLength);
@@ -139,6 +140,16 @@ async function audioLoop() {
       } catch (e) { fail('audio configure', e); aenc = null; }
     }
     if (aOffset === null) aOffset = nowUs() - data.timestamp;
+    // The loudest sample now and then (1 in 10 chunks): tells a silent page from a lost sound.
+    if (audioChunks++ % 10 === 0 && /^f32/.test(data.format || '')) {
+      try {
+        const pcm = new Float32Array(data.allocationSize({ planeIndex: 0 }) / 4);
+        data.copyTo(pcm, { planeIndex: 0 });
+        let peak = 0;
+        for (let i = 0; i < pcm.length; i++) { const x = Math.abs(pcm[i]); if (x > peak) peak = x; }
+        stats.audioPeak = Math.max(stats.audioPeak, peak);
+      } catch (e) { /* level unknown */ }
+    }
     if (aenc && aenc.state === 'configured') {
       try { aenc.encode(data); } catch (e) { fail('audio encode', e); }
     }
@@ -164,7 +175,7 @@ window.lumenStart = async function (opts) {
   repeatTimer = setInterval(repeatTick, Math.max(5, Math.round(1000 / (opts.fps || 60))));
   statsTimer = setInterval(() => {
     sendJson({ t: 'stats', ...stats, queue: venc ? venc.encodeQueueSize : null, buffered: ws.bufferedAmount, settings: vtrack ? vtrack.getSettings() : null });
-    stats.frames = stats.repeats = stats.skipped = stats.bytes = stats.captured = 0;
+    stats.frames = stats.repeats = stats.skipped = stats.bytes = stats.captured = stats.audioPeak = 0;
   }, 2000);
   const s = vtrack.getSettings();
   return { width: s.width, height: s.height, frameRate: s.frameRate, audio: !!atrack };
