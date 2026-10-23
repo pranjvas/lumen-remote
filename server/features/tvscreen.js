@@ -102,6 +102,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       else if (msg.pointer) enqueue(() => onPointer(msg.pointer, msg.click === true));
     } else if (msg.t === 'screen-video') {
       store.set('tvscreen.video', typeof msg.state === 'string' ? msg.state.slice(0, 20) : null, { src: 'derived', via: 'tvscreen' });
+      if (msg.state !== 'paused') log.info('TV player', { state: String(msg.state).slice(0, 20), mode: typeof msg.mode === 'string' ? msg.mode.slice(0, 10) : null, note: msg.state === 'error' ? null : String(msg.error ?? '').slice(0, 120) || null });
       if (msg.state === 'error') {
         log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 200), stage: current?.stage ?? null });
         enqueue(() => fallback(String(msg.error ?? '')));
@@ -178,7 +179,14 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const pick = await pickMedia(explicit);
     if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
-    const { url } = relay().register(pick.url, pick.headers);
+    const { url, token } = relay().register(pick.url, pick.headers);
+    // HLS with fragmented-MP4 segments never plays in the TV's own player (CineHD found the same), so
+    // the agent goes straight to its in-page hls.js player for it.
+    const probe = pick.kind === 'hls' && relay().probeHls
+      ? await Promise.race([relay().probeHls(token).catch(() => null), new Promise((r) => setTimeout(r, 6000, null))])
+      : null;
+    if (probe?.drm) return playProtected(pick);
+    const engine = probe?.fmp4 ? 'hls' : 'avplay';
     if (!on) await open();
     const tc = transcoder();
     const known = tc?.existing?.(pick.url);
@@ -190,14 +198,52 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       await fallback(known ? 'converted before' : 'conversion requested');
       return { value: { kind: pick.kind, title: current.title, converted: true } };
     }
-    adapter.sendScreen({ t: 'screen-play', url, title: current.title });
-    log.info('video handed to the TV player', { kind: pick.kind, host: new URL(pick.url).hostname });
+    adapter.sendScreen({ t: 'screen-play', url, title: current.title, engine });
+    log.info('video handed to the TV player', { kind: pick.kind, engine, host: new URL(pick.url).hostname });
     return { value: { kind: pick.kind, title: store.get('browser.title')?.v ?? null } };
+  }
+
+  // DRM-protected video plays through the TV's own certified DRM (PlayReady / Widevine via EME in the
+  // agent's hls.js): the site's licence server decides, and the keys stay inside the TV. Lumen relays
+  // the CENC stream and the licence requests with the page's headers. The licence servers come from
+  // the page's player config (Vimeo's playerConfig today).
+  const DRM_SCRIPT = `(() => {
+    const r = window.playerConfig && window.playerConfig.request;
+    if (!r || !r.drm || !r.drm.cdms || !r.files || !r.files.hls_cenc) return null;
+    const f = r.files.hls_cenc, cdns = f.cdns || {};
+    const cdn = cdns[f.default_cdn] || Object.values(cdns)[0];
+    const lic = (k) => (r.drm.cdms[k] && r.drm.cdms[k].license_url) || null;
+    const wv = r.drm.cdms.widevine;
+    return { stream: cdn && cdn.url || null, playready: lic('playready'), widevine: lic('widevine'), widevineCert: wv && typeof wv.certificate === 'string' ? wv.certificate : null };
+  })()`;
+
+  async function playProtected(pick) {
+    const info = await b().evaluate(DRM_SCRIPT).catch(() => null);
+    if (!info?.stream || !(info.playready || info.widevine)) {
+      throw new LumenError('UNAVAILABLE', 'This video is DRM-protected and Lumen could not find its licence server on this page');
+    }
+    const { url } = relay().register(info.stream, pick.headers);
+    const drm = {};
+    if (info.playready) drm['com.microsoft.playready'] = { licenseUrl: relay().register(info.playready, { ...pick.headers, licence: 'resolve' }).url };
+    if (info.widevine) {
+      // Widevine first asks for the licence server's (public) service certificate; the page carries it.
+      const cert = /^[A-Za-z0-9+/=]{16,8192}$/.test(info.widevineCert ?? '') ? Buffer.from(info.widevineCert, 'base64') : null;
+      drm['com.widevine.alpha'] = {
+        licenseUrl: relay().register(info.widevine, { ...pick.headers, licence: 'resolve' }).url,
+        ...(cert && relay().registerBlob && { serverCertificateUrl: relay().registerBlob(cert).url }),
+      };
+    }
+    if (!on) await open();
+    current = { pick, title: store.get('browser.title')?.v ?? '', stage: 'drm', job: null };
+    a().sendScreen({ t: 'screen-play', url, title: current.title, engine: 'hls', drm });
+    log.info('protected video handed to the TV player', { host: new URL(info.stream).hostname, systems: Object.keys(drm) });
+    return { value: { kind: 'hls', drm: Object.keys(drm), title: current.title } };
   }
 
   // The TV's player refused the stream: re-package it (copy) on this PC, then fully convert it.
   async function fallback(error) {
     if (!current || !on) return;
+    if (current.stage === 'drm') { toast('The TV could not get a licence for this protected video'); return; }
     const next = current.stage === 'direct' ? 'copy' : current.stage === 'copy' ? 'encode' : null;
     const tc = transcoder();
     if (!next || !tc?.available()) {

@@ -1,4 +1,4 @@
-// Lumen Eyes: a windowless Tizen .NET app that lets Lumen see the TV screen. The Lumen TV agent
+﻿// Lumen Eyes: a windowless Tizen .NET app that lets Lumen see the TV screen. The Lumen TV agent
 // launches it with app-control extra "lumen" = ws://<pc>:<port>/eyes?key=<key>; it dials out to that
 // WebSocket and answers capture requests with one still each. Stills come from libdisplay-capture-api's
 // ppicapture() (in-process: libvideo-capture → DRM ioctl on /dev/dri/card1); mode 0 is the composited
@@ -29,7 +29,7 @@ namespace LumenEyes
 
     class App : CoreUIApplication
     {
-        const string Version = "0.3.0";
+        const string Version = "0.3.1";
         const int BufSize = 0x7e900;              // the library's own buffer size; frames come back at 720x540
         const int GiveUpAfterMs = 10 * 60 * 1000; // exit when Lumen has been unreachable this long
         static readonly Regex LumenUrl = new Regex(@"^ws://[0-9.]{7,15}:\d{1,5}/eyes\?key=[0-9a-f]{16,128}$");
@@ -37,6 +37,9 @@ namespace LumenEyes
         readonly object gate = new object();
         string url;
         CancellationTokenSource current;
+        // True while a connection to Lumen is open; a launch while not linked reconnects at once
+        // instead of waiting out the backoff.
+        volatile bool linked;
         IntPtr data, ybuf, cbuf;
 
         protected override void OnCreate()
@@ -55,7 +58,7 @@ namespace LumenEyes
             if (next == null || !LumenUrl.IsMatch(next)) return;
             lock (gate)
             {
-                if (next == url && current != null && !current.IsCancellationRequested) return;
+                if (next == url && current != null && !current.IsCancellationRequested && linked) return;
                 current?.Cancel();
                 url = next;
                 current = new CancellationTokenSource();
@@ -78,6 +81,7 @@ namespace LumenEyes
                         await ws.ConnectAsync(new Uri(target), token);
                         backoffMs = 1000;
                         lastSeen = DateTime.UtcNow;
+                        linked = true;
                         await SendText(ws, "{\"t\":\"hello\",\"version\":\"" + Version + "\"}", token);
                         var buffer = new byte[4096];
                         while (ws.State == WebSocketState.Open && !token.IsCancellationRequested)
@@ -100,8 +104,9 @@ namespace LumenEyes
                         }
                     }
                 }
-                catch (OperationCanceledException) { return; }
+                catch (OperationCanceledException) { linked = false; return; }
                 catch (Exception) { }
+                linked = false;
                 if ((DateTime.UtcNow - lastSeen).TotalMilliseconds > GiveUpAfterMs) { Exit(); return; }
                 try { await Task.Delay(backoffMs, token); } catch (OperationCanceledException) { return; }
                 backoffMs = Math.Min(backoffMs * 2, 30000);

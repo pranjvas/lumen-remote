@@ -1,7 +1,9 @@
 // Lumen Agent: the "Lumen browser on TV" screen. The page is rendered on the PC (Lumen's own
 // browser, behind the VPN when it is on) and arrives here as JPEG frames over the agent socket; the
 // TV remote drives it (keys go back to the PC). Videos the page plays can be handed to the TV's own
-// player (AVPlay) through Lumen's relay: full quality with sound.
+// player (AVPlay) through Lumen's relay: full quality with sound. When AVPlay refuses a stream (clear
+// fMP4 HLS is the usual case on this TV), hls.js on a <video> element takes over (up to 1080p,
+// H.264/AAC), then a plain <video>: the order CineHD's media engine uses.
 // Runs on Chromium M69, so the syntax stays within ES2017.
 (function () {
   'use strict';
@@ -33,6 +35,8 @@
   const hint = document.getElementById('hint');
   const toastEl = document.getElementById('toast');
   const player = document.getElementById('av');
+  const mse = document.getElementById('mse');
+  let hls = null;
 
   function read(fn, fallback) {
     try { const v = fn(); return v === undefined ? fallback : v; } catch (e) { return fallback; }
@@ -103,12 +107,15 @@
 
   // ---- the TV's own video player ----
 
-  function playVideo(url, title, fromStart) {
+  function playVideo(url, title, fromStart, engine, drm) {
     stopVideo(false);
-    video = { url: url, title: title || '', state: 'loading' };
+    video = { url: url, title: title || '', state: 'loading', mode: 'avplay', drm: drm || null };
+    const mine = video;
     root.className = 'screen video';
     document.body.classList.add('video');
     showHint((title ? title + ' · ' : '') + 'OK play/pause · ◀ ▶ 10 s · Back returns to the page', 7000);
+    // Lumen found a format the TV's player does not take (fragmented-MP4 HLS): skip it.
+    if (engine === 'hls') return refused(drm ? 'DRM-protected HLS' : 'fragmented-MP4 HLS');
     let stage = 'webapis';
     try {
       if (typeof webapis === 'undefined' || !webapis.avplay) throw new Error('webapis.avplay is missing');
@@ -120,7 +127,7 @@
       webapis.avplay.setListener({
         onbufferingcomplete: function () { report('playing'); },
         onstreamcompleted: function () { report('ended'); stopVideo(true); },
-        onerror: function (err) { report('error', 'onerror: ' + String(err)); toast('The TV could not play this video'); stopVideo(true); },
+        onerror: function (err) { refused('onerror: ' + String(err)); },
         oncurrentplaytime: function () {},
       });
       stage = 'prepareAsync';
@@ -130,30 +137,114 @@
         // A stream Lumen is still converting grows while it plays, so the player joins at its live
         // end; go back to the start once playback is running.
         if (fromStart) setTimeout(function () { read(function () { webapis.avplay.seekTo(0); }); }, 1200);
+        // AVPlay sometimes "plays" a stream it cannot decode, with a black screen and a clock that never
+        // moves; treat that as a refusal.
+        setTimeout(function () {
+          if (video !== mine || mine.mode !== 'avplay') return;
+          const t = read(function () { return webapis.avplay.getCurrentTime(); }, 0);
+          const state = read(function () { return webapis.avplay.getState(); }, '');
+          if (state === 'PLAYING' && !(t > 0)) refused('AVPlay did not start (clock at ' + t + ')');
+        }, 10000);
       }, function (err) {
-        report('error', 'prepare: ' + String(err && (err.name + ' ' + (err.message || '')) || err));
-        toast('The TV could not play this video');
-        stopVideo(true);
+        refused('prepare: ' + String(err && (err.name + ' ' + (err.message || '')) || err));
       });
     } catch (e) {
-      report('error', stage + ': ' + String(e && (e.name + ' ' + (e.message || '')) || e));
-      toast('The TV player is not available');
-      stopVideo(true);
+      refused(stage + ': ' + String(e && (e.name + ' ' + (e.message || '')) || e));
     }
+  }
+
+  // ---- fallback: hls.js / <video> in this page (CineHD's order: AVPlay, hls.js MSE, plain video) ----
+
+  function refused(reason) {
+    if (!video) return;
+    if (video.mode !== 'avplay') return failed(reason);
+    read(function () { webapis.avplay.stop(); });
+    read(function () { webapis.avplay.close(); });
+    send({ t: 'screen-video', state: 'fallback', error: reason });
+    const url = video.url;
+    const isHls = /\.m3u8|\/relay\/x\//i.test(url) || /mpegurl/i.test(url);
+    if (isHls && window.Hls && window.Hls.isSupported()) return playHls(url, reason, video.drm);
+    if (mse.canPlayType('video/mp4')) return playVideoElement(url, reason);
+    failed(reason);
+  }
+
+  function failed(reason) {
+    report('error', reason);
+    toast('The TV could not play this video');
+    stopVideo(true);
+  }
+
+  function useMse(mode) {
+    video.mode = mode;
+    root.className = 'screen video mse';
+    mse.style.display = 'block';
+    mse.onplaying = function () { report('playing'); };
+    mse.onpause = function () { if (video) report('paused'); };
+    mse.onended = function () { report('ended'); stopVideo(true); };
+    mse.onerror = function () { failed(mode + ': ' + String(mse.error && mse.error.code)); };
+  }
+
+  // drm: { keySystem: licence URL } (Lumen relays the licence request to the site's licence server);
+  // the TV's own DRM module (PlayReady / Widevine, through EME) decrypts.
+  function playHls(url, reason, drm) {
+    useMse('hls');
+    const config = { enableWorker: false, maxBufferLength: 20, maxMaxBufferLength: 30, maxBufferSize: 16 * 1024 * 1024, capLevelToPlayerSize: false };
+    if (drm) {
+      config.emeEnabled = true;
+      config.drmSystems = {};
+      Object.keys(drm).forEach(function (k) {
+        const d = drm[k] || {};
+        config.drmSystems[k] = { licenseUrl: String(d.licenseUrl || '') };
+        if (d.serverCertificateUrl) config.drmSystems[k].serverCertificateUrl = String(d.serverCertificateUrl);
+      });
+    }
+    hls = new window.Hls(config);
+    hls.on(window.Hls.Events.MANIFEST_PARSED, function (ev, data) {
+      // This TV's MSE path plays up to 1080p.
+      let cap = -1;
+      (data.levels || []).forEach(function (l, i) { if (!l.height || l.height <= 1080) cap = i; });
+      if (cap >= 0) hls.autoLevelCapping = cap;
+      mse.play().catch(function () {});
+    });
+    hls.on(window.Hls.Events.ERROR, function (ev, data) {
+      if (!data || !data.fatal) return;
+      if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
+      failed('hls: ' + data.type + ' ' + data.details + (data.error && data.error.message ? ' (' + String(data.error.message).slice(0, 120) + ')' : '') + (data.response && data.response.code ? ' http ' + data.response.code : ''));
+    });
+    hls.loadSource(url);
+    hls.attachMedia(mse);
+    send({ t: 'screen-video', state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using hls.js' });
+  }
+
+  function playVideoElement(url, reason) {
+    useMse('video');
+    mse.src = url;
+    mse.play().catch(function () {});
+    send({ t: 'screen-video', state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using <video>' });
   }
 
   function report(state, error) {
     if (!video) return;
     video.state = state;
-    send({ t: 'screen-video', state: state, error: error || null,
-      position: read(function () { return webapis.avplay.getCurrentTime(); }, null),
-      duration: read(function () { return webapis.avplay.getDuration(); }, null) });
+    const inPage = video.mode !== 'avplay';
+    send({ t: 'screen-video', state: state, error: error || null, mode: video.mode,
+      position: inPage ? Math.round(mse.currentTime * 1000) : read(function () { return webapis.avplay.getCurrentTime(); }, null),
+      duration: inPage ? Math.round((mse.duration || 0) * 1000) : read(function () { return webapis.avplay.getDuration(); }, null) });
   }
 
   function stopVideo(backToPage) {
     if (!video) return;
-    read(function () { webapis.avplay.stop(); });
-    read(function () { webapis.avplay.close(); });
+    if (video.mode === 'avplay') {
+      read(function () { webapis.avplay.stop(); });
+      read(function () { webapis.avplay.close(); });
+    } else {
+      if (hls) { read(function () { hls.destroy(); }); hls = null; }
+      mse.onplaying = mse.onpause = mse.onended = mse.onerror = null;
+      read(function () { mse.pause(); });
+      mse.removeAttribute('src');
+      read(function () { mse.load(); });
+      mse.style.display = 'none';
+    }
     send({ t: 'screen-video', state: 'stopped' });
     video = null;
     document.body.classList.remove('video');
@@ -162,6 +253,16 @@
   }
 
   function videoKey(key) {
+    if (video.mode !== 'avplay') {
+      if (key === 'back' || key === 'stop') return stopVideo(true);
+      if (key === 'enter' || key === 'playpause' || key === 'play' || key === 'pause') {
+        if (!mse.paused && key !== 'play') mse.pause(); else mse.play().catch(function () {});
+        return undefined;
+      }
+      if (key === 'left' || key === 'rewind') { mse.currentTime = Math.max(0, mse.currentTime - SEEK_MS / 1000); return undefined; }
+      if (key === 'right' || key === 'ff') { mse.currentTime = mse.currentTime + SEEK_MS / 1000; return undefined; }
+      return undefined;
+    }
     const state = read(function () { return webapis.avplay.getState(); }, '');
     if (key === 'back' || key === 'stop') return stopVideo(true);
     if (key === 'enter' || key === 'playpause' || key === 'play' || key === 'pause') {
@@ -201,7 +302,7 @@
         cursor.style.transform = 'translate(' + Math.round(msg.x * 1920) + 'px,' + Math.round(msg.y * 1080) + 'px)';
         cursor.style.display = msg.visible === false ? 'none' : 'block';
       } else if (msg.t === 'screen-play') {
-        playVideo(msg.url, msg.title, msg.fromStart === true);
+        playVideo(msg.url, msg.title, msg.fromStart === true, msg.engine, msg.drm && typeof msg.drm === 'object' ? msg.drm : null);
       } else if (msg.t === 'screen-toast') {
         toast(String(msg.text || '').slice(0, 140));
       }

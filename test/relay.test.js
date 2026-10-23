@@ -44,6 +44,54 @@ describe('relay', () => {
       upstream.close();
     }
   });
+
+  test('CORS for the in-page player, HLS probe (fMP4, DRM), licence POSTs only where allowed, resolved per request, and blobs', async () => {
+    const seen = [];
+    const upstream = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => { body += d; });
+      req.on('end', () => {
+        seen.push({ method: req.method, url: req.url, body });
+        if (req.url === '/v/master.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia.m3u8\n'); return; }
+        if (req.url === '/v/media.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end('#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,AA=="\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:6,\nseg.m4s\n#EXT-X-ENDLIST\n'); return; }
+        if (req.url === '/lic/la') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ licenseAcquisitionUrl: `http://127.0.0.1:${upstream.address().port}/lic/server`, token: 't 1' })); return; }
+        if (req.url.startsWith('/lic/server')) { res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(`licence for ${body}`); return; }
+        res.writeHead(404); res.end();
+      });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    let handler;
+    const front = http.createServer((req, res) => handler(req, res));
+    await new Promise((r) => front.listen(0, '127.0.0.1', r));
+    const lan = { address: '127.0.0.1', port: front.address().port, route: (prefix, { request }) => { handler = request; return () => {}; } };
+    const relay = createRelay({ log: createTestLog(), lan });
+    relay.start();
+    const up = `http://127.0.0.1:${upstream.address().port}`;
+    try {
+      const stream = relay.register(`${up}/v/master.m3u8`, { referer: 'https://site.example/' });
+      const master = await fetch(stream.url);
+      assert.equal(master.headers.get('access-control-allow-origin'), '*');
+      const pre = await fetch(stream.url, { method: 'OPTIONS', headers: { 'access-control-request-headers': 'range' } });
+      assert.equal(pre.status, 204);
+      assert.match(pre.headers.get('access-control-allow-methods'), /POST/);
+      assert.deepEqual(await relay.probeHls(stream.token), { fmp4: true, endlist: true, drm: true });
+      // A stream token never accepts POSTs.
+      assert.equal((await fetch(stream.url, { method: 'POST', body: 'x' })).status, 404);
+      // A licence token resolves the real licence server, then forwards the challenge there.
+      const lic = relay.register(`${up}/lic/la`, { referer: 'https://site.example/', licence: 'resolve' });
+      const reply = await fetch(lic.url, { method: 'POST', body: 'challenge' });
+      assert.equal(reply.status, 200);
+      assert.equal(await reply.text(), 'licence for challenge');
+      assert.ok(seen.some((s) => s.method === 'GET' && s.url === '/lic/la'));
+      assert.ok(seen.some((s) => s.method === 'POST' && s.url === '/lic/server?ExpressPlayToken=t%201'));
+      const blob = relay.registerBlob(Buffer.from([1, 2, 3]));
+      assert.deepEqual([...Buffer.from(await (await fetch(blob.url)).arrayBuffer())], [1, 2, 3]);
+    } finally {
+      relay.stop();
+      front.close();
+      upstream.close();
+    }
+  });
 });
 
 describe('transcode', () => {

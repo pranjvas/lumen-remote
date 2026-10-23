@@ -14,9 +14,12 @@ const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_SESSIONS = 20;
 const MAX_PLAYLIST_BYTES = 4 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
+const MAX_LICENCE_BYTES = 256 * 1024;
 const TIMEOUT_MS = 20000;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0';
 const PASS_REQUEST = ['range', 'accept', 'accept-encoding', 'if-range'];
+// The agent's in-page player (hls.js) fetches from a different origin than the app page.
+const CORS = { 'access-control-allow-origin': '*', 'access-control-expose-headers': 'content-length, content-range, accept-ranges' };
 const PASS_RESPONSE = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag', 'cache-control'];
 
 const b64url = (s) => Buffer.from(s, 'utf8').toString('base64url');
@@ -35,8 +38,8 @@ function webUrl(raw, base) {
   }
 }
 
-/** One upstream GET/HEAD, through an HTTP CONNECT proxy when proxyUrl is set. → IncomingMessage */
-export function requestUpstream(target, { method = 'GET', headers = {}, proxyUrl = null, timeoutMs = TIMEOUT_MS } = {}) {
+/** One upstream request (GET/HEAD, or POST with `body`), through an HTTP CONNECT proxy when proxyUrl is set. → IncomingMessage */
+export function requestUpstream(target, { method = 'GET', headers = {}, proxyUrl = null, timeoutMs = TIMEOUT_MS, body = null } = {}) {
   const url = new URL(target);
   const secure = url.protocol === 'https:';
   const port = Number(url.port) || (secure ? 443 : 80);
@@ -50,7 +53,7 @@ export function requestUpstream(target, { method = 'GET', headers = {}, proxyUrl
       req.on('response', resolve);
       req.on('timeout', () => req.destroy(new Error('timed out')));
       req.on('error', fail);
-      req.end();
+      req.end(body ?? undefined);
     };
     if (!proxyUrl) return send(null);
     const proxy = new URL(proxyUrl);
@@ -60,7 +63,7 @@ export function requestUpstream(target, { method = 'GET', headers = {}, proxyUrl
       req.on('response', resolve);
       req.on('timeout', () => req.destroy(new Error('timed out')));
       req.on('error', fail);
-      req.end();
+      req.end(body ?? undefined);
       return;
     }
     const connect = http.request({ host: proxy.hostname, port: proxy.port, method: 'CONNECT', path: `${url.hostname}:${port}`, headers: { host: `${url.hostname}:${port}` }, agent: false, timeout: timeoutMs });
@@ -127,6 +130,7 @@ export function rewritePlaylist(text, base, toRelay) {
 export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = () => null }) {
   const log = rootLog.child('relay');
   const sessions = new Map(); // token → { referer, origin, userAgent, at }
+  const blobs = new Map(); // token → { body, type, at }: small public files Lumen hands the TV (a DRM service certificate)
   let unroute = null;
 
   function prune() {
@@ -146,55 +150,152 @@ export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = 
   }
 
   /** A relay URL for `target` the TV can fetch; referer/userAgent are sent upstream. */
-  function register(target, { referer = null, origin = null, cookie = null, userAgent = null } = {}) {
+  // licence: true lets the TV POST to exactly this URL (a DRM licence server: the TV's own DRM module
+  // makes the request, Lumen only adds the page's headers and carries it through the VPN).
+  // licence: 'resolve' means the URL first answers a GET with the real licence-server URL (Vimeo:
+  // JSON { licenseAcquisitionUrl, token } for ExpressPlay, or the URL as text), fetched per request.
+  function register(target, { referer = null, origin = null, cookie = null, userAgent = null, licence = false } = {}) {
     const url = webUrl(target);
     if (!url) throw new LumenError('INVALID', 'Only http(s) streams can be relayed');
     prune();
     const token = randomBytes(16).toString('hex');
     const ref = referer ? webUrl(referer) : null;
     sessions.set(token, {
-      referer: ref?.href ?? null, origin: origin ?? ref?.origin ?? null, userAgent: userAgent || UA, at: Date.now(),
-      cookie: typeof cookie === 'string' && cookie.length < 8192 ? cookie : null, cookieSite: siteOf(url.hostname),
+      target: url.href, referer: ref?.href ?? null, origin: origin ?? ref?.origin ?? null, userAgent: userAgent || UA, at: Date.now(),
+      cookie: typeof cookie === 'string' && cookie.length < 8192 ? cookie : null, cookieSite: siteOf(url.hostname), licence: licence === true || licence === 'resolve' ? licence : false,
     });
     return { token, url: relayUrl(token, url.href) };
+  }
+
+  function upstreamHeaders(session, target) {
+    const headers = { 'user-agent': session.userAgent, ...(session.referer && { referer: session.referer }), ...(session.origin && { origin: session.origin }) };
+    // The page's cookies go only to the site that set them, never to other hosts in the playlist.
+    if (session.cookie && siteOf(target.hostname) === session.cookieSite) headers.cookie = session.cookie;
+    return headers;
+  }
+
+  async function fetchPlaylist(session, target) {
+    const { res, url } = await fetchFollow(target, { headers: { ...upstreamHeaders(session, new URL(target)), 'accept-encoding': 'identity' }, proxyUrl: vpn()?.proxyUrl?.() ?? null, timeoutMs: 8000 });
+    if (res.statusCode !== 200) { res.resume(); throw new LumenError('FAILED', `The playlist answered ${res.statusCode}`); }
+    return { text: (await readBody(res, MAX_PLAYLIST_BYTES)).toString('utf8'), url };
+  }
+
+  /**
+   * What kind of HLS a registered stream is: { fmp4 } is true when its media playlist uses
+   * fragmented MP4 segments (EXT-X-MAP), which the TV's own player does not play.
+   * { drm } is true for DRM-encrypted (SAMPLE-AES) streams.
+   */
+  async function probeHls(token) {
+    const session = sessions.get(token);
+    if (!session?.target) throw new LumenError('NOT_FOUND', 'Unknown stream');
+    let { text, url } = await fetchPlaylist(session, session.target);
+    const variant = /#EXT-X-STREAM-INF/.test(text) ? text.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith('#')) : null;
+    if (variant) ({ text, url } = await fetchPlaylist(session, new URL(variant, url).href));
+    // SAMPLE-AES (FairPlay, Widevine, PlayReady): only a licensed DRM player can decrypt it.
+    const drm = /#EXT-X-(SESSION-)?KEY:METHOD=SAMPLE-AES/.test(text);
+    return { fmp4: /#EXT-X-MAP/.test(text), endlist: /#EXT-X-ENDLIST/.test(text), drm };
+  }
+
+  /** A relay URL serving `body` (a Buffer) as `type`. */
+  function registerBlob(body, type = 'application/octet-stream') {
+    const token = randomBytes(16).toString('hex');
+    blobs.set(token, { body, type, at: Date.now() });
+    while (blobs.size > MAX_SESSIONS) blobs.delete(blobs.keys().next().value);
+    return { token, url: `${base()}/b/${token}` };
   }
 
   // /relay/x/<job>/<file>: HLS written by the transcoder (features/transcode.js).
   function serveConverted(req, res, job, name) {
     const file = transcoder()?.file(job, name);
     if (name.endsWith('.m3u8')) log.debug('converted playlist requested', { job, found: Boolean(file) });
-    if (!file) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
+    if (!file) { res.writeHead(404, { ...CORS, 'content-type': 'text/plain' }); res.end('not found'); return; }
     const playlist = name.endsWith('.m3u8');
     if (playlist) {
       // The playlist grows while ffmpeg works, so players treat it as live and join near the end;
       // EXT-X-START tells them to start at the beginning.
       const text = fs.readFileSync(file, 'utf8').replace(/^#EXTM3U\r?\n/, '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n');
       const body = Buffer.from(text, 'utf8');
-      res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
+      res.writeHead(200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
       res.end(req.method === 'HEAD' ? undefined : body);
       return;
     }
     const size = fs.statSync(file).size;
-    res.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
+    res.writeHead(200, { ...CORS, 'content-type': 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(file).pipe(res);
   }
 
+  async function resolveLicenceServer(session, target, proxyUrl) {
+    const { res, url } = await fetchFollow(target.href, { headers: { ...upstreamHeaders(session, target), 'accept-encoding': 'identity' }, proxyUrl, timeoutMs: 10000 });
+    const text = (await readBody(res, 64 * 1024)).toString('utf8').trim();
+    if (res.statusCode !== 200) throw new LumenError('FAILED', `The licence URL request answered ${res.statusCode}`);
+    let next = null;
+    try {
+      const j = JSON.parse(text);
+      if (j?.licenseAcquisitionUrl && j?.token) next = webUrl(`${j.licenseAcquisitionUrl}?ExpressPlayToken=${encodeURIComponent(j.token)}`);
+    } catch { /* plain URL */ }
+    next ??= webUrl(text, url);
+    if (!next) throw new LumenError('FAILED', 'The licence URL request returned no URL');
+    return next;
+  }
+
+  async function relayLicence(req, res, session, target) {
+    session.at = Date.now();
+    let body;
+    try {
+      body = await readBody(req, MAX_LICENCE_BYTES);
+    } catch {
+      res.writeHead(413, { ...CORS, 'content-type': 'text/plain' });
+      res.end('too large');
+      return;
+    }
+    const proxyUrl = vpn()?.proxyUrl?.() ?? null;
+    try {
+      let server = target;
+      if (session.licence === 'resolve') server = await resolveLicenceServer(session, target, proxyUrl);
+      const headers = { ...upstreamHeaders(session, server), 'content-length': String(body.length), 'accept-encoding': 'identity' };
+      for (const name of ['content-type', 'soapaction', 'accept']) if (req.headers[name]) headers[name] = req.headers[name];
+      const up = await requestUpstream(server.href, { method: 'POST', headers, body, proxyUrl });
+      const reply = await readBody(up, MAX_LICENCE_BYTES);
+      log.info('licence request', { host: server.hostname, status: up.statusCode, sent: body.length, received: reply.length });
+      if (up.statusCode >= 400) {
+        log.warn('licence server refused', { status: up.statusCode, type: up.headers['content-type'] ?? null, sentType: headers['content-type'] ?? null, reply: reply.toString('utf8').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 300) });
+      }
+      res.writeHead(up.statusCode, { ...CORS, 'content-type': up.headers['content-type'] ?? 'application/octet-stream', 'content-length': reply.length });
+      res.end(reply);
+    } catch (err) {
+      log.warn('licence request failed', { host: target.hostname, message: err.message });
+      res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
+      res.end('licence server failed');
+    }
+  }
+
   async function onRequest(req, res) {
+    if (req.method === 'OPTIONS') {
+      const asked = String(req.headers['access-control-request-headers'] ?? '').slice(0, 300).replace(/[^\w, -]/g, '');
+      res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET, HEAD, POST', 'access-control-allow-headers': asked || 'range, if-range', 'access-control-max-age': '600' });
+      res.end();
+      return;
+    }
     const parts = new URL(req.url, 'http://relay.invalid').pathname.split('/').filter(Boolean); // relay, token, target, name
     if (parts[1] === 'x' && parts.length === 4) return serveConverted(req, res, parts[2], parts[3]);
+    if (parts[1] === 'b' && parts.length === 3 && blobs.has(parts[2])) {
+      const blob = blobs.get(parts[2]);
+      res.writeHead(200, { ...CORS, 'content-type': blob.type, 'content-length': blob.body.length });
+      res.end(req.method === 'HEAD' ? undefined : blob.body);
+      return;
+    }
     const session = sessions.get(parts[1]);
     const target = parts[2] ? webUrl((() => { try { return unb64url(parts[2]); } catch { return ''; } })()) : null;
+    if (session && target && req.method === 'POST' && session.licence && target.href === session.target) return relayLicence(req, res, session, target);
     if (!session || !target || (req.method !== 'GET' && req.method !== 'HEAD')) {
-      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.writeHead(404, { ...CORS, 'content-type': 'text/plain' });
       res.end('not found');
       return;
     }
     session.at = Date.now();
     log.info('relay request', { host: target.hostname, method: req.method, range: req.headers.range ?? null });
-    const headers = { 'user-agent': session.userAgent, ...(session.referer && { referer: session.referer }), ...(session.origin && { origin: session.origin }) };
-    // The page's cookies go only to the site that set them, never to other hosts in the playlist.
-    if (session.cookie && siteOf(target.hostname) === session.cookieSite) headers.cookie = session.cookie;
+    const headers = upstreamHeaders(session, target);
     for (const name of PASS_REQUEST) if (req.headers[name] && name !== 'accept-encoding') headers[name] = req.headers[name];
     headers['accept-encoding'] = 'identity';
     let upstream;
@@ -202,7 +303,7 @@ export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = 
       upstream = await fetchFollow(target.href, { method: req.method, headers, proxyUrl: vpn()?.proxyUrl?.() ?? null });
     } catch (err) {
       log.warn('relay fetch failed', { host: target.hostname, message: err.message });
-      res.writeHead(502, { 'content-type': 'text/plain' });
+      res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
       res.end('upstream failed');
       return;
     }
@@ -212,17 +313,17 @@ export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = 
       try {
         const text = (await readBody(up, MAX_PLAYLIST_BYTES)).toString('utf8');
         const body = Buffer.from(rewritePlaylist(text, finalUrl, (abs) => relayUrl(parts[1], abs)), 'utf8');
-        res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
+        res.writeHead(200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
         res.end(body);
       } catch (err) {
-        res.writeHead(502, { 'content-type': 'text/plain' });
+        res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
         res.end(err.message);
       }
       return;
     }
     const out = {};
     for (const name of PASS_RESPONSE) if (up.headers[name]) out[name] = up.headers[name];
-    res.writeHead(up.statusCode, out);
+    res.writeHead(up.statusCode, { ...CORS, ...out });
     if (req.method === 'HEAD') { up.resume(); res.end(); return; }
     up.pipe(res);
     up.on('error', () => res.destroy());
@@ -236,8 +337,11 @@ export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = 
     stop() {
       unroute?.();
       sessions.clear();
+      blobs.clear();
     },
     register,
+    registerBlob,
+    probeHls,
     convertedUrl: (job) => `${base()}/x/${job}/index.m3u8`,
     proxyUrl: () => vpn()?.proxyUrl?.() ?? null,
     setDemand() {},
