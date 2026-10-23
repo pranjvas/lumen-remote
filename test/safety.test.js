@@ -33,6 +33,18 @@ describe('key catalogue allowlist', { skip: skipUnless('server/catalog/keys.js')
   });
 });
 
+describe('rate buckets', () => {
+  test('browser frame acks have a bucket of their own: a full pointer bucket does not refuse them, and they do not use up commands', async () => {
+    const { createSafety } = await import('../server/safety.js');
+    const safety = createSafety({ config: {} });
+    const client = {};
+    for (let i = 0; i < 120; i += 1) safety.checkRate(client, 'pointer.move');
+    assert.throws(() => safety.checkRate(client, 'pointer.move'), (err) => err.code === 'RATE_LIMIT', 'the pointer bucket is empty');
+    for (let i = 0; i < 100; i += 1) safety.checkRate(client, 'browser.ack');
+    safety.checkRate(client, 'key.click');
+  });
+});
+
 describe('safety through the hub', { skip: skipUnless('server/app.js') }, () => {
   let stack, b, mock;
   before(async () => {

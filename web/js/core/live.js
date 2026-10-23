@@ -15,6 +15,16 @@ function frame(id, cmd, args) {
   return { ...args, t: 'cmd', id, cmd };
 }
 
+// Binary messages (asked for with /live?frames=bin): [type][header length][2 reserved][seq u32][w u16][h u16]
+// then the payload. Type 1 is a browser frame, whose payload is the JPEG.
+export function decodeBinary(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 12) return null;
+  const view = new DataView(buffer);
+  const headerLength = view.getUint8(1);
+  if (view.getUint8(0) !== 1 || headerLength < 12 || headerLength > buffer.byteLength) return null;
+  return { t: 'browser.frame', seq: view.getUint32(4), w: view.getUint16(8), h: view.getUint16(10), bytes: new Uint8Array(buffer, headerLength) };
+}
+
 export function createLive({ url = defaultUrl() } = {}) {
   const listeners = new Map();
   const pending = new Map();
@@ -52,7 +62,13 @@ export function createLive({ url = defaultUrl() } = {}) {
       attempt = 0;
       setStatus('open');
     });
+    ws.binaryType = 'arraybuffer';
     ws.addEventListener('message', (ev) => {
+      if (typeof ev.data !== 'string') {
+        const msg = decodeBinary(ev.data);
+        if (msg) emit(msg.t, msg);
+        return;
+      }
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (!msg || typeof msg !== 'object') return;
@@ -125,5 +141,5 @@ export function createLive({ url = defaultUrl() } = {}) {
 
 function defaultUrl() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}/live`;
+  return `${proto}//${location.host}/live?frames=bin`;
 }

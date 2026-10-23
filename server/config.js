@@ -41,13 +41,15 @@ export const DEFAULTS = deepFreeze({
   wol: { targets: [], ports: [9, 7] },
   ai: { backend: 'auto', model: 'claude-opus-5-5', effort: 'low' },
   // The Browser view's headless Edge (spec §11.3): closed after idleMs without a viewer; frames are
-  // JPEGs of at most maxWidth × maxHeight at up to maxFps per viewer.
+  // JPEGs of at most maxWidth × maxHeight at up to maxFps per viewer. Edge is paced to that rate
+  // (pace: false acks every frame at once, as before).
   browser: {
     // Pages on this PC (127.0.0.1/localhost) are blocked; tests that serve their own pages turn this on.
     allowLoopback: false,
     edgePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
     idleMs: 1_200_000,
-    maxFps: 15,
+    maxFps: 24,
+    pace: true,
     quality: 60,
     maxWidth: 1280,
     maxHeight: 800,

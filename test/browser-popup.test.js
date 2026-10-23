@@ -40,9 +40,16 @@ describe('browser: sign-in pop-ups', { skip }, () => {
     await viewer.hello;
     okAck(await viewer.send('browser.viewport', { w: 640, h: 400 }));
   });
+  // As browser.test.js: Edge's helper processes can hold the profile a moment after Edge closed, and a
+  // failed data-dir cleanup must not leave the page server open (the test process would never exit).
   after(async () => {
-    await stack?.stop();
-    server?.close();
+    try {
+      await stack?.server.stop();
+      await new Promise((r) => setTimeout(r, 500));
+      await stack?.stop().catch(() => {});
+    } finally {
+      server?.close();
+    }
   });
 
   const openShop = async () => {
@@ -56,11 +63,13 @@ describe('browser: sign-in pop-ups', { skip }, () => {
     await openShop();
     await clickButton();
     await waitFor(() => state('popup') === true, { timeout: 15000, message: 'the pop-up on show' });
-    assert.match(state('url') ?? '', /\/signin$/);
+    await waitFor(() => /\/signin$/.test(state('url') ?? ''), { timeout: 5000, message: `the pop-up's address (now ${state('url')})` });
     await clickButton(); // "Continue" in the pop-up
     await waitFor(() => state('popup') === false, { timeout: 15000, message: 'back to the page' });
-    const title = await stack.server.features.browser.evaluate('document.title');
-    assert.equal(title, 'Signed in', 'the opener got the pop-up\'s message');
+    // The message event can reach the opener a moment after the pop-up is gone.
+    await waitFor(async () => (await stack.server.features.browser.evaluate('document.title')) === 'Signed in', {
+      timeout: 3000, message: 'the opener got the pop-up\'s message',
+    });
   });
 
   test('Back while a pop-up is on show closes it', async () => {

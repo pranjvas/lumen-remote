@@ -17,6 +17,9 @@ const REQUEST_TIMEOUT_MS = 8000;
 const ICON_RETRY_MS = 10 * 60 * 1000;
 const MAX_ICON_BYTES = 512 * 1024;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+// Browser-screen frames on their way to the TV at once (each confirmed by a ping's pong; see sendFrame).
+const FRAME_WINDOW = 1;
+const FRAME_PONG_TIMEOUT_MS = 1500;
 const REQUEST_TYPES = new Set(['apps', 'icon', 'exit', 'open-url', 'launch', 'meta', 'screen', 'caps']);
 const APP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const URL_MAX_LENGTH = 4096;
@@ -188,7 +191,9 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
       touch(ws);
       handleMessage(msg);
     });
+    ws.on('pong', (data) => onFramePong(ws, data));
     ws.on('close', () => {
+      clearTimeout(frameQueues.get(ws)?.timer);
       if (ws === active) log.info('agent disconnected');
       drop(ws);
     });
@@ -244,12 +249,57 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     active.send(JSON.stringify(msg));
     return true;
   }
-  /** One JPEG frame for the browser screen; skipped while the socket is backed up (a few frames at
-   *  most, so control messages such as screen-play are not stuck behind seconds of video). */
+  /** One JPEG frame for the browser screen. At most FRAME_WINDOW frames are on their way to the TV:
+   *  each is followed by a WebSocket ping, and the TV's pong (its browser answers on its own, after
+   *  everything sent before the ping arrived) frees its place. A newer frame replaces one still
+   *  waiting, so a slow TV link shows the newest frame instead of working through seconds of old ones
+   *  held in socket buffers, and control messages such as screen-play stay quick. A TV that never
+   *  pongs gets one frame per completed socket write instead. */
+  const frameQueues = new WeakMap(); // agent socket → { next, writing, inFlight: [{ id, at }], lastId, pongs, timer }
   function sendFrame(bytes) {
-    if (!isOpen() || active.bufferedAmount > 384 * 1024) return false;
-    active.send(bytes, { binary: true });
+    if (!isOpen()) return false;
+    const ws = active;
+    let queue = frameQueues.get(ws);
+    if (!queue) frameQueues.set(ws, (queue = { next: null, writing: false, inFlight: [], lastId: 0, pongs: null, timer: null }));
+    queue.next = bytes;
+    writeFrame(ws, queue);
     return true;
+  }
+  function writeFrame(ws, queue) {
+    clearTimeout(queue.timer);
+    queue.timer = null;
+    if (!queue.next || ws !== active || ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (queue.inFlight.length && now - queue.inFlight[0].at > FRAME_PONG_TIMEOUT_MS) {
+      if (queue.pongs === null) queue.pongs = false; // no pong ever: pace on socket writes only
+      queue.inFlight = queue.inFlight.filter((f) => now - f.at <= FRAME_PONG_TIMEOUT_MS);
+    }
+    if (queue.writing) return;
+    if (queue.pongs !== false && queue.inFlight.length >= FRAME_WINDOW) {
+      queue.timer = setTimeout(() => writeFrame(ws, queue), queue.inFlight[0].at + FRAME_PONG_TIMEOUT_MS + 1 - now);
+      return;
+    }
+    const bytes = queue.next;
+    queue.next = null;
+    queue.writing = true;
+    ws.send(bytes, { binary: true }, () => {
+      queue.writing = false;
+      writeFrame(ws, queue);
+    });
+    // Pinged even without pongs so far: one arriving late turns the window back on.
+    queue.lastId = (queue.lastId + 1) >>> 0;
+    const id = Buffer.alloc(4);
+    id.writeUInt32BE(queue.lastId);
+    queue.inFlight.push({ id: queue.lastId, at: now });
+    ws.ping(id);
+  }
+  function onFramePong(ws, data) {
+    const queue = frameQueues.get(ws);
+    if (!queue || !Buffer.isBuffer(data) || data.length !== 4) return;
+    const id = data.readUInt32BE(0);
+    queue.pongs = true;
+    queue.inFlight = queue.inFlight.filter((f) => f.id > id);
+    writeFrame(ws, queue);
   }
 
   /** Live video (features/livevideo.js): one init segment or fragment message. Not sent while more

@@ -25,9 +25,13 @@ describe('browser + VPN: the switch routes Lumen\'s browser through the tunnel',
     hello = await b.hello;
     await b.send('view', { name: 'browser', visible: true });
   });
+  // The peer is closed whatever happens to the stack's cleanup: left running, it keeps the test process alive.
   after(async () => {
-    await stack?.stop();
-    await peer?.close();
+    try {
+      await stack?.stop();
+    } finally {
+      await peer?.close();
+    }
   });
 
   test('a config upload is validated, saved, and reported without keys', async () => {

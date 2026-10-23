@@ -401,29 +401,41 @@ export function mountBrowser(root, ctx) {
   let decoding = false;
   let queued = null;
 
-  // Frames paint in order; a frame that arrives mid-decode replaces any earlier waiting one, and
-  // only painted frames are acked, so a slow phone simply gets fewer frames.
+  // Every frame is acked as it arrives: the server's per-client window paces the network, and a frame
+  // that arrives mid-decode replaces any earlier waiting one, so a slow phone paints fewer frames
+  // without making the stream wait for it. A frame that fails to decode is skipped, not the next one.
   async function onFrame(msg) {
+    ctx.live.post('browser.ack', { seq: msg.seq });
     if (!showing()) return;
     if (decoding) { queued = msg; return; }
     decoding = true;
     try {
       let m = msg;
       while (m) {
-        await draw(m);
-        ctx.live.post('browser.ack', { seq: m.seq });
+        try {
+          await draw(m);
+        } catch (err) {
+          console.warn('Browser frame dropped', err);
+        }
         m = queued;
         queued = null;
       }
-    } catch (err) {
-      console.warn('Browser frame dropped', err);
     } finally {
       decoding = false;
     }
   }
 
-  async function draw({ data }) {
-    const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+  // Binary frames carry the JPEG bytes; JSON ones (older servers, the dev server) base64.
+  function base64Bytes(data) {
+    if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(data);
+    const text = atob(data);
+    const out = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i += 1) out[i] = text.charCodeAt(i);
+    return out;
+  }
+
+  async function draw({ bytes: raw, data }) {
+    const bytes = raw ?? base64Bytes(data);
     // Edge sends JPEG; the dev server's fake frames are PNG.
     const bitmap = await createImageBitmap(new Blob([bytes], { type: bytes[0] === 0x89 ? 'image/png' : 'image/jpeg' }));
     if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
