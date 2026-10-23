@@ -174,14 +174,14 @@ describe('tools: play_title and save_app_skill', () => {
     assert.match(rental.result.summary, /only to rent or buy/);
   });
 
-  test('save_app_skill records a learned flow; CineHD is refused', async () => {
+  test('save_app_skill records a learned flow', async () => {
     const skills = createSkills({ dataDir: tempDir(), log: createTestLog() });
     const ctx = { hub: fakeHub(), store: store([]), skills };
     const saved = await callTool('save_app_skill', { app: 'SonyLIV', flows: { search: [{ keys: ['KEY_UP', 'KEY_ENTER'] }] }, notes: '- search is at the top', verified: 'test' }, ctx);
     assert.equal(saved.isError, false, saved.text);
     assert.deepEqual(skills.get('sonyliv').flows.search, [{ keys: ['KEY_UP', 'KEY_ENTER'] }]);
-    const cine = await callTool('save_app_skill', { app: 'CineHD TV' }, ctx);
-    assert.equal(cine.isError, true);
+    const cine = await callTool('save_app_skill', { app: 'CineHD TV', notes: '- movie player' }, ctx);
+    assert.equal(cine.isError, false);
   });
 });
 

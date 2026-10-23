@@ -9,10 +9,10 @@ import { gridPath, runFlow } from './skills.js';
 const AI_CLIENT = Object.freeze({ id: 'lumen-ai', ai: true, send() {} });
 
 const AGENT_APP = 'lumenrmt01.LumenAgent';
-const isCineHd = (app) => Boolean(app) && (/^pvcinehd01\./.test(app.id ?? '') || /cine\s*hd/i.test(app.name ?? ''));
+
 const POWER_KEYS = new Set(['KEY_POWER', 'KEY_POWEROFF', 'KEY_POWERON']);
-// While CineHD is in the foreground the AI may only leave it or adjust the TV, never navigate inside it.
-const CINEHD_KEYS = new Set(['KEY_HOME', 'KEY_EXIT', 'KEY_RETURN', 'KEY_VOLUP', 'KEY_VOLDOWN', 'KEY_MUTE', 'KEY_MENU', 'KEY_SOURCE']);
+
+
 const DEFAULT_INPUTS = ['TV', 'HDMI1', 'HDMI2', 'HDMI3', 'HDMI4', 'AV1'];
 const SETTING_GROUPS = ['picture', 'pictureAdvanced', 'sound', 'input', 'general'];
 const PICTURE_DIGEST = ['mode', 'backlight', 'contrast', 'shadowDetail', 'sharpness', 'color', 'tint', 'colorTone', 'localDimming'];
@@ -458,9 +458,6 @@ const TOOLS = [
         if (POWER_KEYS.has(key)) fail('Power keys are not allowed here; use the power tool');
         if (!catalog.isAllowedKey(key)) fail(`${key} is not an allowed key`);
       }
-      if (isCineHd(foregroundApp(store)) && keys.some((key) => !CINEHD_KEYS.has(key))) {
-        fail('CineHD is open. Lumen does not navigate inside CineHD; it can only leave it (Home, Back, Exit) or change the volume.', 'UNAVAILABLE');
-      }
       for (const [i, key] of keys.entries()) {
         if (signal?.aborted) fail(`Cancelled after ${i} of ${keys.length} keys`, 'FAILED');
         try {
@@ -490,7 +487,7 @@ const TOOLS = [
   },
   {
     name: 'launch_app',
-    description: 'Open an app on the TV by name or id (fuzzy: "netflix", "prime", "hotstar", "plex"). CineHD can be opened this way, but nothing can be searched or played inside it. To open a specific Netflix title or YouTube video use open_netflix or play_youtube instead.',
+    description: 'Open an app on the TV by name or id (fuzzy: "netflix", "prime", "hotstar", "plex"). To open a specific Netflix title or YouTube video use open_netflix or play_youtube instead.',
     inputSchema: object({
       app: { type: 'string', minLength: 1, maxLength: 80, description: 'App name or id' },
     }, ['app']),
@@ -646,7 +643,6 @@ const TOOLS = [
       submit: { type: 'boolean', description: 'Press Done/Enter after typing' },
     }, ['text']),
     async run({ text, submit = false }, { hub, store }) {
-      if (isCineHd(foregroundApp(store))) fail('CineHD is open. Lumen does not search or type inside CineHD.', 'UNAVAILABLE');
       const clean = text.replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
       if (!clean) fail('Nothing to type');
       await send(hub, { cmd: 'text.send', text: clean, submit });
@@ -660,7 +656,6 @@ const TOOLS = [
       waitMs: { type: 'integer', minimum: 0, maximum: 5000, description: 'Wait this long before capturing (let the screen settle)' },
     }),
     async run({ waitMs = 0 }, { hub, store, eyes, signal }) {
-      if (isCineHd(foregroundApp(store))) fail('CineHD is open. Lumen does not look inside CineHD.', 'UNAVAILABLE');
       if (!eyes?.latest) fail('Seeing the screen is not available', 'UNAVAILABLE');
       if (waitMs) await sleep(waitMs);
       if (signal?.aborted) fail('Cancelled', 'CANCELLED');
@@ -688,7 +683,6 @@ const TOOLS = [
     async run({ title, year, type, app }, ctx) {
       const { hub, store, titles, skills } = ctx;
       if (!titles || !skills) fail('Playing titles is not available', 'UNAVAILABLE');
-      if (app && /cine\s*hd/i.test(app)) fail('Lumen does not search or play titles inside CineHD.', 'UNAVAILABLE');
       const installedIds = (valueOf(store, 'app.installed') ?? []).map((a) => a?.id).filter(Boolean);
       const found = await titles.find(title, { year, type, installedIds, preferApp: app });
       if (!found.match) return { ok: false, error: { code: 'NOT_FOUND', message: `"${title}" was not found in the India catalogue; try web search for the exact title` } };
@@ -761,8 +755,7 @@ const TOOLS = [
       exitRight: { type: 'boolean', description: 'Afterwards, press Right until focus leaves the keyboard' },
     }, ['rows', 'start', 'text']),
     async run({ rows, start, text, exitRight = false }, ctx) {
-      const { hub, store } = ctx;
-      if (isCineHd(foregroundApp(store))) fail('Lumen does not type inside CineHD.', 'UNAVAILABLE');
+      const { hub } = ctx;
       if (!rows.some((r) => r.some((k) => k != null && String(k).toLowerCase() === start.toLowerCase()))) fail(`"${start}" is not one of the keys you listed`);
       const plan = gridPath({ rows, start, maxChars: 40 }, cleanSearchText(text));
       if (!plan.typed) fail('None of those characters are on that keyboard');
@@ -822,9 +815,8 @@ const TOOLS = [
       text: { type: 'string', maxLength: 120, description: 'Text for typing flows' },
     }, ['app', 'flow']),
     async run({ app, flow, text }, ctx) {
-      const { skills, store } = ctx;
+      const { skills } = ctx;
       if (!skills) fail('Skills are not available', 'UNAVAILABLE');
-      if (/cine\s*hd/i.test(app) || isCineHd(foregroundApp(store))) fail('Lumen does not run flows inside CineHD.', 'UNAVAILABLE');
       const skill = skills.get(app);
       if (!skill) fail(`No skill for ${app}`, 'NOT_FOUND');
       if (!skill.flows[flow]) fail(`${skill.app} has no "${flow}" flow (it has ${Object.keys(skill.flows).join(', ') || 'none'})`, 'NOT_FOUND');
@@ -846,7 +838,6 @@ const TOOLS = [
     }, ['app']),
     async run({ app, appId, summary, notes, flows, verified }, { skills, store }) {
       if (!skills) fail('Skills are not available', 'UNAVAILABLE');
-      if (/cine\s*hd/i.test(app) || /^pvcinehd01\./.test(appId ?? '')) fail('Lumen does not keep skills for CineHD.', 'UNAVAILABLE');
       const fromList = (valueOf(store, 'app.installed') ?? []).find((a) => norm(a?.name) === norm(app));
       let saved;
       try {
