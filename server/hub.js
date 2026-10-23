@@ -688,6 +688,19 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       }
     },
 
+    // Starts a TV app through the agent with app-control data (operation + extra keys), the way
+    // Smart Hub tiles and other apps deep-link; the agent bounds the key count and size.
+    'agent.launch': async ({ appId, operation, data }) => {
+      requireTvOn();
+      text(appId, 'appId', { max: 128, pattern: /^[A-Za-z0-9._-]+$/ });
+      if (operation !== undefined) text(operation, 'operation', { max: 200, pattern: /^https?:\/\/[A-Za-z0-9./_-]+$/ });
+      if (data !== undefined && (typeof data !== 'object' || data === null || Array.isArray(data))) {
+        throw new LumenError('INVALID', 'data must be an object of app-control keys');
+      }
+      const res = await call('agent', 'request', 'launch', { appId, operation, data });
+      return { value: res.value ?? res };
+    },
+
     'pair.remote': async () => {
       requireTvOn();
       return call('remote', 'pair');

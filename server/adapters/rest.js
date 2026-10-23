@@ -45,7 +45,7 @@ export function normaliseDevice(d = {}) {
   };
 }
 
-export function createRest({ config, log: rootLog, store }) {
+export function createRest({ config, data, log: rootLog, store }) {
   const log = rootLog.child('rest');
   const { host } = config.tv;
   const port = config.tv.ports.rest;
@@ -61,7 +61,12 @@ export function createRest({ config, log: rootLog, store }) {
   let power = 'unknown';
   let failures = 0;
   let device = {};
-  let wakeMac = null;
+  // Kept in data/wake.json (never in the store or the UI) so Lumen can wake the TV after a restart
+  // while the TV is off.
+  let wakeMac = (() => {
+    const saved = data?.readJson?.('wake.json', {})?.mac;
+    return typeof saved === 'string' && MAC.test(saved) ? saved : null;
+  })();
   let foregroundId = null;
   let foregroundPublished;
   let lastProbeWasForeground = false;
@@ -159,7 +164,10 @@ export function createRest({ config, log: rootLog, store }) {
       const derived = key === 'platform' || key === 'year';
       store.set(`device.${key}`, value, { src: derived ? 'derived' : 'live', via: 'rest:/api/v2/', ttlMs });
     }
-    if (typeof raw.wifiMac === 'string' && MAC.test(raw.wifiMac)) wakeMac = raw.wifiMac;
+    if (typeof raw.wifiMac === 'string' && MAC.test(raw.wifiMac) && raw.wifiMac !== wakeMac) {
+      wakeMac = raw.wifiMac;
+      try { data?.writeJson?.('wake.json', { mac: wakeMac }); } catch { /* best effort */ }
+    }
   }
 
   async function readDevice(priority) {

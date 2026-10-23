@@ -216,6 +216,7 @@ async function retryTransient(fn, { everyMs, totalMs = Infinity, attempts = Infi
 
 // `browser` (optional) returns the Browser-view feature (spec §11.3); it is created after Cast, hence lazy.
 // Candidate action_play_url strings for Netflix (provider-defined; ranked, config.cast.netflixSmartHub picks).
+// The first plays the title on the Q95T (live 2026-10-23: Friends started playing from a cold start).
 const SMART_HUB_NETFLIX = [
   (id) => `m=https://www.netflix.com/watch/${id}&source_type=4`,
   (id) => `m=${id}&source_type=4`,
@@ -350,10 +351,16 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
   }
 
   // Smart Hub's own tile launch (decompiled from CoBA's WebAppTileLauncher.LaunchNetflix): the Netflix
-  // app is started with app-control extra data, which DIAL cannot send. Needs TV agent 0.4.0+.
+  // app is started with app-control extra data, which DIAL cannot send. Needs TV agent 0.4.0+. Smart Hub
+  // also sends __K_SPLASH_SCREEN, __LEGACY_LAUNCH__ and __K_RELOCATE_BELOW; those are reserved for
+  // platform apps and make launchAppControl fail with SecurityError for the agent, so they are left out.
   async function launchViaAgent(target) {
     const a = agent();
-    if (target.kind !== 'netflix' || !target.id || !a?.request || store.get('conn.agent')?.v !== 'online') return false;
+    if (target.kind !== 'netflix' || !target.id) return false;
+    if (!a?.request || store.get('conn.agent')?.v !== 'online') {
+      logger.info('TV agent offline; using DIAL', { agent: store.get('conn.agent')?.v ?? null });
+      return false;
+    }
     const forms = SMART_HUB_NETFLIX;
     const playUrl = forms[config.cast?.netflixSmartHub ?? 0](target.id);
     try {
@@ -361,12 +368,11 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
         appId: 'org.tizen.netflix-app',
         data: {
           '--root': 'app', '--app-js': 'netflix', callerid: 'com.samsung.tv.csfs', action_play_url: playUrl,
-          __K_SPLASH_SCREEN: 'LA_UI_DEFAULT', __LEGACY_LAUNCH__: 'true', __K_RELOCATE_BELOW: 'com.samsung.tv.csfs',
         },
       });
       return true;
     } catch (err) {
-      logger.debug('agent launch failed; falling back to DIAL', { message: err?.message });
+      logger.info('agent launch refused; using DIAL', { message: err?.message });
       return false;
     }
   }

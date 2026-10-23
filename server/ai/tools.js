@@ -494,11 +494,14 @@ const TOOLS = [
         fail('Give titleId or url. To open Netflix without a title use launch_app.');
       }
       const session = await send(hub, { cmd: 'cast.url', url: `https://www.netflix.com/title/${id}` });
-      // Live on the Q95T (2026-10-21): every tested launch format opened Netflix on its home or profile
-      // screen, never on the title, so say so instead of implying the title is playing.
+      // Live on the Q95T: through the TV agent (Smart Hub's app-control launch) the title starts playing
+      // (2026-10-23); over DIAL every format only opened Netflix's home or profile screen (2026-10-21).
+      const played = session?.via === 'agent';
       return {
-        ok: true, titleId: id, landsOnTitle: false,
-        summary: castSummary(session, 'Opened Netflix. On this TV Netflix ignores title links and opens on its home screen, so the user picks the title there'),
+        ok: true, titleId: id, landsOnTitle: played,
+        summary: played
+          ? castSummary(session, 'Started the title in Netflix. If Netflix asks who is watching, the user picks a profile and it plays')
+          : castSummary(session, 'Opened Netflix without the TV agent, so it opens on its home screen and the user picks the title there. Connecting the TV agent (Settings) lets titles play directly'),
       };
     },
   },

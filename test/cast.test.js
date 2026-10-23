@@ -449,6 +449,23 @@ describe('cast: through the server and the mock TV', { skip }, () => {
     }
   });
 
+  test('agent.launch passes an app id and app-control data to the TV agent, and refuses bad input', async () => {
+    const agent = stack.agent();
+    await b.waitForState('conn.agent', (r) => r?.v === 'online', { timeout: 10000 });
+    const ack = await b.send('agent.launch', { appId: '3201907018807', data: { PAYLOAD: '{"values":"x"}' } }, { timeout: 15000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    const launch = agent.requests.findLast((r) => r.type === 'launch');
+    assert.equal(launch.appId, '3201907018807');
+    assert.deepEqual(launch.data, { PAYLOAD: '{"values":"x"}' });
+    for (const bad of [{ appId: 'a b' }, { appId: 'x', operation: 'javascript:alert(1)' }, { appId: 'x', data: [1] }]) {
+      const res = await b.send('agent.launch', bad, { timeout: 15000 });
+      assert.equal(res.ok, false, JSON.stringify(bad));
+      assert.equal(res.error.code, 'INVALID');
+    }
+    agent.ws.close();
+    await b.waitForState('conn.agent', (r) => r?.v !== 'online', { timeout: 30000 });
+  });
+
   test('Netflix links go to the TV agent as a Smart Hub app-control launch when it is online, DIAL otherwise', async () => {
     const agent = stack.agent();
     await b.waitForState('conn.agent', (r) => r?.v === 'online', { timeout: 10000 });
@@ -460,6 +477,8 @@ describe('cast: through the server and the mock TV', { skip }, () => {
     assert.equal(launch.appId, 'org.tizen.netflix-app');
     assert.equal(launch.data.action_play_url, 'm=https://www.netflix.com/watch/70153404&source_type=4');
     assert.equal(launch.data['--app-js'], 'netflix');
+    assert.equal(launch.data.callerid, 'com.samsung.tv.csfs');
+    assert.deepEqual(Object.keys(launch.data).filter((k) => k.startsWith('__')), [], 'no platform-reserved keys (SecurityError on the TV)');
     assert.equal(mock.state.dial.launches.length, dialBefore, 'no DIAL launch when the agent handled it');
     agent.ws.close();
     await b.waitForState('conn.agent', (r) => r?.v !== 'online', { timeout: 30000 });
