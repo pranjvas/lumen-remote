@@ -207,3 +207,20 @@ describe('tools: typing on an app keyboard and the Agent SDK schema', () => {
     assert.deepEqual(parsed.flows, { open: [{ launch: true }] });
   });
 });
+
+describe('titles: Prime Video add-on channels', () => {
+  test('an "Amazon Channel" offer is a paid add-on, not chosen, and reported as such', async () => {
+    const fetchImpl = async () => ({ ok: true, json: async () => ({ data: { popularTitles: { edges: [{ node: { id: 'c', objectType: 'SHOW', content: { title: 'Counterpart', originalReleaseYear: 2017 },
+      offers: [{ monetizationType: 'FLATRATE', presentationType: 'HD', standardWebURL: 'https://app.primevideo.com/detail?gti=x', package: { clearName: 'Sony Pictures Amazon Channel', technicalName: 'amazonsonypictures' } }] } }] } } }) });
+    const titles = createTitles({ log: createTestLog(), fetchImpl });
+    const found = await titles.find('counterpart', { installedIds: ['3201910019365'] });
+    assert.equal(found.choice, null);
+    assert.equal(found.why, 'paid-add-on');
+  });
+
+  test('the Apple TV skill ships with the full title flow', () => {
+    const skill = createSkills({ log: createTestLog() }).get('3201807016597');
+    assert.equal(skill.slug, 'apple-tv');
+    assert.deepEqual(Object.keys(skill.flows), ['open', 'search', 'type', 'pickResult', 'play']);
+  });
+});

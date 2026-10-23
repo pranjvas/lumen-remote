@@ -697,6 +697,7 @@ const TOOLS = [
       if (!found.choice) {
         const message = {
           'rent-or-buy-only': `${label} is only to rent or buy here (${where.join(', ')}). Renting costs money, so Lumen did not do it; tell the user.`,
+          'paid-add-on': `${label} streams only on a paid Prime Video add-on channel here (${where.join(', ')}); that costs extra, so Lumen did not subscribe. Tell the user.`,
           'not-on-requested-app': `${label} is not included on ${app}; it is on ${where.join(', ')}.`,
           'not-on-installed-apps': `${label} streams on ${where.join(', ')}, none of which is installed on this TV.`,
           'not-streaming': `${label} is not streaming in India right now.`,

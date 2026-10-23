@@ -124,7 +124,8 @@ describe('eyes: screen capture through the TV agent', () => {
 
   test('look_at_screen returns the picture as image content, not inside the JSON text', async () => {
     const ctx = { hub: stack.server.hub, store: stack.server.store, eyes: stack.server.adapters.eyes };
-    const cine = await callTool('look_at_screen', {}, ctx); // the fake agent reports CineHD in front
+    stack.server.store.set('app.foreground', { id: 'pvcinehd01.CineHDTV', name: 'CineHD TV' }, { src: 'live', via: 'test' });
+    const cine = await callTool('look_at_screen', {}, ctx);
     assert.equal(cine.isError, true);
     assert.match(cine.result.error.message, /CineHD/);
     stack.server.store.set('app.foreground', { id: '3201907018807', name: 'Netflix' }, { src: 'live', via: 'test' });

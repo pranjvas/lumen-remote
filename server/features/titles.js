@@ -40,6 +40,14 @@ const RANK = { FLATRATE: 0, FREE: 1, ADS: 2, RENT: 3, BUY: 4 };
 
 const norm = (s) => String(s ?? '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]/g, '');
 
+// A JustWatch package → this TV's app; "amazon<channel>" packages are Prime Video add-on channels.
+function providerFor(offer) {
+  const known = PROVIDERS[offer.provider];
+  if (known) return known;
+  if (/^amazon[a-z0-9]+$/.test(offer.provider)) return { ...PROVIDERS.amazonprime, name: `${offer.service} (Prime Video add-on)`, addon: true };
+  return null;
+}
+
 /** The content id at the end of a provider URL (Hotstar /1971000669, Netflix /title/70153404, Prime gti=…). */
 export function contentIdFrom(url) {
   if (!url) return null;
@@ -119,10 +127,11 @@ export function createTitles({ log, fetchImpl = globalThis.fetch }) {
     const installed = new Set(installedIds);
     const prefer = preferApp ? norm(preferApp) : null;
     const usable = match.offers
-      .map((offer) => ({ offer, provider: PROVIDERS[offer.provider] }))
+      .map((offer) => ({ offer, provider: providerFor(offer) }))
       .filter(({ provider }) => provider && provider.appIds.some((id) => installed.has(id) || installed.size === 0));
     const fits = (p) => !prefer || norm(p.provider.name).includes(prefer) || p.provider.appIds.some((id) => norm(id).includes(prefer));
-    const included = usable.filter(({ offer }) => INCLUDED.has(offer.monetization));
+    // Prime Video Channels (Sony Pictures, Apple TV+, MGM … "Amazon Channel") are paid add-ons on top of Prime.
+    const included = usable.filter(({ offer, provider }) => INCLUDED.has(offer.monetization) && !provider.addon);
     const pick = included.find(fits) ?? (prefer ? null : included[0]);
     const choice = pick ? {
       service: pick.provider.name,
@@ -134,7 +143,11 @@ export function createTitles({ log, fetchImpl = globalThis.fetch }) {
       contentId: contentIdFrom(pick.offer.url),
     } : null;
     let why = 'included';
-    if (!choice) why = usable.length ? (prefer && included.length ? 'not-on-requested-app' : 'rent-or-buy-only') : match.offers.length ? 'not-on-installed-apps' : 'not-streaming';
+    if (!choice) {
+      if (prefer && included.length) why = 'not-on-requested-app';
+      else if (usable.some(({ provider, offer }) => provider.addon && INCLUDED.has(offer.monetization))) why = 'paid-add-on';
+      else why = usable.length ? 'rent-or-buy-only' : match.offers.length ? 'not-on-installed-apps' : 'not-streaming';
+    }
     return { match, candidates: scored.slice(1, 4).map(({ r }) => ({ title: r.title, year: r.year, type: r.type })), choice, why };
   }
 
