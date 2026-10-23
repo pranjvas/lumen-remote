@@ -325,6 +325,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let page = null; // CDP connection to the tab on show: the page, or a pop-up while one is open
   let mainPage = null; // the page itself while a pop-up is on show
   let popup = null; // { id, cdp } a sized pop-up the page opened (a sign-in window)
+  const popupConnections = new WeakSet(); // every pop-up's CDP connection, shown now or before
   let mainTargetId = null;
   const frameContexts = new Set(); // default execution contexts of the page's frames (its own and in-process iframes)
   let lastUserInput = 0;
@@ -701,6 +702,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     const pcdp = await connectCdp(`ws://127.0.0.1:${devPort}/devtools/page/${targetId}`);
     if (page !== owner || popup) { pcdp.close(); return; }
     popup = { id: targetId, cdp: pcdp };
+    popupConnections.add(pcdp);
     pcdp.onClose(() => onConnectionLost(pcdp));
     pcdp.on('Page.screencastFrame', (params) => onScreencastFrame(params, pcdp));
     pcdp.on('Page.frameNavigated', ({ frame }) => { if (!frame.parentId) refreshHistory(pcdp); });
@@ -1046,7 +1048,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   function mouse(cdp, type, event, extra = {}, at = toViewport(event)) {
     const buttons = [...pressed].reduce((bits, name) => bits | BUTTON_BITS[name], 0);
-    return cdp.send('Input.dispatchMouseEvent', { type, ...at, modifiers: modifierBits(event.modifiers), buttons, ...extra });
+    return cdp.send('Input.dispatchMouseEvent', { type, ...at, modifiers: modifierBits(event.modifiers), buttons, ...extra })
+      .catch((err) => {
+        // A pop-up that closed itself in answer to this click (a sign-in window's Continue) took it.
+        if (popupConnections.has(cdp) && popup?.cdp !== cdp) return undefined;
+        throw err;
+      });
   }
 
   // A finger covers many page pixels (more still when the phone shows the TV's 1280×720 page), so a
