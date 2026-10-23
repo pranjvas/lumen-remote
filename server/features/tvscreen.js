@@ -35,6 +35,12 @@ const PAUSE_PAGE_SCRIPT = `(() => {
 })()`;
 const YOUTUBE_REPEAT_MS = 15000; // the same video started again this soon after a hand-off is only paused
 const YOUTUBE_MIN_EMBED_AREA = 40000; // CSS px²: a YouTube embed smaller than ~200×200 is not "the page's video"
+const YOUTUBE_APP_IDS = new Set(['111299001912', '9Ur5IzDKqV.TizenYouTube']);
+const AUTO_RETRY_MS = 60000; // a page whose video could not be handed over is not tried again by itself this soon
+const MANUAL_GRACE_MS = 5000; // the automatic hand-off leaves the page alone this long around a manual one
+const PROBE_MS = 6000; // the HLS probe's budget: a slow or failing playlist plays in AVPlay
+// Two hosts are the same site when their last two labels match (the relay's own rule for cookies).
+const siteOf = (raw) => { try { return new URL(raw).hostname.toLowerCase().split('.').slice(-2).join('.'); } catch { return ''; } };
 
 /** The YouTube video a link points at → { id, t? } (t in whole seconds), or null. Covers watch?v=,
  *  youtu.be/, /shorts/, /embed/ (start=), /live/, m. and music. hosts, youtube-nocookie.com. */
@@ -77,12 +83,36 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let queue = Promise.resolve();
   let current = null; // { pick, title, stage: 'direct' | 'copy' | 'encode', job }
   let autoTimer = null;
-  let handing = false;
   let bringingFront = 0;
   let lastRemoteInput = 0; // OK / clicks from the TV remote or the trackpad
   let lastYoutube = null; // { id, at } of the last video opened in the TV's YouTube app
+  let generation = 0; // bumped by close(): an automatic hand-off started before it never reopens the screen
+  // Every hand-off (automatic, Yellow, Video → TV, the AI tool) runs one at a time, so a video is
+  // never handed over twice at once (two relay sessions, two screen-plays, two YouTube launches).
+  let handOffChain = Promise.resolve();
+  let handOffBusy = 0;
+  let autoRun = null; // the automatic hand-off in flight → its result, or null
+  let lastManualAt = 0;
+  let autoFailed = null; // { url, at }: the page whose video could not be handed over
+  let heldFrame = null; // the page's latest frame, held back while the TV's player is in front
+  let removeStoreListener = null;
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
+  const setVideo = (value) => store.set('tvscreen.video', value, { src: 'derived', via: 'tvscreen' });
+  const videoActive = () => TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v);
+  const cancelled = () => Object.assign(new LumenError('FAILED', 'The browser screen was closed'), { cancelled: true });
+  // An automatic hand-off stops quietly once the screen was closed (or closed and opened again).
+  const checkLive = (ctx) => { if (ctx?.auto && (ctx.gen !== generation || !on)) throw cancelled(); };
+  // The page's own video is paused once the TV plays it: it would download the same stream a second
+  // time (through the VPN) and keep sending frames the TV does not show.
+  const pausePage = async () => { await browser()?.evaluate?.(PAUSE_PAGE_SCRIPT).catch(() => {}); };
+
+  function serialHandOff(fn) {
+    handOffBusy += 1;
+    const run = handOffChain.then(fn).finally(() => { handOffBusy -= 1; });
+    handOffChain = run.catch(() => {});
+    return run;
+  }
   const b = () => {
     const feature = browser();
     if (!feature) throw new LumenError('UNAVAILABLE', 'Lumen’s browser is not available');
@@ -167,8 +197,9 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     };
     const moved = next.x !== cursor.x || next.y !== cursor.y;
     if (action === 'click') lastRemoteInput = Date.now();
-    if (on) bringToFront();
+    // A sync with nothing to do (the Browser view asks where the pointer is) changes nothing on the TV.
     if (moved || action !== 'move') {
+      if (on) bringToFront();
       const feature = b();
       cursor = next;
       if (on && moved) sendCursor();
@@ -179,11 +210,12 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { value: { x: cursor.x, y: cursor.y, tv: on } };
   }
 
-  // Another app (say the TV's YouTube app after a hand-off) is in front of Lumen's page: using the
-  // trackpad brings the page, and its pointer, back.
+  // The TV's YouTube app Lumen handed a video to is in front of Lumen's page: using the trackpad
+  // brings the page, and its pointer, back. Any other app the user opened stays in front.
   function bringToFront() {
     const fg = store.get('app.foreground')?.v;
-    if (!fg?.id || fg.id === appId || !appId || !rest || Date.now() - bringingFront < FRONT_EVERY_MS) return;
+    if (!fg?.id || fg.id === appId || !appId || !rest || !lastYoutube || Date.now() - bringingFront < FRONT_EVERY_MS) return;
+    if (!YOUTUBE_APP_IDS.has(fg.id) && !/^youtube$/i.test(String(fg.name ?? ''))) return;
     bringingFront = Date.now();
     log.info('bringing Lumen’s page back in front', { from: fg.name ?? fg.id });
     rest.launch(appId).then(() => sendCursor()).catch((err) => log.debug('agent bring-to-front failed', { message: err.message }));
@@ -202,7 +234,14 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       if (typeof msg.key === 'string') enqueue(() => onKey(msg.key));
       else if (msg.pointer) enqueue(() => onPointer(msg.pointer, msg.click === true));
     } else if (msg.t === 'screen-video') {
-      store.set('tvscreen.video', typeof msg.state === 'string' ? msg.state.slice(0, 20) : null, { src: 'derived', via: 'tvscreen' });
+      setVideo(typeof msg.state === 'string' ? msg.state.slice(0, 20) : null);
+      // Back on the page: it shows the frame held back while the player was in front (a still page
+      // sends no new one).
+      if (!videoActive() && heldFrame) {
+        const frame = heldFrame;
+        heldFrame = null;
+        agent()?.sendFrame?.(frame);
+      }
       if (msg.state !== 'paused') log.info('TV player', { state: String(msg.state).slice(0, 20), mode: typeof msg.mode === 'string' ? msg.mode.slice(0, 10) : null, note: msg.state === 'error' ? null : String(msg.error ?? '').slice(0, 120) || null });
       if (msg.state === 'error') {
         log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 200), stage: current?.stage ?? null });
@@ -235,7 +274,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (appId && rest) await rest.launch(appId).catch((err) => log.debug('agent bring-to-front failed', { message: err.message }));
     if (!on) {
       on = true;
-      removeSink = feature.addSink((bytes) => agent()?.sendFrame?.(bytes));
+      setVideo(null);
+      heldFrame = null;
+      // While the TV's player is in front the page's frames are not shown: the TV would only decode
+      // them on the thread its player needs. The latest one is kept for the return to the page.
+      removeSink = feature.addSink((bytes) => {
+        if (videoActive()) { heldFrame = bytes; return; }
+        heldFrame = null;
+        agent()?.sendFrame?.(bytes);
+      });
       unsubscribe = adapter.onScreen(onMessage);
       setState(true);
       if (config.tvscreen?.autoPlayOnTv !== false) autoTimer = setInterval(() => { autoHandOff().catch(() => {}); }, AUTO_POLL_MS);
@@ -248,11 +295,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   async function close() {
     if (!on) return { value: { on: false } };
     on = false;
+    generation += 1;
     clearInterval(autoTimer);
     autoTimer = null;
     removeSink?.();
     unsubscribe?.();
     removeSink = unsubscribe = null;
+    heldFrame = null;
+    // The agent's own 'stopped' arrives after the subscription is gone.
+    setVideo(null);
     setState(false);
     await agent()?.request?.('screen', { on: false }).catch(() => {});
     log.info('browser screen closed on the TV');
@@ -261,28 +312,41 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
 
   // The user started a big video on the page: play it on the TV's player instead, and pause it on the
   // page (so it does not keep loading, and does not start again when the TV returns to the page).
+  // A hand-off that failed leaves the page's video playing (the user can still watch it there), and
+  // the same page is not tried again by itself for a while.
   async function autoHandOff() {
-    if (!on || handing || TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v)) return;
+    // Busy: a slow page check or a hand-off in flight must not let the next tick start a second one.
+    if (!on || handOffBusy || videoActive() || Date.now() - lastManualAt < MANUAL_GRACE_MS) return null;
     const feature = browser();
-    if (!feature) return;
+    if (!feature) return null;
     // Only a video someone started (a click, a key, opening a link) goes to the TV: videos that start
     // by themselves (previews, autoplay) stay on the page instead of taking the TV over.
-    if (Date.now() - Math.max(feature.lastInputAt?.() ?? 0, lastRemoteInput) > USER_START_MS) return;
-    handing = true; // before the page check: a slow page must not let the next tick start a second hand-off
-    let playing = false;
-    try {
-      const yt = youtubeVideo(store.get('browser.url')?.v);
-      playing = await feature.evaluate(pageVideoScript(yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA)).catch(() => false) === true;
-      if (!playing) return;
+    if (Date.now() - Math.max(feature.lastInputAt?.() ?? 0, lastRemoteInput) > USER_START_MS) return null;
+    const pageUrl = store.get('browser.url')?.v ?? '';
+    if (autoFailed?.url === pageUrl && Date.now() - autoFailed.at < AUTO_RETRY_MS) return null;
+    const ctx = { auto: true, gen: generation };
+    const run = serialHandOff(async () => {
+      if (ctx.gen !== generation || !on) return null;
+      const yt = youtubeVideo(pageUrl);
+      const playing = await feature.evaluate(pageVideoScript(yt ? AUTO_MIN_AREA_YOUTUBE : AUTO_MIN_AREA)).catch(() => false) === true;
+      if (!playing || ctx.gen !== generation || !on) return null;
       // The same YouTube video starting again on the page right after it went to the app: just pause it.
-      if (yt && lastYoutube?.id === yt.id && Date.now() - lastYoutube.at < YOUTUBE_REPEAT_MS) return;
+      if (yt && lastYoutube?.id === yt.id && Date.now() - lastYoutube.at < YOUTUBE_REPEAT_MS) { await pausePage(); return null; }
       toast(yt ? 'Opening in YouTube on the TV…' : 'Playing on the TV’s player…');
-      const result = await playVideo().catch((err) => { toast(err.message); return null; });
-      if (result) log.info('page video handed to the TV automatically');
-    } finally {
-      if (playing) await feature.evaluate(PAUSE_PAGE_SCRIPT).catch(() => {});
-      handing = false;
-    }
+      try {
+        const result = await handOff({}, ctx);
+        log.info('page video handed to the TV automatically');
+        return result;
+      } catch (err) {
+        if (err.cancelled) return null;
+        autoFailed = { url: pageUrl, at: Date.now() };
+        toast(err.message);
+        log.info('automatic hand-off failed', { message: err.message });
+        return null;
+      }
+    });
+    autoRun = run;
+    try { return await run; } finally { if (autoRun === run) autoRun = null; }
   }
 
   // The page's own video first: a playing <video> with a real URL, then a YouTube embed (the biggest),
@@ -296,25 +360,27 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const feature = b();
     const media = feature.media();
     const pageUrl = store.get('browser.url')?.v ?? '';
-    const site = (u) => { try { return new URL(u).hostname.split('.').slice(-2).join('.'); } catch { return ''; } };
     const headersFor = (url) => media.find((m) => m.url === url)?.headers ?? { referer: pageUrl };
     if (explicit) return { url: explicit, kind: /\.m3u8/i.test(explicit) ? 'hls' : 'file', headers: headersFor(explicit) };
     const found = await feature.evaluate(PAGE_MEDIA_SCRIPT).catch(() => null);
-    const videos = (found?.videos ?? []).filter((v) => /^https?:/.test(v.src)).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
+    const all = found?.videos ?? [];
+    const videos = all.filter((v) => /^https?:/.test(v.src)).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
     const asFile = (v) => ({ url: v.src, kind: /\.m3u8/i.test(v.src) ? 'hls' : 'file', headers: headersFor(v.src) });
     if (videos[0]?.playing) return asFile(videos[0]);
-    const embed = (found?.frames ?? []).filter((f) => f.area >= YOUTUBE_MIN_EMBED_AREA)
+    // A YouTube embed is the page's video only while none of the page's own players plays (an MSE
+    // player's blob: video included): the site's video is not swapped for an unrelated embed.
+    const embed = all.some((v) => v.playing) ? null : (found?.frames ?? []).filter((f) => f.area >= YOUTUBE_MIN_EMBED_AREA)
       .map((f) => ({ area: f.area, video: youtubeVideo(f.src) })).filter((f) => f.video).sort((x, y) => y.area - x.area)[0];
     if (embed) return { kind: 'youtube', video: embed.video };
     if (videos[0]) return asFile(videos[0]);
-    const own = media.filter((m) => site(m.url) === site(pageUrl));
+    const own = media.filter((m) => siteOf(m.url) === siteOf(pageUrl));
     const rank = (list) => list.find((m) => m.kind === 'hls') ?? list.find((m) => m.kind === 'file') ?? list.find((m) => m.kind === 'dash');
     return rank(own) ?? rank(media) ?? null;
   }
 
   // A YouTube video plays in the TV's own YouTube app (DIAL, as Cast does), at the position the page's
   // player is at; the page's video is paused so it does not keep playing behind the app.
-  async function playOnYoutube(video, { fromPage = false, onPage = false } = {}) {
+  async function playOnYoutube(video, { fromPage = false, onPage = false } = {}, ctx = {}) {
     const launcher = cast();
     if (!launcher?.castUrl) throw new LumenError('UNAVAILABLE', 'Lumen cannot start YouTube on the TV right now');
     const feature = browser();
@@ -324,9 +390,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       if (player?.found) t = player.live ? undefined : player.t >= 1 ? Math.floor(player.t) : video.t;
     }
     const watch = `https://www.youtube.com/watch?v=${video.id}${t >= 1 ? `&t=${t}` : ''}`;
+    checkLive(ctx);
     await launcher.castUrl(watch);
     lastYoutube = { id: video.id, at: Date.now() };
-    if (feature?.evaluate) await feature.evaluate(PAUSE_PAGE_SCRIPT).catch(() => {});
+    await pausePage();
     // The page's title names the video only when the page is that video's own page.
     const title = onPage ? String(store.get('browser.title')?.v ?? '').replace(/ - YouTube$/, '') || null : null;
     log.info('YouTube video opened in the TV’s YouTube app', { at: t >= 1 ? t : 0 });
@@ -337,26 +404,60 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
    *  skips the direct attempt and converts on this PC straight away. A YouTube page (or link, or a
    *  YouTube embed on the page) opens in the TV's YouTube app instead. */
   async function playVideo({ url: explicit, convert = false } = {}) {
+    lastManualAt = Date.now();
+    const joined = autoRun;
+    const pageUrl = store.get('browser.url')?.v ?? '';
+    try {
+      return await serialHandOff(async () => {
+        // Yellow (or Video → TV) while the automatic hand-off was handing the page's video over: that one counts.
+        if (joined && explicit === undefined && !convert) {
+          const done = await joined;
+          if (done) return done;
+        }
+        try {
+          return await handOff({ url: explicit, convert });
+        } catch (err) {
+          if (explicit === undefined) autoFailed = { url: pageUrl, at: Date.now() };
+          throw err;
+        }
+      });
+    } finally {
+      lastManualAt = Date.now();
+    }
+  }
+
+  // The player is in front on the TV as soon as it gets the stream (the agent reports 'playing' later).
+  function sendPlay(adapter, msg) {
+    adapter.sendScreen(msg);
+    setVideo('loading');
+  }
+
+  async function handOff({ url: explicit, convert = false } = {}, ctx = {}) {
     const pageUrl = store.get('browser.url')?.v ?? '';
     const yt = youtubeVideo(explicit ?? pageUrl);
     if (yt) {
       const onPage = youtubeVideo(pageUrl)?.id === yt.id;
       // An explicit link's own t= wins over where the page's player is.
-      return playOnYoutube(yt, { fromPage: onPage && !(explicit && yt.t), onPage });
+      return playOnYoutube(yt, { fromPage: onPage && !(explicit && yt.t), onPage }, ctx);
     }
     const pick = await pickMedia(explicit);
-    if (pick?.kind === 'youtube') return playOnYoutube(pick.video);
+    if (pick?.kind === 'youtube') return playOnYoutube(pick.video, {}, ctx);
     const adapter = a();
     if (!pick) throw new LumenError('NOT_FOUND', 'No video found on this page yet: start the video, then try again');
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
     const { url, token } = relay().register(pick.url, pick.headers);
     // HLS with fragmented-MP4 segments never plays in the TV's own player (CineHD found the same), so
     // the agent goes straight to its in-page hls.js player for it.
+    let probeTimer = null;
     const probe = pick.kind === 'hls' && relay().probeHls
-      ? await Promise.race([relay().probeHls(token).catch(() => null), new Promise((r) => setTimeout(r, 6000, null))])
+      ? await Promise.race([
+        relay().probeHls(token).catch(() => null),
+        new Promise((r) => { probeTimer = setTimeout(r, PROBE_MS, null); }),
+      ]).finally(() => clearTimeout(probeTimer))
       : null;
-    if (probe?.drm) return playProtected(pick);
+    if (probe?.drm) return playProtected(pick, ctx);
     const engine = probe?.fmp4 ? 'hls' : 'avplay';
+    checkLive(ctx);
     if (!on) await open();
     const tc = transcoder();
     const known = tc?.existing?.(pick.url);
@@ -365,12 +466,13 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     // A video already converted (or known not to play directly) goes straight to the converted copy.
     if (known || convert) {
       current.stage = known && !known.copy ? 'copy' : 'direct';
-      await fallback(known ? 'converted before' : 'conversion requested');
+      if (await fallback(known ? 'converted before' : 'conversion requested')) await pausePage();
       return { value: { kind: pick.kind, title: current.title, converted: true } };
     }
-    adapter.sendScreen({ t: 'screen-play', url, title: current.title, engine });
+    sendPlay(adapter, { t: 'screen-play', url, title: current.title, engine });
+    await pausePage();
     log.info('video handed to the TV player', { kind: pick.kind, engine, host: new URL(pick.url).hostname });
-    return { value: { kind: pick.kind, title: store.get('browser.title')?.v ?? null } };
+    return { value: { kind: pick.kind, engine, title: store.get('browser.title')?.v ?? null } };
   }
 
   // DRM-protected video plays through the TV's own certified DRM (PlayReady / Widevine via EME in the
@@ -387,39 +489,49 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { stream: cdn && cdn.url || null, playready: lic('playready'), widevine: lic('widevine'), widevineCert: wv && typeof wv.certificate === 'string' ? wv.certificate : null };
   })()`;
 
-  async function playProtected(pick) {
+  async function playProtected(pick, ctx = {}) {
     const info = await b().evaluate(DRM_SCRIPT).catch(() => null);
     if (!info?.stream || !(info.playready || info.widevine)) {
       throw new LumenError('UNAVAILABLE', 'This video is DRM-protected and Lumen could not find its licence server on this page');
     }
-    const { url } = relay().register(info.stream, pick.headers);
+    // The page's cookie was captured for pick.url: it goes only to that same site, never to a stream
+    // or licence host the page's script names.
+    const noCookie = { ...pick.headers };
+    delete noCookie.cookie;
+    const headersFor = (target, extra = {}) => ({ ...(siteOf(target) === siteOf(pick.url) ? pick.headers : noCookie), ...extra });
+    const { url } = relay().register(info.stream, headersFor(info.stream));
     const drm = {};
-    if (info.playready) drm['com.microsoft.playready'] = { licenseUrl: relay().register(info.playready, { ...pick.headers, licence: 'resolve' }).url };
+    if (info.playready) drm['com.microsoft.playready'] = { licenseUrl: relay().register(info.playready, headersFor(info.playready, { licence: 'resolve' })).url };
     if (info.widevine) {
       // Widevine first asks for the licence server's (public) service certificate; the page carries it.
       const cert = /^[A-Za-z0-9+/=]{16,8192}$/.test(info.widevineCert ?? '') ? Buffer.from(info.widevineCert, 'base64') : null;
       drm['com.widevine.alpha'] = {
-        licenseUrl: relay().register(info.widevine, { ...pick.headers, licence: 'resolve' }).url,
+        licenseUrl: relay().register(info.widevine, headersFor(info.widevine, { licence: 'resolve' })).url,
         ...(cert && relay().registerBlob && { serverCertificateUrl: relay().registerBlob(cert).url }),
       };
     }
+    checkLive(ctx);
     if (!on) await open();
+    // A converted video playing before keeps no ffmpeg running behind the protected one.
+    if (current?.job) transcoder()?.stopJob(current.job);
     current = { pick, title: store.get('browser.title')?.v ?? '', stage: 'drm', job: null };
-    a().sendScreen({ t: 'screen-play', url, title: current.title, engine: 'hls', drm });
+    sendPlay(a(), { t: 'screen-play', url, title: current.title, engine: 'hls', drm });
+    await pausePage();
     log.info('protected video handed to the TV player', { host: new URL(info.stream).hostname, systems: Object.keys(drm) });
     return { value: { kind: 'hls', drm: Object.keys(drm), title: current.title } };
   }
 
   // The TV's player refused the stream: re-package it (copy) on this PC, then fully convert it.
+  // → true when a converted copy went to the TV.
   async function fallback(error) {
-    if (!current || !on) return;
-    if (current.stage === 'drm') { toast('The TV could not get a licence for this protected video'); return; }
+    if (!current || !on) return false;
+    if (current.stage === 'drm') { toast('The TV could not get a licence for this protected video'); return false; }
     const next = current.stage === 'direct' ? 'copy' : current.stage === 'copy' ? 'encode' : null;
     const tc = transcoder();
     if (!next || !tc?.available()) {
       if (!next) toast('The TV cannot play this video');
       else toast('The TV cannot play this format, and ffmpeg is missing on the PC to convert it');
-      return;
+      return false;
     }
     if (current.job) tc.stopJob(current.job);
     current.stage = next;
@@ -427,12 +539,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     try {
       const { id } = await tc.convert(current.pick.url, { headers: current.pick.headers, proxyUrl: relay()?.proxyUrl?.() ?? null, copy: next === 'copy' });
       current.job = id;
-      agent()?.sendScreen?.({ t: 'screen-play', url: relay().convertedUrl(id), title: current.title, fromStart: true });
+      const adapter = agent();
+      if (adapter?.sendScreen) sendPlay(adapter, { t: 'screen-play', url: relay().convertedUrl(id), title: current.title, fromStart: true });
       log.info('playing the converted video on the TV', { stage: next, after: error.slice(0, 80) });
+      return true;
     } catch (err) {
       log.warn('conversion failed', { stage: next, message: err.message });
       if (next === 'copy') return fallback(error);
       toast(err.message);
+      return false;
     }
   }
 
@@ -441,8 +556,19 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     close,
     playVideo,
     pointer,
-    start() { setState(false); },
+    start() {
+      setState(false);
+      // The agent gone (closed, the TV off): its player is gone too, whatever it last reported.
+      removeStoreListener ??= store.on('patch', (patch) => {
+        if ('conn.agent' in patch && patch['conn.agent']?.v !== 'online' && store.get('tvscreen.video')?.v != null) {
+          heldFrame = null;
+          setVideo(null);
+        }
+      });
+    },
     async stop() {
+      removeStoreListener?.();
+      removeStoreListener = null;
       if (current?.job) transcoder()?.stopJob(current.job);
       await close();
     },
