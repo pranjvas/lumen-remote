@@ -326,6 +326,7 @@
     if (msg.type === 'open-url') return openUrl(msg.url);
     if (msg.type === 'launch') return launchApp(msg.appId, msg.operation, msg.data);
     if (msg.type === 'meta') return appMeta(msg.appId);
+    if (msg.type === 'caps') return mediaCaps();
     if (msg.type === 'screen') return screenMode(msg.on === true);
     if (msg.type === 'exit') {
       setTimeout(quit, 200);
@@ -346,6 +347,37 @@
       hideSoon();
     }
     return { on: on };
+  }
+
+  // ---- caps: what this TV's web engine can play (for Lumen's live video of its browser) ----
+
+  var CAPS_TYPES = [
+    'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.640028"', 'video/mp4; codecs="avc1.640029"',
+    'video/mp4; codecs="avc1.64002A"', 'video/mp4; codecs="avc1.640033"', 'video/mp4; codecs="avc1.640034"',
+    'video/mp4; codecs="hvc1.1.6.L120.B0"', 'video/mp4; codecs="hvc1.1.6.L150.B0"', 'video/mp4; codecs="hev1.1.6.L150.B0"',
+    'video/mp4; codecs="hvc1.2.4.L153.B0"', 'video/mp4; codecs="hvc1.1.6.L153.B0"',
+    'audio/mp4; codecs="mp4a.40.2"', 'audio/mp4; codecs="opus"', 'video/webm; codecs="vp9"', 'video/webm; codecs="vp8, opus"'
+  ];
+
+  function mediaCaps() {
+    var mse = {};
+    var plain = {};
+    var probe = document.createElement('video');
+    CAPS_TYPES.forEach(function (t) {
+      mse[t] = read(function () { return window.MediaSource ? MediaSource.isTypeSupported(t) : null; }, null);
+      plain[t] = read(function () { return probe.canPlayType(t); }, null);
+    });
+    return {
+      userAgent: navigator.userAgent,
+      mediaSource: typeof window.MediaSource,
+      webkitMediaSource: typeof window.WebKitMediaSource,
+      rtcPeerConnection: typeof window.RTCPeerConnection,
+      webkitRtcPeerConnection: typeof window.webkitRTCPeerConnection,
+      videoDecoder: typeof window.VideoDecoder,
+      screen: { w: screen.width, h: screen.height, dpr: window.devicePixelRatio },
+      mse: mse,
+      canPlayType: plain
+    };
   }
 
   // ---- meta: an app's declared metadata (partner apps put their deep-link template here,

@@ -754,6 +754,13 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     },
 
     // An installed app's declared metadata (deep-link templates and the like) through the agent.
+    // What the TV's web engine can play (MSE/canPlayType codec support, WebRTC), for live video.
+    'agent.caps': async () => {
+      requireTvOn();
+      const res = await call('agent', 'request', 'caps', {});
+      return { value: res.value ?? res };
+    },
+
     'agent.meta': async ({ appId }) => {
       requireTvOn();
       text(appId, 'appId', { max: 128, pattern: /^[A-Za-z0-9._-]+$/ });
