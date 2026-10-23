@@ -1110,7 +1110,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   /** A JPEG screenshot of the page as the browser shows it. */
   async function screenshot() {
     const cdp = requireReady();
-    const { data } = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70 });
+    const params = { format: 'jpeg', quality: 70 };
+    // The TV's live video renders the page at 1.5× or 3×: the picture stays at CSS size.
+    if (sinks.size && tvScale !== 1) {
+      const v = (await cdp.send('Page.getLayoutMetrics')).cssVisualViewport;
+      if (v) params.clip = { x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: 1 / tvScale };
+    }
+    const { data } = await cdp.send('Page.captureScreenshot', params);
     return Buffer.from(data, 'base64');
   }
 

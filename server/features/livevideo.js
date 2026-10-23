@@ -263,7 +263,7 @@ export function createFanout({ requestKey, now = () => Date.now(), setTimer = se
     },
     onInit(next) {
       gen += 1;
-      init = { gen, info: { mime: next.mime, codec: next.codec, width: next.width, height: next.height, fps: next.fps, audio: next.audio, reset: next.reset }, buf: next.buf };
+      init = { gen, info: { mime: next.mime, tvMime: next.tvMime ?? null, codec: next.codec, width: next.width, height: next.height, fps: next.fps, audio: next.audio, reset: next.reset }, buf: next.buf };
       for (const [viewer, state] of viewers) if (!state.paused) sendInit(viewer, state);
     },
     onMedia(m) {
@@ -358,11 +358,11 @@ export function createRateControl({ ladder, startIndex = 0 }) {
       const { min, max } = ladder[index].bitrate;
       if (congested) {
         good = 0;
-        bad += 1;
         if (bitrate > min) {
           bitrate = Math.max(min, Math.round(bitrate * 0.7));
           return { bitrate };
         }
+        bad += 1; // congested at the floor of this step
         if (bad >= 3 && index < ladder.length - 1) return moveTo(index + 1, 'congestion');
         return null;
       }
@@ -609,7 +609,10 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   function onMuxed(m) {
     if (m.kind === 'init') {
       log.info('live video stream', { codec: m.codec, size: `${m.width}x${m.height}`, fps: m.fps, audio: m.audio, reset: m.reset });
-      fanout.onInit(m);
+      // The encoder's exact codec string (HEVC can come out as High tier) and the one the TV said it
+      // takes for this step: the TV's player uses the first it accepts.
+      const tv = rate?.step?.codec?.tv;
+      fanout.onInit({ ...m, tvMime: tv && familyOf(tv) === familyOf(m.codec) ? mimeType(tv, m.audio) : null });
       publishState('streaming');
     } else fanout.onMedia(m);
   }

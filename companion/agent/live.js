@@ -230,14 +230,20 @@
 
   // ---- messages ----
 
+  function family(type) { return /hvc1|hev1/.test(String(type)) ? 'hevc' : 'avc'; }
+
+  function supported(type) {
+    if (!type || !window.MediaSource) return false;
+    try { return MediaSource.isTypeSupported(String(type)); } catch (e) { return false; }
+  }
+
   function onInit(g, info, data) {
-    const type = String(info.mime || '');
-    if (!ms || info.reset || type !== mime) {
-      let ok = false;
-      try { ok = window.MediaSource && MediaSource.isTypeSupported(type); } catch (e) { ok = false; }
-      if (!ok) { gen = g; refuse('not supported: ' + type.slice(0, 80)); return; }
-      create(type);
-    }
+    // The stream's exact codec string first, then the one this TV said it takes for the step.
+    const exact = String(info.mime || '');
+    const type = supported(exact) ? exact : supported(info.tvMime) ? String(info.tvMime) : null;
+    if (!type) { gen = g; refuse('not supported: ' + exact.slice(0, 80)); return; }
+    // Same codec family: a new resolution goes into the same buffer (MSE takes a new init segment).
+    if (!ms || info.reset || family(type) !== family(mime)) create(type);
     gen = g;
     waitInit = false;
     queue.push(data);
