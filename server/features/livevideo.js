@@ -474,7 +474,7 @@ async function evaluate(cdp, expression, { gesture = false } = {}) {
 
 export function createLiveVideo({ config, log: rootLog, store, browser }) {
   const log = rootLog.child('livevideo');
-  const settings = { enabled: false, maxHeight: 1080, preferHevc: true, idleStopMs: 15_000, gopSeconds: 2, fragmentMs: FRAGMENT_MS,
+  const settings = { enabled: false, maxHeight: 1080, preferHevc: true, idleStopMs: 15_000, gopSeconds: 1, fragmentMs: FRAGMENT_MS,
     statsLateMs: STATS_LATE_MS, statsGoneMs: STATS_GONE_MS, statsGraceMs: STATS_GRACE_MS, ...config.liveVideo };
   const token = randomBytes(24).toString('hex');
   let server = null; // loopback HTTP + WebSocket server for the capture page
@@ -722,7 +722,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
       if (quietMs > settings.statsGoneMs) { log.warn('the TV stopped reporting on the live video', { quietMs }); v.onFallback?.('the TV stopped reporting'); continue; }
       signals.statsLate = quietMs > settings.statsLateMs;
       v.refused = false;
-      v.last = { ...signals, kbps: sent ? Math.round((sent.sentBytes * 8) / 1000) : 0, lagMs: tv?.lag != null ? Math.round(tv.lag * 1000) : null };
+      v.last = { ...signals, kbps: sent ? Math.round((sent.sentBytes * 8) / 1000) : 0, lagMs: tv?.lag != null ? Math.round(tv.lag * 1000) : (v.last?.lagMs ?? null) };
       const change = rate.tick(signals);
       if (change?.exhausted) { v.onFallback?.('The TV could not play the live video'); continue; }
       if (change?.step !== undefined) {

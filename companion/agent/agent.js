@@ -286,8 +286,13 @@
 
   // ---- reporting ----
 
+  let watchTicks = 0;
   function watchTick() {
     if (!greeted) return;
+    // These readings are synchronous calls into the TV's services (up to half a second each while
+    // video decodes): with live video on, every third second is enough (volume has its own listener).
+    watchTicks += 1;
+    if (window.LumenLive && window.LumenLive.isShowing() && watchTicks % 3 !== 0) return;
     const fast = readFast();
     if (JSON.stringify(fast) !== lastFastSig) send({ t: 'state', snapshot: snapshotWith(fast) });
   }
