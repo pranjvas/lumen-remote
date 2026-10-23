@@ -340,6 +340,17 @@ const BROWSER_COMMANDS = {
     publishBrowser();
     return {};
   },
+  // Clear history: the fake browser closes and forgets its pages, and every client hears browser.cleared.
+  'browser.clearHistory': async ({ history = true, cache = true, cookies = false }) => {
+    await sleep(700);
+    if (history) {
+      clearTimeout(browser.loadTimer);
+      Object.assign(browser, { session: 'off', error: null, url: null, title: null, loading: false, history: [], index: -1, scroll: 0, typed: '', focus: false });
+      publishBrowser();
+    }
+    broadcast({ t: 'browser.cleared', history, cache, cookies });
+    return { value: { history, cache, cookies, removed: 12, left: [], restarted: false } };
+  },
   'browser.openOnTv': async ({ url }) => {
     requireOn();
     const href = browserUrl(url || browser.url);

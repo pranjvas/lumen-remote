@@ -54,6 +54,7 @@ const NAMES = {
   rest: 'The TV', remote: 'The remote channel', upnp: 'UPnP', ipc: 'IP Control', agent: 'The TV agent', eyes: 'Lumen Eyes',
   wol: 'Wake-on-LAN', avtransport: 'Media casting', dial: 'App casting', sleep: 'The sleep timer', scenes: 'Scenes',
   tracked: 'Tracked settings', macros: 'Macros', cast: 'Cast', ai: 'Ask Lumen', browser: 'The browser', vpn: 'The VPN',
+  history: 'Clearing history',
 };
 
 // The caller used when hub.handle is given no client (internal use, tests).
@@ -865,6 +866,16 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return {};
     },
     'browser.close': async () => feature('browser', 'close'),
+    // Clear history (Browser view): what Lumen's browser and Lumen kept about the pages it showed
+    // (features/history.js). history and cache are on unless turned off; cookies (signs out of
+    // sites) only when asked. Every client then forgets its own copy (browser.cleared).
+    'browser.clearHistory': async ({ history = true, cache = true, cookies = false }) => {
+      const choice = { history: boolean(history, 'history'), cache: boolean(cache, 'cache'), cookies: boolean(cookies, 'cookies') };
+      if (!choice.history && !choice.cache && !choice.cookies) throw invalid('Choose what to clear');
+      const res = await feature('history', 'clear', choice);
+      broadcast({ t: 'browser.cleared', ...choice });
+      return res;
+    },
     // "On TV": Lumen's own browser shown full screen on the TV (the TV's built-in browser stays
     // available as browser.openInTvBrowser).
     'browser.openOnTv': async ({ url }) => {

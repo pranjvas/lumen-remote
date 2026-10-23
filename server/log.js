@@ -1,5 +1,6 @@
 // Leveled logger: console + <dir>/lumen.log (rotated at 1 MB, three old files kept).
-// Every message and object is redacted first: tokens, keys, MAC-like and UUID-like strings.
+// Every message and object is redacted first: tokens, keys, MAC-like and UUID-like strings, and the
+// path and query of web addresses (only scheme://host stays).
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -9,6 +10,14 @@ const KEEP = 3;
 const MAX_DEPTH = 6;
 
 const SENSITIVE_KEY = /token|secret|authorization|password|cookie|csrf|agentkey|wifimac|^mac$|^sid$|duid|serial/i;
+// A web address keeps only its scheme and host: the path and query of a page (search terms, video
+// ids, the target of a relay link) are browsing history and never reach the log in full.
+const URL_IN_TEXT = /\b((?:https?|wss?):\/\/)([^\s/?#"'<>\\)\]|]+)([/?#][^\s"'<>\\)\]|]*)?/gi;
+function shortenUrl(match, scheme, authority, rest) {
+  const host = authority.slice(authority.lastIndexOf('@') + 1); // no user:password@
+  return `${scheme}${host}${rest && rest !== '/' ? '/…' : rest ?? ''}`;
+}
+
 const STRING_RULES = [
   [/\b(bearer)\s+[\w.~+/=-]+/gi, '$1 [redacted]'],
   [/("(?:[\w-]*(?:token|secret|authorization|key))"\s*:\s*")[^"]*"/gi, '$1[redacted]"'],
@@ -16,6 +25,7 @@ const STRING_RULES = [
   [/\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b/gi, '[mac]'],
   [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '[uuid]'],
   [/\b[0-9a-f]{32,}\b/gi, '[hex]'],
+  [URL_IN_TEXT, shortenUrl],
 ];
 
 export function redactString(text) {
@@ -86,6 +96,14 @@ function createFileSink(dir, { maxBytes = MAX_BYTES, keep = KEEP } = {}) {
         console.error(`lumen: file logging disabled (${err.code ?? err.message})`);
       }
     },
+    // After the files were rewritten in place (clear history): the next line reopens the file and
+    // counts its size afresh.
+    reopen() {
+      if (fd !== null) {
+        try { fs.closeSync(fd); } catch { /* already closed */ }
+      }
+      fd = null;
+    },
     close() {
       if (fd !== null) {
         try { fs.closeSync(fd); } catch { /* already closed */ }
@@ -143,5 +161,5 @@ export function createLogger({
     };
   }
 
-  return { ...make(null), close: () => sink?.close() };
+  return { ...make(null), close: () => sink?.close(), reopen: () => sink?.reopen() };
 }

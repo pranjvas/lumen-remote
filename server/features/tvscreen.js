@@ -40,6 +40,7 @@ const AUTO_RETRY_MS = 60000; // a page whose video could not be handed over is n
 const MANUAL_GRACE_MS = 5000; // the automatic hand-off leaves the page alone this long around a manual one
 const PROBE_MS = 6000; // the HLS probe's budget: a slow or failing playlist plays in AVPlay
 // Two hosts are the same site when their last two labels match (the relay's own rule for cookies).
+const hostOf = (raw) => { try { return new URL(raw).hostname; } catch { return null; } };
 const siteOf = (raw) => { try { return new URL(raw).hostname.toLowerCase().split('.').slice(-2).join('.'); } catch { return ''; } };
 
 /** The YouTube video a link points at → { id, t? } (t in whole seconds), or null. Covers watch?v=,
@@ -312,7 +313,8 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       unsubscribe = adapter.onScreen(onMessage);
       setState(true);
       if (config.tvscreen?.autoPlayOnTv !== false) autoTimer = setInterval(() => { autoHandOff().catch(() => {}); }, AUTO_POLL_MS);
-      log.info('browser shown on the TV', { url: store.get('browser.url')?.v ?? null });
+      // The site only: page addresses are browsing history (Clear history scrubs even this from the log).
+      log.info('browser shown on the TV', { host: hostOf(store.get('browser.url')?.v) });
     }
     // Every open offers live video again: after the agent restarted or reconnected, its player is gone.
     offerLive();
@@ -736,12 +738,29 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { value: { live: liveWanted } };
   }
 
+  /** Clear history: forgets the pages and videos the TV screen remembers (the page whose video failed,
+   *  the last YouTube hand-off, the page's last frame). A video the TV is playing now keeps going;
+   *  → { videoOnTv, job }: whether one is, and its conversion job, which must stay. */
+  function forgetHistory() {
+    const playing = videoActive();
+    autoFailed = null;
+    lastYoutube = null;
+    lastJpeg = null;
+    heldFrame = null;
+    if (!playing) {
+      if (current?.job) transcoder()?.stopJob(current.job);
+      current = null;
+    }
+    return { videoOnTv: playing, job: playing ? current?.job ?? null : null };
+  }
+
   return {
     open,
     close,
     playVideo,
     pointer,
     setLive,
+    forgetHistory,
     start() {
       setState(false);
       // The agent gone (closed, the TV off): its player is gone too, whatever it last reported.

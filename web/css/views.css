@@ -1107,6 +1107,21 @@
   .browser-tools .btn .icon { width: 21px; height: 21px; }
 }
 
+/* Clear history: a quiet button at the end of the page status row on every width (an icon alone on
+   narrow phones), and its sheet: one row per kind of data, each saying what it removes. */
+.browser-status .browser-clear { flex: none; height: 28px; padding: 0 10px; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.browser-status .browser-clear .icon { width: 15px; height: 15px; }
+@media (max-width: 420px) {
+  .browser-status .browser-clear { width: 32px; padding: 0; gap: 0; }
+  .browser-status .browser-clear span { display: none; }
+}
+.clear-row { align-items: flex-start; }
+.clear-row input { flex: none; margin: 3px 0 0; }
+.clear-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.clear-text b { font-weight: 600; color: var(--ink); }
+.clear-text small { font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }
+.clear-note { margin: 14px 2px 0; font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }
+
 /* Settings: Bluetooth devices */
 .bt-devices { display: flex; flex-direction: column; gap: 6px; }
 .bt-device { display: flex; align-items: center; gap: 6px; }
