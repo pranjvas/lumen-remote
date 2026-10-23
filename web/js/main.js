@@ -1,6 +1,7 @@
 // Lumen web UI entry: live link, state, routing, presence, chrome and views.
 
-import { $, h } from './ui/dom.js';
+import { $, h, icon } from './ui/dom.js';
+import { openSheet } from './ui/sheet.js';
 import { createLive } from './core/live.js';
 import { createState } from './core/state.js';
 import { createContext } from './core/ctx.js';
@@ -52,6 +53,27 @@ const ask = createAsk(ctx);
 const bar = ask.composer();
 bar.form.id = 'askbar';
 $('#askbar-slot').replaceWith(bar.form);
+
+// Lumen AI is one tap away on every screen: the header button opens a composer over the current view
+// (sending goes to the conversation, like the ask bar). Phones only; desktop always shows the bar.
+const aiButton = h('button', { class: 'ai-btn', type: 'button', 'aria-label': 'Ask Lumen', title: 'Ask Lumen (/)' }, icon('spark', 'sm'), h('span', { text: 'Ask' }));
+aiButton.addEventListener('click', () => {
+  let sheetInput = null;
+  openSheet({
+    title: 'Ask Lumen',
+    className: 'ask-sheet',
+    build(body, sheet) {
+      const { form, input } = ask.composer({ big: true });
+      sheetInput = input;
+      input.placeholder = bar.input.placeholder;
+      input.setAttribute('autofocus', '');
+      form.addEventListener('submit', () => sheet.close());
+      body.append(form, h('p', { class: 'ask-sheet-hint', text: 'Anything on the TV, in any app: play a title, change a setting, find something on a page.' }));
+    },
+    onClose: () => ask.inputs.delete(sheetInput),
+  });
+});
+$('#ai-slot').replaceWith(aiButton);
 
 state.watch('device.name', () => {
   const name = state.value('device.name', null) || state.value('device.modelName', null);

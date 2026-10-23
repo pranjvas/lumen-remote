@@ -590,6 +590,30 @@ img { display: block; }
   .app[data-view="remote"] .askbar { display: none; }
 }
 
+/* Lumen AI button: in the header on every phone screen (desktop keeps the ask bar in view). */
+.ai-btn {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 14px 0 11px;
+  border-radius: var(--r-pill);
+  color: var(--accent-ink, #1a1206);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: 0.01em;
+  background: linear-gradient(135deg, color-mix(in oklab, var(--accent) 92%, white), var(--accent));
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 60%, transparent), 0 6px 22px -6px color-mix(in oklab, var(--accent) 70%, transparent);
+}
+.ai-btn .icon { color: currentColor; }
+.ai-btn:active { transform: scale(0.96); }
+@media (max-width: 979px) {
+  .ai-btn { display: inline-flex; }
+  .app[data-view="ask"] .ai-btn { display: none; }
+}
+.ask-sheet .ask-composer { margin: 4px 0 0; }
+.ask-sheet-hint { margin: 12px 2px 4px; font-size: 13px; color: var(--ink-3); }
+
 /* The Ask view has its own composer, docked under the conversation. */
 .app[data-view="ask"] .askbar { visibility: hidden; }
 @media (max-width: 979px) {
