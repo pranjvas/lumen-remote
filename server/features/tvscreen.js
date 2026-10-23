@@ -11,7 +11,7 @@ const STREAK_MS = 260; // presses closer than this accelerate
 const SCROLL_PX = 600;
 const EDGE = 0.002;
 
-export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay }) {
+export function createTvScreen({ config, log: rootLog, store, agent, rest, browser, relay, transcoder = () => null }) {
   const log = rootLog.child('tvscreen');
   const appId = config.agent?.appId;
   let on = false;
@@ -21,6 +21,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let streak = 0;
   let lastKeyAt = 0;
   let queue = Promise.resolve();
+  let current = null; // { pick, title, stage: 'direct' | 'copy' | 'encode', job }
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
   const b = () => {
@@ -101,7 +102,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       else if (msg.pointer) enqueue(() => onPointer(msg.pointer, msg.click === true));
     } else if (msg.t === 'screen-video') {
       store.set('tvscreen.video', typeof msg.state === 'string' ? msg.state.slice(0, 20) : null, { src: 'derived', via: 'tvscreen' });
-      if (msg.state === 'error') log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 200) });
+      if (msg.state === 'error') {
+        log.warn('TV player error', { error: String(msg.error ?? '').slice(0, 200), stage: current?.stage ?? null });
+        enqueue(() => fallback(String(msg.error ?? '')));
+      }
     }
   }
 
@@ -175,9 +179,36 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (!relay()) throw new LumenError('UNAVAILABLE', 'The media relay is not available');
     const { url } = relay().register(pick.url, pick.headers);
     if (!on) await open();
-    adapter.sendScreen({ t: 'screen-play', url, title: store.get('browser.title')?.v ?? '' });
+    if (current?.job) transcoder()?.stopJob(current.job);
+    current = { pick, title: store.get('browser.title')?.v ?? '', stage: 'direct', job: null };
+    adapter.sendScreen({ t: 'screen-play', url, title: current.title });
     log.info('video handed to the TV player', { kind: pick.kind, host: new URL(pick.url).hostname });
     return { value: { kind: pick.kind, title: store.get('browser.title')?.v ?? null } };
+  }
+
+  // The TV's player refused the stream: re-package it (copy) on this PC, then fully convert it.
+  async function fallback(error) {
+    if (!current || !on) return;
+    const next = current.stage === 'direct' ? 'copy' : current.stage === 'copy' ? 'encode' : null;
+    const tc = transcoder();
+    if (!next || !tc?.available()) {
+      if (!next) toast('The TV cannot play this video');
+      else toast('The TV cannot play this format, and ffmpeg is missing on the PC to convert it');
+      return;
+    }
+    if (current.job) tc.stopJob(current.job);
+    current.stage = next;
+    toast(next === 'copy' ? 'Preparing the video for the TV…' : 'Converting the video for the TV…');
+    try {
+      const { id } = await tc.convert(current.pick.url, { headers: current.pick.headers, proxyUrl: relay()?.proxyUrl?.() ?? null, copy: next === 'copy' });
+      current.job = id;
+      agent()?.sendScreen?.({ t: 'screen-play', url: relay().convertedUrl(id), title: current.title });
+      log.info('playing the converted video on the TV', { stage: next, after: error.slice(0, 80) });
+    } catch (err) {
+      log.warn('conversion failed', { stage: next, message: err.message });
+      if (next === 'copy') return fallback(error);
+      toast(err.message);
+    }
   }
 
   return {
@@ -185,7 +216,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     close,
     playVideo,
     start() { setState(false); },
-    async stop() { await close(); },
+    async stop() {
+      if (current?.job) transcoder()?.stopJob(current.job);
+      await close();
+    },
     setDemand() {},
   };
 }

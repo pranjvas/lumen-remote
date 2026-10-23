@@ -25,6 +25,7 @@ import { createBrowser } from './features/browser.js';
 import { createVpn } from './features/vpn.js';
 import { createRelay } from './features/relay.js';
 import { createTvScreen } from './features/tvscreen.js';
+import { createTranscoder } from './features/transcode.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -99,14 +100,15 @@ export async function startServer(overrides = {}, seams = {}) {
       macros: createMacros({ ...ctx, remote }),
       // Page links from Cast open in the Browser view, which is created after the hub (it sends frames through it).
       cast: createCast({ ...ctx, avtransport, dial, rest, lan, browser: () => features.browser, agent: () => agent }),
-      relay: createRelay({ ...ctx, vpn: () => features.vpn }),
+      transcode: createTranscoder(ctx),
+      relay: createRelay({ ...ctx, vpn: () => features.vpn, transcoder: () => features.transcode }),
     };
     const hub = createHub({ ...ctx, adapters, features });
     let http = null;
     // The MCP URL handed to the Claude Code CLI must use the bound port (port 0 in tests).
     features.ai = createAi({ ...ctx, hub, adapters, browser: () => features.browser, httpPort: () => http?.port ?? config.http.port, backends: seams.aiBackends });
     features.browser = createBrowser({ ...ctx, hub, vpn: () => features.vpn });
-    features.tvscreen = createTvScreen({ ...ctx, agent: () => agent, rest, browser: () => features.browser, relay: () => features.relay });
+    features.tvscreen = createTvScreen({ ...ctx, agent: () => agent, rest, browser: () => features.browser, relay: () => features.relay, transcoder: () => features.transcode });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);

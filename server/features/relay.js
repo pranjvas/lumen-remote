@@ -3,6 +3,7 @@
 // Referer and the browser's User-Agent, following redirects. HLS playlists are rewritten so every
 // variant playlist, key and segment also comes through the relay. Stream tokens are random and
 // expire; only http(s) targets are relayed.
+import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
@@ -123,7 +124,7 @@ export function rewritePlaylist(text, base, toRelay) {
   }).join('\n');
 }
 
-export function createRelay({ log: rootLog, lan, vpn = () => null }) {
+export function createRelay({ log: rootLog, lan, vpn = () => null, transcoder = () => null }) {
   const log = rootLog.child('relay');
   const sessions = new Map(); // token → { referer, origin, userAgent, at }
   let unroute = null;
@@ -158,8 +159,20 @@ export function createRelay({ log: rootLog, lan, vpn = () => null }) {
     return { token, url: relayUrl(token, url.href) };
   }
 
+  // /relay/x/<job>/<file>: HLS written by the transcoder (features/transcode.js).
+  function serveConverted(req, res, job, name) {
+    const file = transcoder()?.file(job, name);
+    if (!file) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
+    const playlist = name.endsWith('.m3u8');
+    const size = fs.statSync(file).size;
+    res.writeHead(200, { 'content-type': playlist ? 'application/vnd.apple.mpegurl' : 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
+    if (req.method === 'HEAD') { res.end(); return; }
+    fs.createReadStream(file).pipe(res);
+  }
+
   async function onRequest(req, res) {
     const parts = new URL(req.url, 'http://relay.invalid').pathname.split('/').filter(Boolean); // relay, token, target, name
+    if (parts[1] === 'x' && parts.length === 4) return serveConverted(req, res, parts[2], parts[3]);
     const session = sessions.get(parts[1]);
     const target = parts[2] ? webUrl((() => { try { return unb64url(parts[2]); } catch { return ''; } })()) : null;
     if (!session || !target || (req.method !== 'GET' && req.method !== 'HEAD')) {
@@ -215,6 +228,8 @@ export function createRelay({ log: rootLog, lan, vpn = () => null }) {
       sessions.clear();
     },
     register,
+    convertedUrl: (job) => `${base()}/x/${job}/index.m3u8`,
+    proxyUrl: () => vpn()?.proxyUrl?.() ?? null,
     setDemand() {},
   };
 }
