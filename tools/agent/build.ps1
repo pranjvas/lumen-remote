@@ -95,6 +95,11 @@ if ($created.Count -gt 0) {
 # ---- 3. agent-config.json ----
 $version = ([xml](Get-Content -LiteralPath (Join-Path $AgentDir 'config.xml') -Raw)).widget.version
 if (-not $version) { throw 'companion/agent/config.xml has no widget version' }
+# The agent's CSP lets its player fetch only from the relay port; another lan.port would break playback.
+$csp = [string](Select-String -LiteralPath (Join-Path $AgentDir 'config.xml') -Pattern '<tizen:content-security-policy>(.*)</tizen:content-security-policy>').Matches[0].Groups[1].Value
+if ($csp -notmatch "connect-src [^;]*http://\*:$PcPort(\s|;|$)" -or $csp -notmatch "media-src [^;]*http://\*:$PcPort(\s|;|$)") {
+  throw "companion/agent/config.xml CSP does not allow the relay port $PcPort (add http://*:$PcPort to connect-src and media-src)"
+}
 Write-JsonFile (Join-Path $AgentDir 'agent-config.json') ([ordered]@{
   pcHost = $pcHost
   pcPort = $PcPort

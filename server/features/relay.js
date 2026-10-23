@@ -242,6 +242,37 @@ function readBody(res, max, { drain = false } = {}) {
     });
     res.on('end', () => resolve(Buffer.concat(chunks)));
     res.on('error', reject);
+    res.resume(); // a 'data' listener alone does not restart a stream readHead paused
+  });
+}
+
+const PLAYLIST_SNIFF_BYTES = 64;
+const looksLikePlaylist = (head) => /^﻿?\s*#EXTM3U/.test(head.toString('utf8'));
+
+/** The first `bytes` bytes of a response (fewer when it ends sooner), leaving the rest unread and paused. */
+function readHead(res, bytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const detach = () => {
+      res.off('data', onData);
+      res.off('end', onEnd);
+      res.off('error', onError);
+      res.off('close', onClose);
+    };
+    const finish = (ended) => {
+      detach();
+      res.pause();
+      resolve({ head: Buffer.concat(chunks), ended });
+    };
+    const onData = (c) => { chunks.push(c); size += c.length; if (size >= bytes) finish(false); };
+    const onEnd = () => finish(true);
+    const onError = (err) => { detach(); reject(err); };
+    const onClose = () => { detach(); reject(new Error('the stream closed early')); };
+    res.on('data', onData);
+    res.on('end', onEnd);
+    res.on('error', onError);
+    res.on('close', onClose);
   });
 }
 
@@ -470,9 +501,25 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     }
     const { res: up, url: finalUrl } = upstream;
     const type = up.headers['content-type'] ?? '';
-    if (up.statusCode === 200 && isPlaylist(type, finalUrl) && req.method === 'GET') {
+    // A playlist served with another type from a URL without .m3u8 is still a playlist to hls.js (it only
+    // checks for #EXTM3U), so the body decides too: left unrewritten, its URIs would be fetched by the TV
+    // itself, outside the VPN.
+    let sniffed = null;
+    if (up.statusCode === 200 && req.method === 'GET' && !isPlaylist(type, finalUrl)) {
       try {
-        const text = (await readBody(up, MAX_PLAYLIST_BYTES)).toString('utf8');
+        sniffed = await readHead(up, PLAYLIST_SNIFF_BYTES);
+      } catch (err) {
+        log.warn('relay fetch failed', { host: target.hostname, message: err.message });
+        up.destroy();
+        res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
+        res.end('upstream failed');
+        return;
+      }
+    }
+    if (up.statusCode === 200 && req.method === 'GET' && (isPlaylist(type, finalUrl) || looksLikePlaylist(sniffed.head))) {
+      try {
+        const rest = sniffed?.ended ? Buffer.alloc(0) : await readBody(up, MAX_PLAYLIST_BYTES - (sniffed?.head.length ?? 0));
+        const text = Buffer.concat([sniffed?.head ?? Buffer.alloc(0), rest]).toString('utf8');
         const body = Buffer.from(rewritePlaylist(text, finalUrl, (abs) => relayUrl(parts[1], abs)), 'utf8');
         res.writeHead(200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
         res.end(body);
@@ -486,6 +533,10 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     for (const name of PASS_RESPONSE) if (up.headers[name]) out[name] = up.headers[name];
     res.writeHead(up.statusCode, { ...CORS, ...out });
     if (req.method === 'HEAD') { up.resume(); res.end(); return; }
+    if (sniffed) {
+      if (sniffed.ended) { res.end(sniffed.head); return; }
+      res.write(sniffed.head);
+    }
     up.pipe(res);
     up.on('error', () => res.destroy());
     res.on('close', () => up.destroy());
