@@ -54,7 +54,7 @@ function endToEndHeaders(headers) {
 
 // A browser keeps idle keep-alive sockets open through the proxy; when every slot is taken, the one
 // silent the longest (at least idleEvictMs) is closed for the newcomer and the browser reopens it later.
-export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 150, queueMs = 10000, idleEvictMs = 2000 }) {
+export function createVpnProxy({ tunnel, log: rootLog, maxStreams = 250, queueMs = 10000, idleEvictMs = 2000 }) {
   const log = rootLog.child('vpn-proxy');
   const server = http.createServer();
   const sockets = new Set(); // client connections (Edge)

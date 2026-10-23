@@ -329,15 +329,15 @@ describe('vpn: tunnel + proxy end to end through the Go test peer on 127.0.0.1',
     t.diagnostic(`5 MiB via proxy: ${((bytes * 8) / seconds / 1e6).toFixed(1)} Mbit/s in ${seconds.toFixed(2)} s`);
   });
 
-  test('stream capacity: 40 concurrent CONNECTs are carried at once (the rebuilt core allows 160; the original 32)', { timeout: 40000 }, async () => {
+  test('stream capacity: 200 concurrent CONNECTs are carried at once (the rebuilt core allows 260; the original 32)', { timeout: 40000 }, async () => {
     const held = [];
     try {
-      const opened = await Promise.all(Array.from({ length: 40 }, () => connectVia(proxy.port, `${TUNNEL_PEER_IP}:80`, { timeout: 20000 })));
+      const opened = await Promise.all(Array.from({ length: 200 }, () => connectVia(proxy.port, `${TUNNEL_PEER_IP}:80`, { timeout: 20000 })));
       for (const [i, c] of opened.entries()) {
         held.push(c.socket);
         assert.equal(c.status, 200, `CONNECT #${i + 1}`);
       }
-      await waitFor(() => tunnel.status().streams === 40, { timeout: 5000, message: `40 open streams (now ${tunnel.status().streams})` });
+      await waitFor(() => tunnel.status().streams === 200, { timeout: 15000, message: `200 open streams (now ${tunnel.status().streams})` });
     } finally {
       for (const s of held) s.destroy();
     }

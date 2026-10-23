@@ -8,7 +8,7 @@
 
 enum mux_type { MUX_OPEN = 1, MUX_OPENED = 2, MUX_DATA = 3, MUX_EOF = 4, MUX_RST = 5, MUX_CREDIT = 6, MUX_DNS = 7, MUX_DNSANSWER = 8, MUX_STATUS = 9, MUX_HELLO = 10 };
 
-#define MUX_MAX_STREAMS 160
+#define MUX_MAX_STREAMS 260
 #define MUX_INITIAL_CREDIT (1024 * 1024) /* per stream; must match protocol/frames.js INITIAL_CREDIT. 64 KiB capped Proton downloads at ~3 Mbit/s over a 58 ms path. */
 #define MUX_MAX_FRAME (256 * 1024)
 #define MUX_CREDIT_GRANT 32768 /* grant consumed bytes back once this much is unacked; independent of the initial window so core and hub versions interoperate */
