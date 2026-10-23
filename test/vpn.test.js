@@ -293,6 +293,29 @@ describe('vpn: tunnel + proxy end to end through the Go test peer on 127.0.0.1',
     await waitFor(() => tunnel.status().streams === 0, { timeout: 5000, message: 'streams released after the peer closed them' });
   });
 
+  test('DNS burst: 60 concurrent CONNECTs to 30 distinct new names all open (lwIP holds only DNS_TABLE_SIZE lookups at once)', { timeout: 30000 }, async (t) => {
+    // Before the hub resolved names itself, everything past lwIP's 8 pending lookups got an instant
+    // 502 "vpn: dns-failed" (heavy pages showed ERR_TUNNEL_CONNECTION_FAILED).
+    const names = Array.from({ length: 30 }, (_, i) => `burst-${i}-${crypto.randomBytes(3).toString('hex')}.test`);
+    const t0 = Date.now();
+    const opened = await Promise.all([...names, ...names].map((name) => connectVia(proxy.port, `${name}:80`, { timeout: 20000 })));
+    t.diagnostic(`60 CONNECTs, 30 new names: ${Date.now() - t0} ms`);
+    try {
+      const bad = opened.filter((c) => c.status !== 200).map((c) => `${c.status} ${c.head.toString('latin1').trim()}`);
+      assert.deepEqual(bad, [], 'every CONNECT got 200');
+      const c = opened[0];
+      c.socket.write(`GET /hello HTTP/1.1\r\nHost: ${names[0]}\r\nConnection: close\r\n\r\n`);
+      assert.ok((await readAll(c.socket, c.head)).toString('latin1').endsWith(HELLO), 'a stream opened by name carries traffic');
+    } finally {
+      for (const c of opened) c.socket.destroy();
+    }
+    // Answers are shared: the same names again come from the hub's short cache.
+    const t1 = Date.now();
+    assert.deepEqual(await Promise.all(names.map((n) => tunnel.resolve(n))), names.map(() => TUNNEL_PEER_IP));
+    t.diagnostic(`30 cached names again: ${Date.now() - t1} ms`);
+    await waitFor(() => tunnel.status().streams === 0, { timeout: 8000, message: 'burst streams released' });
+  });
+
   test('proxy rejects what no browser sends a proxy: relative paths, https:// URLs, bad CONNECT authorities (400)', async () => {
     assert.equal((await request({ port: proxy.port, path: '/hello' })).status, 400, 'relative path');
     assert.equal((await viaProxy(proxy.port, `https://${TUNNEL_PEER_IP}/hello`)).status, 400, 'https absolute-URI');

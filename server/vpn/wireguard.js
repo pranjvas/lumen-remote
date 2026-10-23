@@ -34,6 +34,14 @@ const HELLO_TIMEOUT_MS = 2000;
 const STOP_GRACE_MS = 1000;
 const LOOPBACK = new Set(['127.0.0.1', '::ffff:127.0.0.1', '::1']);
 const IPV4_LITERAL = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+// In-tunnel DNS in front of OPEN. lwIP holds DNS_TABLE_SIZE lookups at once (8 in the original
+// core, 64 in Lumen's rebuild) and fails the next one at once ("dns-failed"), so the hub keeps
+// fewer than that in flight, shares one lookup per name, and remembers answers briefly. Names are
+// still resolved only inside the tunnel (DNS frames to the core); nothing here touches node:dns.
+export const DNS_MAX_INFLIGHT = 6; // below the original core's 8, so either core works
+export const DNS_CACHE_TTL_MS = 60000; // lwIP does not hand the record TTL over the mux
+export const DNS_NEGATIVE_TTL_MS = 15000; // a name the DNS server refused (e.g. a filtered ad host)
+const DNS_CACHE_MAX = 1024;
 
 // Worker side.
 const POLL_MS = 20;
@@ -129,6 +137,8 @@ class TunnelStream extends SocketLikeDuplex {
     this.localEof = false;
     this.pending = null;
     this.failure = null;
+    this.openSent = false; // OPEN went to the core (after the hub's DNS lookup for a hostname)
+    this.dnsName = null; // the hostname this stream was opened by, if any
     this.openTimer = setTimeout(() => this.fail('vpn-open-timeout', 'tunnel stream open timed out'), openTimeoutMs);
   }
 
@@ -174,7 +184,7 @@ class TunnelStream extends SocketLikeDuplex {
     clearTimeout(this.openTimer);
     if (!this.released) {
       this.released = true;
-      this.hub.send(T.RST, this.id, err?.code ? String(err.code) : 'closed');
+      if (this.openSent) this.hub.send(T.RST, this.id, err?.code ? String(err.code) : 'closed');
       this.hub.release(this.id);
     }
     if (this.pending) {
@@ -224,6 +234,7 @@ class TunnelStream extends SocketLikeDuplex {
     this.released = true;
     clearTimeout(this.openTimer);
     this.hub.release(this.id);
+    if (!this.opened && this.openSent && this.dnsName) this.hub.forgetDns(this.dnsName); // maybe a stale address
     this.failure = codedError(code, message ?? `tunnel stream reset: ${code}`);
     this.destroy(this.listenerCount('error') ? this.failure : undefined);
   }
@@ -248,7 +259,10 @@ class Tunnel extends EventEmitter {
   #lastError = null;
   #streams = new Map();
   #nextId = 1;
-  #dnsPending = new Map();
+  #dnsPending = new Map(); // name -> waiters [{ resolve, reject, timer }]
+  #dnsCache = new Map(); // name -> { ip | null, expires } (insertion order = age)
+  #dnsQueue = []; // names waiting for an in-flight slot
+  #dnsInflight = new Set(); // names sent to the core, answer not yet back
   #pendingStart = null;
   #startPromise = null;
   #stopPromise = null;
@@ -298,7 +312,10 @@ class Tunnel extends EventEmitter {
     };
   }
 
-  // Opens "port:host" inside the tunnel; the wasm resolves hostnames through the tunnel's DNS.
+  // Opens host:port inside the tunnel. A hostname is first resolved through the tunnel's DNS
+  // (resolve(): shared, limited, briefly cached), then OPEN carries "port:ip"; the hostname still
+  // reaches the far side in TLS SNI and the Host header. Lookup failures reset the stream with
+  // the same "dns-failed" code the core uses.
   connect(host, port) {
     if (this.#state !== 'up') return new FailedStream(codedError('vpn-tunnel-down', `VPN tunnel is not up (${this.#state})`));
     if (this.#streams.size >= MAX_STREAMS) return new FailedStream(codedError('vpn-too-many-streams', `tunnel already has ${MAX_STREAMS} open streams`));
@@ -306,14 +323,37 @@ class Tunnel extends EventEmitter {
     this.#nextId = id >= MAX_STREAM_ID ? 1 : id + 1;
     const stream = new TunnelStream(this, id, this.#openTimeoutMs);
     this.#streams.set(id, stream);
-    this.send(T.OPEN, id, `${port}:${host}`);
     this.#log.debug('stream open', { id, host, port });
+    if (IPV4_LITERAL.test(host)) {
+      stream.openSent = true;
+      this.send(T.OPEN, id, `${port}:${host}`);
+      return stream;
+    }
+    stream.dnsName = host;
+    this.resolve(host).then(
+      (ip) => {
+        if (stream.released) return;
+        stream.openSent = true;
+        this.send(T.OPEN, id, `${port}:${ip}`);
+      },
+      (err) => {
+        const code = err.code === 'vpn-dns-failed' || err.code === 'vpn-dns-timeout' ? 'dns-failed' : err.code;
+        stream.fail(code, err.message);
+      },
+    );
     return stream;
   }
 
   resolve(host) {
     if (IPV4_LITERAL.test(host)) return Promise.resolve(host);
     if (this.#state !== 'up') return Promise.reject(codedError('vpn-tunnel-down', `VPN tunnel is not up (${this.#state})`));
+    const cached = this.#dnsCache.get(host);
+    if (cached) {
+      if (cached.expires > Date.now()) {
+        return cached.ip ? Promise.resolve(cached.ip) : Promise.reject(codedError('vpn-dns-failed', `tunnel DNS could not resolve ${host}`));
+      }
+      this.#dnsCache.delete(host);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.#settleDns(host, codedError('vpn-dns-timeout', `tunnel DNS timed out for ${host}`)), this.#dnsTimeoutMs);
       const waiting = this.#dnsPending.get(host);
@@ -321,9 +361,46 @@ class Tunnel extends EventEmitter {
         waiting.push({ resolve, reject, timer });
       } else {
         this.#dnsPending.set(host, [{ resolve, reject, timer }]);
-        this.send(T.DNS, 0, host);
+        this.#queueDns(host);
       }
     });
+  }
+
+  // A stream opened by name failed before OPENED: the cached address may be stale, ask again next time.
+  forgetDns(name) {
+    this.#dnsCache.delete(name);
+  }
+
+  // Sends a DNS frame when fewer than DNS_MAX_INFLIGHT names are in the core, else queues the name.
+  #queueDns(name) {
+    if (this.#dnsInflight.has(name)) return; // an earlier lookup (timed out here) is still in the core
+    if (this.#dnsInflight.size >= DNS_MAX_INFLIGHT) {
+      this.#dnsQueue.push(name);
+      return;
+    }
+    this.#dnsInflight.add(name);
+    if (!this.send(T.DNS, 0, name)) this.#dnsInflight.delete(name);
+  }
+
+  #pumpDns() {
+    while (this.#dnsQueue.length && this.#dnsInflight.size < DNS_MAX_INFLIGHT) {
+      const name = this.#dnsQueue.shift();
+      if (this.#dnsPending.has(name)) this.#queueDns(name); // skipped when every waiter already timed out
+    }
+  }
+
+  #cacheDns(name, ip) {
+    this.#dnsCache.delete(name);
+    if (!ip && this.#state !== 'up') return; // the core answers "no address" while it is not up: not a real answer
+    if (this.#dnsCache.size >= DNS_CACHE_MAX) this.#dnsCache.delete(this.#dnsCache.keys().next().value);
+    this.#dnsCache.set(name, { ip, expires: Date.now() + (ip ? DNS_CACHE_TTL_MS : DNS_NEGATIVE_TTL_MS) });
+  }
+
+  #resetDns() {
+    for (const name of [...this.#dnsPending.keys()]) this.#settleDns(name, codedError('vpn-link-lost', 'tunnel link lost'));
+    this.#dnsQueue = [];
+    this.#dnsInflight.clear();
+    this.#dnsCache.clear();
   }
 
   // Used by TunnelStream.
@@ -344,6 +421,7 @@ class Tunnel extends EventEmitter {
     this.#wasUp = false;
     this.#core = null;
     this.#lastError = null;
+    this.#resetDns();
     this.#workerStarted = false;
     this.#setState();
     try {
@@ -499,8 +577,12 @@ class Tunnel extends EventEmitter {
     if (eq < 0) return;
     const name = text.slice(0, eq);
     const ip = text.slice(eq + 1);
-    if (IPV4_LITERAL.test(ip)) this.#settleDns(name, null, ip);
+    this.#dnsInflight.delete(name);
+    const ok = IPV4_LITERAL.test(ip);
+    this.#cacheDns(name, ok ? ip : null);
+    if (ok) this.#settleDns(name, null, ip);
     else this.#settleDns(name, codedError('vpn-dns-failed', `tunnel DNS could not resolve ${name}`));
+    this.#pumpDns();
   }
 
   #settleDns(name, err, ip) {
@@ -519,7 +601,7 @@ class Tunnel extends EventEmitter {
     this.#link = null;
     this.#linked = false;
     this.#failStreams('vpn-link-lost', `tunnel link lost (${reason})`);
-    for (const name of [...this.#dnsPending.keys()]) this.#settleDns(name, codedError('vpn-link-lost', 'tunnel link lost'));
+    this.#resetDns();
     socket.destroy();
     this.#log.debug('mux link down', { reason });
     this.#setState();
