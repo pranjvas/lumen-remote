@@ -95,6 +95,30 @@ const LOOPBACK_PATTERNS = ['*://localhost*', '*://*.localhost*', '*://127.*', '*
 // accelerators that would close or replace the shared tab.
 const EDIT_SHORTCUTS = new Set(['a', 'c', 'v', 'x', 'z', 'y', 'Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End']);
 
+// Ad click-through links (sponsored search results) go through ad-redirect hosts that the VPN's
+// DNS blocks, so the click ends on an error page. The destination is carried in the link itself.
+const AD_HOSTS = /(^|\.)(doubleclick\.net|googleadservices\.com|googlesyndication\.com|dartsearch\.net)$/i;
+const DEST_PARAMS = ['adurl', 'ds_dest_url', 'dest_url', 'url', 'u'];
+
+/** The page an ad-redirect URL leads to, or null when `raw` is not an ad redirect. */
+export function adDestination(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return null; }
+  if (!AD_HOSTS.test(u.hostname)) return null;
+  const candidates = DEST_PARAMS.map((k) => u.searchParams.get(k)).filter(Boolean);
+  // DoubleClick ddm links append the destination after a bare '?': …;dc_…?https://site/…
+  const embedded = raw.slice(u.origin.length).match(/https?(?::|%3A)(?:\/|%2F){2}.+$/i);
+  if (embedded) candidates.push(embedded[0]);
+  for (let c of candidates) {
+    if (/^https?%3A/i.test(c)) { try { c = decodeURIComponent(c); } catch { continue; } }
+    try {
+      const dest = new URL(c);
+      if ((dest.protocol === 'http:' || dest.protocol === 'https:') && !AD_HOSTS.test(dest.hostname) && !isLoopbackHost(dest.hostname)) return dest.href;
+    } catch { /* not a URL */ }
+  }
+  return null;
+}
+
 export function clampViewport(w, h) {
   return {
     w: clamp(Math.round(Number(w) || VIEWPORT.maxW), VIEWPORT.minW, VIEWPORT.maxW),
@@ -574,7 +598,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     cdp.on('Network.requestWillBeSent', (p) => {
       if (p.type === 'Document' && p.frameId === mainFrameId) mediaSeen = [];
       if (mediaRequests.size > 500) mediaRequests.clear();
-      mediaRequests.set(p.requestId, { url: p.request.url, type: p.type, headers: { ...p.request.headers } });
+      mediaRequests.set(p.requestId, { url: p.request.url, type: p.type, frameId: p.frameId, headers: { ...p.request.headers } });
     });
     cdp.on('Network.requestWillBeSentExtraInfo', (p) => {
       const r = mediaRequests.get(p.requestId);
@@ -591,7 +615,17 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       publish('media', mediaSeen.length);
     });
     cdp.on('Network.loadingFinished', (p) => mediaRequests.delete(p.requestId));
-    cdp.on('Network.loadingFailed', (p) => mediaRequests.delete(p.requestId));
+    cdp.on('Network.loadingFailed', (p) => {
+      const r = mediaRequests.get(p.requestId);
+      mediaRequests.delete(p.requestId);
+      // A blocked ad redirect in the main frame: go to the page the ad points at instead.
+      const dest = r?.type === 'Document' && r.frameId === mainFrameId && !p.canceled ? adDestination(r.url) : null;
+      if (dest && cdp === page) {
+        log.info('ad redirect blocked; opening its destination', { host: new URL(dest).hostname });
+        publish('url', dest);
+        cdp.send('Page.navigate', { url: dest }).catch(() => {});
+      }
+    });
     if (!config.browser?.allowLoopback) await cdp.send('Network.setBlockedURLs', { urls: LOOPBACK_PATTERNS });
     mainFrameId = (await cdp.send('Page.getFrameTree')).frameTree.frame.id;
     await cdp.send('Runtime.addBinding', { name: TITLE_BINDING });
