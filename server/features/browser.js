@@ -431,6 +431,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   const liveArgs = () => (live ? [
     `--auto-select-tab-capture-source-by-title=${CAPTURE_TITLE}`, '--disable-audio-output',
     '--enable-features=PlatformHEVCEncoderSupport',
+    // On a laptop with two GPUs Edge takes the power-saving one (here an AMD iGPU, while the RTX
+    // 3060's encoder sat idle): rendering, capture and the H.264/HEVC encoder go on the fast one.
+    ...(config.liveVideo?.highPerformanceGpu === false ? [] : ['--force_high_performance_gpu']),
   ] : ['--mute-audio']);
   // A 4K stream needs a device scale of 3 behind the TV's 1280×720 CSS viewport (an emulated scale
   // above 2 is captured at 2). The scale belongs to the screen, see screenArg.

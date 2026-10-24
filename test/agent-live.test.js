@@ -153,6 +153,11 @@ test('playback starts on a key frame, catches up gently, and never seeks to catc
   live.data(keyAt(1, 9.1));
   await flush();
   clock.now += 500;
+  setTime(5.55);
+  ranges[0][1] = 9.7; // far behind half a second later: the rate stays (one change per dwell)
+  tick(500);
+  assert.ok(video.playbackRate > 1, 'no second rate change within the dwell');
+  clock.now += 4000;
   setTime(5.6);
   ranges[0][1] = 9.7; // 4.1 s behind: no seek (the PC sheds the lag), and back to normal speed
   tick(500);

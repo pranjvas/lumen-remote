@@ -21,6 +21,9 @@
   const CALM_LAG = 0.45; // back to normal speed below this
   const CATCH_UP_LAG = 1.5; // the faster rate only below this: further behind, the PC sheds the lag
   const CATCH_UP_RATE = 1.1;
+  // Each rate change makes this TV's hardware player hiccup; with the lag hovering at a threshold the
+  // rate flipped every 500 ms tick (seen 24 Oct: stalls, restarts and step-downs). At most one change per dwell.
+  const RATE_DWELL_MS = 4000;
   const KEEP_BEHIND = 4; // seconds of played video kept in the buffer
   const TRIM_EVERY = 10; // control ticks (500 ms) between buffer trims: remove() is not cheap here
   const MAX_QUEUE_BYTES = 8 * 1024 * 1024; // appends waiting beyond this: start over from a key frame
@@ -63,6 +66,7 @@
   let moved = false; // the clock has moved since this player started
   let stuckSince = 0; // a stall began (the clock stopped with frames ahead)
   let seekingSince = 0;
+  let lastRateAt = 0;
   let farSince = 0;
   let outSince = 0;
   let askedAt = 0; // a fresh start was asked of the PC: nothing is judged until its init comes
@@ -273,6 +277,7 @@
   }
 
   function setRate(to, t, lag) {
+    lastRateAt = now();
     el.playbackRate = to;
     note('live-rate', { to: to, t: r2(t), lag: r2(lag) });
   }
@@ -340,7 +345,7 @@
     let rate = el.playbackRate;
     if (lag > SOFT_LAG && lag < CATCH_UP_LAG) rate = CATCH_UP_RATE;
     else if (lag < CALM_LAG || lag >= CATCH_UP_LAG) rate = 1;
-    if (rate !== el.playbackRate) setRate(rate, t, lag);
+    if (rate !== el.playbackRate && now() - lastRateAt >= RATE_DWELL_MS) setRate(rate, t, lag);
     if (el.paused) el.play().catch(noop);
     if (t !== lastTime) {
       if (lastTime >= 0) {
