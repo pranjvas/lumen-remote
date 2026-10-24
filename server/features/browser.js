@@ -463,6 +463,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   const incognitoPrefix = incognitoPrefixFor(profileDir);
   let incognito = false;
   let incognitoDir = null; // the incognito session's profile, from Edge's first start in it
+  let incognitoSession = 0; // counts sessions: a teardown ends only the one it began in
   let beforeIncognito = null; // the page open when incognito began, shown again when it ends
   const incognitoListeners = new Set();
 
@@ -819,6 +820,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // this ends the incognito session (its profile is deleted) unless keepProfile: Edge starts again
   // in the same session right away (the VPN switch, a start retry).
   async function teardown({ keepProfile = false } = {}) {
+    // A slow close of the normal Edge must not end an incognito session that began meanwhile.
+    const ends = incognito && !keepProfile ? incognitoSession : null;
     launchedProxy = null;
     savedBounds = null;
     clearIdle();
@@ -850,7 +853,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       process.off('exit', killOnExit);
     }
     clearPage();
-    if (incognito && !keepProfile) endIncognito();
+    if (ends !== null && incognito && incognitoSession === ends) endIncognito();
   }
 
   // ---------- pop-ups ----------
@@ -1130,7 +1133,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       .catch(async (err) => {
         const message = err instanceof LumenError ? err.message : `The browser could not start: ${err.message}`;
         log.warn('browser start failed', { message: err.message });
-        await teardown();
+        // A start that failed does not end incognito: what the attempt left in its profile goes, and
+        // the next start makes a fresh one.
+        await teardown({ keepProfile: true });
+        if (incognitoDir) {
+          removeIncognitoDir(incognitoDir);
+          incognitoDir = null;
+        }
         setSession('error', message);
         throw err instanceof LumenError ? err : new LumenError('FAILED', message);
       })
@@ -1138,14 +1147,22 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return starting;
   }
 
+  let closing = null; // the close in progress: another close() waits for it to finish
   async function close({ keepProfile = false } = {}) {
     if (!child && !page && !starting) {
+      if (closing) await closing.catch(() => {});
       if (incognito && !keepProfile) endIncognito();
       if (store.get('browser.session')?.v !== 'off') setSession('off');
       return {};
     }
     if (starting) await starting.catch(() => {});
-    await teardown({ keepProfile });
+    const run = teardown({ keepProfile });
+    closing = run;
+    try {
+      await run;
+    } finally {
+      if (closing === run) closing = null;
+    }
     setSession('off');
     log.info('browser closed');
     return {};
@@ -1497,6 +1514,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
         beforeIncognito = store.get('browser.url')?.v ?? null;
         await close();
         incognito = true;
+        incognitoSession += 1;
         publish('incognito', true);
         log.info('incognito on');
         tellIncognito(true);

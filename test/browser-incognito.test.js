@@ -109,7 +109,8 @@ function restartPlan(port) {
 describe('incognito: browser.incognito through the hub (Edge not running)', () => {
   let stack, client;
   before(async () => {
-    stack = await startStack({ config: { log: { level: 'debug', console: false } } });
+    // No Edge at this path: this suite never starts one, and a start fails at once.
+    stack = await startStack({ config: { browser: { edgePath: path.join(os.tmpdir(), 'lumen-no-edge-here', 'msedge.exe') }, log: { level: 'debug', console: false } } });
     client = stack.browser();
     await client.hello;
   });
@@ -137,6 +138,15 @@ describe('incognito: browser.incognito through the hub (Edge not running)', () =
     assert.equal(stack.server.features.browser.incognitoProfile(), null, 'no profile folder before Edge starts');
     await set(false);
     assert.equal(client.value('browser.session') ?? 'off', 'off');
+  });
+
+  test('a browser that fails to start does not end incognito (Retry stays incognito)', async () => {
+    await set(true);
+    const ack = await client.send('browser.open', { url: `http://127.0.0.1:9/${TOKEN}` }, { timeout: 30000 });
+    assert.equal(ack.ok, false);
+    await client.waitForState('browser.session', (r) => r?.v === 'error', { timeout: 5000 });
+    assert.equal(client.value('browser.incognito'), true);
+    await set(false);
   });
 
   test('while on, log lines name no page, site, title or Ask Lumen request; after, they are as before', async () => {
@@ -367,10 +377,21 @@ describe('incognito: with headless Edge', { skip: noEdge }, () => {
     assert.equal(await evaluate('document.cookie'), 'normal=1', 'the normal profile’s cookie is back');
     assert.ok((await edgePids(normalMarker)).length > 0, 'Edge runs on the normal profile again');
     assert.equal(stack.server.features.browser.incognitoProfile(), null);
-    okAck(await viewer.send('browser.close'));
+    okAck(await viewer.send('browser.close', {}, { timeout: 45000 })); // Edge can take a while to close on a busy PC
     await edgeGone(normalMarker);
     assert.ok(!bytesOf(profile).includes(TOKEN), 'the incognito page is nowhere in the normal profile');
     assert.ok(!readLog(stack.dataDir).includes(TOKEN), 'nor in the log');
+  });
+
+  test('a close still under way does not end an incognito session started meanwhile', async () => {
+    await openPage('/normal', 'Normal page');
+    const closed = viewer.send('browser.close', {}, { timeout: 45000 }); // incognito is turned on while Edge is closing
+    await set(true);
+    okAck(await closed);
+    await sleep(300);
+    assert.equal(viewer.value('browser.incognito'), true, 'still incognito once the old Edge has closed');
+    await edgeGone(normalMarker);
+    await set(false);
   });
 
   test('Edge crashing while incognito ends it: the temp profile is deleted and the page forgotten', async () => {
@@ -411,7 +432,9 @@ describe('incognito: with headless Edge', { skip: noEdge }, () => {
     const dir = tempProfile();
     assert.ok(dir && fs.existsSync(dir));
     await stack.server.stop();
-    assert.equal(fs.existsSync(dir), false, 'the incognito profile is gone');
+    // stop() waits at most 5 s per part, and closing Edge can take longer on a busy PC: the profile
+    // goes when the browser's close finishes (or, if Lumen's process exits first, in its exit hook).
+    await waitFor(() => !fs.existsSync(dir), { timeout: 20000, interval: 200, message: 'the incognito profile is gone' });
     await edgeGone(path.basename(dir));
   });
 });
