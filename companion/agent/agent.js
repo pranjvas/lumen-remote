@@ -1,4 +1,4 @@
-// Lumen Agent 0.3: reads TV state in the page context and reports it to the Lumen server on the PC.
+// Lumen Agent (0.8.7): reads TV state in the page context and reports it to the Lumen server on the PC.
 // Hands-off by design: it calls TV getters and listeners and never changes a setting. Its one action
 // is opening a web page in the TV browser when the PC asks (request "open-url").
 // Runs on Chromium M69, so the syntax stays within ES2017.
@@ -6,6 +6,7 @@
   'use strict';
 
   const BACKOFF_MS = [2000, 5000, 10000, 30000];
+  const SCREEN_RETRY_MS = 3000;
   const CONNECT_TIMEOUT_MS = 10000;
   const STATE_EVERY_MS = 5000;
   const WATCH_EVERY_MS = 1000;
@@ -255,7 +256,15 @@
       clearTimeout(openTimer);
       if (opened && window.LumenBox) window.LumenBox.note('ws-close', { code: ev && ev.code, clean: !!(ev && ev.wasClean), reason: String((ev && ev.reason) || '').slice(0, 80) });
       if (ws !== sock) return;
-      if (opened) lastLinkAt = Date.now();
+      if (opened) {
+        lastLinkAt = Date.now();
+        // The browser screen is up but the PC is gone: the live picture would freeze (and keep the
+        // decoder), and every key would go nowhere. The TV's own player keeps playing.
+        if (window.LumenScreen && window.LumenScreen.isActive()) {
+          if (window.LumenLive) window.LumenLive.stop();
+          if (window.LumenScreen.linkDown) window.LumenScreen.linkDown();
+        }
+      }
       ws = null;
       greeted = false;
       scheduleRetry();
@@ -267,13 +276,18 @@
     if (ws !== sock) return;
     // What happened before the last cut-off (black box), handed to the PC once.
     const box = window.LumenBox ? window.LumenBox.take() : [];
-    greeted = send({ t: 'hello', agent: config.version, pcHost: config.pcHost, snapshot: snapshotWith(readFast()), box: box });
+    // What the browser screen shows, so the PC carries on with it (or turns it off) after a reconnect.
+    const screen = window.LumenScreen && window.LumenScreen.state ? window.LumenScreen.state() : undefined;
+    greeted = send({ t: 'hello', agent: config.version, pcHost: config.pcHost, snapshot: snapshotWith(readFast()), box: box, screen: screen });
+    if (greeted && window.LumenScreen && window.LumenScreen.linkUp) window.LumenScreen.linkUp();
     // From now on each note also goes to the PC at once: a page the TV kills cannot always save it.
     if (window.LumenBox && window.LumenBox.setSink) window.LumenBox.setSink(function (entry) { if (greeted) send({ t: 'box', e: entry }); });
   }
 
   function scheduleRetry() {
-    const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+    let delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+    // While the browser screen is up, the PC is tried again quickly (it relaunches nothing by itself).
+    if (window.LumenScreen && window.LumenScreen.isActive()) delay = Math.min(delay, SCREEN_RETRY_MS);
     attempt += 1;
     setStatus('waiting for ' + config.pcHost);
     retryTimer = setTimeout(connect, delay);
@@ -302,6 +316,8 @@
   let slowTicks = 0;
   async function stateTick() {
     if (!greeted) return;
+    // The video in front: where its clock is (every 5 s), so the PC's view of the player cannot drift.
+    if (window.LumenScreen && window.LumenScreen.heartbeat) window.LumenScreen.heartbeat();
     // While live video plays, the heavier system readings (storage, network, Bluetooth) are refreshed
     // only once a minute: the heartbeat itself stays cheap.
     const liveOn = !!(window.LumenLive && window.LumenLive.isShowing());
@@ -580,10 +596,13 @@
   document.addEventListener('visibilitychange', function () {
     // Another app in front (the TV pauses this page in the background): the live player stops cleanly
     // and the PC is told, instead of the PC taking the silence for a crash.
+    // The TV's own player is suspended too (the TV has one decoder, and the app in front needs it).
     if (document.hidden) {
+      if (window.LumenScreen && window.LumenScreen.hidden) window.LumenScreen.hidden();
       if (window.LumenLive && window.LumenLive.hidden) window.LumenLive.hidden();
       return;
     }
+    if (window.LumenScreen && window.LumenScreen.visible) window.LumenScreen.visible();
     if (window.LumenLive && window.LumenLive.visible) window.LumenLive.visible();
     // Opened again from the Apps screen or relaunched by the PC: retry at once, then step aside
     // (unless the PC asked for the browser screen, which stays in front).
@@ -592,7 +611,8 @@
   });
 
   setStatus('starting');
-  if (window.LumenScreen) window.LumenScreen.init(send);
+  // The screen closed on the TV itself (Back with the PC gone): the agent steps aside.
+  if (window.LumenScreen) window.LumenScreen.init(send, { onClosed: hideSoon });
   hideSoon();
   loadConfig().then(function (c) {
     config = c;

@@ -98,7 +98,8 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
           const minArea = Number(/area \* ([\d.]+)/.exec(src)?.[1]);
           assert.ok(Number.isFinite(minArea), `page video script without a minimum area: ${src}`);
           page.minAreas.push(minArea);
-          return page.playing && page.videoArea >= minArea;
+          // The keys of the big videos playing (a video counts as started when its key is new).
+          return page.playing && page.videoArea >= minArea ? [page.key ?? 'v'] : [];
         }
         throw new Error(`unexpected page script: ${src.slice(0, 60)}`);
       },
@@ -265,6 +266,31 @@ describe('tvscreen: YouTube plays in the TV\'s YouTube app', () => {
     await ticks(1, 'a hand-off tick after the repeat');
     assert.equal(launches().length, n + 1);
     assert.equal(plays(), before, 'nothing goes to the agent\'s player');
+    const closed = await b.send('tvscreen.close', {}, { timeout: 10000 });
+    assert.equal(closed.ok, true);
+  });
+
+  test('On TV: a click on a YouTube video that already plays (full screen, volume) opens nothing on the TV', async () => {
+    const other = 'M7lc1UVf-VE'; // not handed off by the tests above
+    setPage(`https://www.youtube.com/watch?v=${other}`);
+    page.player = { id: other, t: 12 };
+    page.playing = true; // it plays, nobody acted for a while
+    page.lastInput = Date.now() - 11000;
+    const opened = await b.send('tvscreen.open', {}, { timeout: 15000 });
+    assert.equal(opened.ok, true, JSON.stringify(opened.error));
+    const n = launches().length;
+    const checks = async (k, message) => { const s = page.minAreas.length; await waitFor(() => page.minAreas.length >= s + k, { timeout: 10000, message }); };
+    await checks(2, 'two page video checks with the video playing');
+    page.lastInput = Date.now(); // the full-screen button
+    await checks(3, 'three page video checks after the click');
+    assert.equal(launches().length, n, 'no YouTube launch for a click on a playing video');
+    assert.equal(page.pauses, 0);
+    // Paused, then played: that one goes.
+    page.playing = false;
+    await checks(2, 'two checks with the video paused');
+    page.playing = true;
+    page.lastInput = Date.now();
+    await waitFor(() => launches().length > n, { timeout: 8000, message: 'YouTube launched after play' });
     const closed = await b.send('tvscreen.close', {}, { timeout: 10000 });
     assert.equal(closed.ok, true);
   });

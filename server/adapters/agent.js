@@ -103,6 +103,54 @@ function isWebUrl(url) {
   }
 }
 
+const clock = (t) => (typeof t === 'number' && Number.isFinite(t) ? new Date(t).toISOString().slice(11, 23) : null);
+const boxKey = (e) => `${e?.t}|${String(e?.k ?? '').slice(0, 24)}`;
+const BOX_DATA_MAX = 300;
+const BOX_CONTEXT = 3;
+
+/**
+ * The agent's black box (the hello's `box`, oldest first) as one log line: the entries the PC has
+ * not logged already as they happened (`streamed`: `${t}|${k}` keys of the 'box' notes), plus the
+ * last few it has for context, in time order. Whole entries are dropped oldest first until the
+ * entries' JSON fits in `max` characters, so the newest ones (just before a cut-off) always stay
+ * and the line is always valid JSON. → { count, fresh, alreadyLogged, dropped, entries }
+ */
+export function formatBox(box, streamed = new Set(), max = 4000) {
+  const all = (Array.isArray(box) ? box : []).filter((e) => e && typeof e === 'object')
+    .map((e, i) => ({ e, i })).sort((x, y) => ((x.e.t ?? 0) - (y.e.t ?? 0)) || (x.i - y.i)).map(({ e }) => e);
+  const seen = [];
+  const fresh = [];
+  all.forEach((e, i) => (streamed.has(boxKey(e)) ? seen : fresh).push(i));
+  const keep = new Set([...fresh, ...seen.slice(-BOX_CONTEXT)]);
+  const chosen = all.filter((e, i) => keep.has(i)).map((e) => {
+    let d = e.d ?? null;
+    const text = JSON.stringify(d) ?? 'null';
+    if (text.length > BOX_DATA_MAX) d = `${text.slice(0, BOX_DATA_MAX)}…`;
+    return { t: clock(e.t), k: String(e.k ?? '').slice(0, 24), d };
+  });
+  const out = [];
+  let length = 2; // []
+  for (let i = chosen.length - 1; i >= 0; i--) {
+    const size = JSON.stringify(chosen[i]).length + (out.length ? 1 : 0);
+    if (length + size > max) break;
+    out.push(chosen[i]);
+    length += size;
+  }
+  out.reverse();
+  return { count: all.length, fresh: fresh.length, alreadyLogged: seen.length, dropped: chosen.length - out.length, entries: out };
+}
+
+// The screen state an agent (0.8.7+) reports in its hello: { active, hidden?, video: { state, mode, position, id } | null }.
+function screenStateOf(screen) {
+  if (!screen || typeof screen !== 'object') return { active: false, hidden: null, video: null };
+  const v = screen.video && typeof screen.video === 'object' ? screen.video : null;
+  return {
+    active: screen.active === true,
+    hidden: typeof screen.hidden === 'boolean' ? screen.hidden : null,
+    video: v ? { state: str(v.state, 20), mode: str(v.mode, 10), position: num(v.position), id: num(v.id) } : null,
+  };
+}
+
 function decodeIcon(dataUrl) {
   const match = typeof dataUrl === 'string' ? /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl) : null;
   if (!match) return null;
@@ -180,6 +228,8 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     active = ws;
     clearTimeout(graceTimer);
     touch(ws);
+    // A new connection has not been told to show the browser screen (features/tvscreen.js).
+    dispatchScreen({ t: 'screen-link' });
     ws.on('message', (raw, isBinary) => {
       if (ws !== active || isBinary) return;
       let msg;
@@ -234,18 +284,29 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     } else if (msg.t === 'box') {
       // A black-box note as it happens (agent 0.8.6+), so the log has it even if the TV kills the page.
       const e = msg.e && typeof msg.e === 'object' ? msg.e : {};
-      log.info('agent note', { k: String(e.k ?? '').slice(0, 24), d: JSON.stringify(e.d ?? null).slice(0, 300) });
+      noteStreamed(e);
+      log.info('agent note', { t: clock(e.t), k: String(e.k ?? '').slice(0, 24), d: (JSON.stringify(e.d ?? null) ?? 'null').slice(0, 300) });
     } else if (msg.t === 'reply') {
       onReply(msg);
-    } else if (typeof msg.t === 'string' && msg.t.startsWith('screen-')) {
+    } else if (typeof msg.t === 'string' && msg.t.startsWith('screen-') && msg.t !== 'screen-sync' && msg.t !== 'screen-link') {
       // The browser screen on the TV (agent 0.6.0+): remote keys, pointer, video player state.
-      for (const listener of screenListeners) {
-        try { listener(msg); } catch (err) { log.debug('screen listener failed', { message: err.message }); }
-      }
+      dispatchScreen(msg);
     }
   }
 
   const screenListeners = new Set();
+  function dispatchScreen(msg) {
+    for (const listener of screenListeners) {
+      try { listener(msg); } catch (err) { log.debug('screen listener failed', { message: err.message }); }
+    }
+  }
+
+  // Black-box notes logged as they happened on this connection: the next hello's box skips them.
+  const streamed = new Set();
+  function noteStreamed(e) {
+    streamed.add(boxKey(e));
+    while (streamed.size > 300) streamed.delete(streamed.values().next().value);
+  }
   const isOpen = () => Boolean(active && active.readyState === WebSocket.OPEN);
   /** JSON to the agent's screen module (screen-cursor, screen-play, screen-toast). */
   function sendScreen(msg) {
@@ -349,16 +410,17 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
 
   async function onHello(msg) {
     // The agent's black box: what happened on the TV before it was last cut off.
-    if (Array.isArray(msg.box) && msg.box.length) {
-      const entries = msg.box.slice(-40).map((e) => ({ t: typeof e?.t === 'number' ? new Date(e.t).toISOString().slice(11, 23) : null, k: String(e?.k ?? '').slice(0, 24), d: e?.d ?? null }));
-      log.info('agent black box', { count: msg.box.length, entries: JSON.stringify(entries).slice(0, 4000) });
-    }
+    if (Array.isArray(msg.box) && msg.box.length) log.info('agent black box', formatBox(msg.box, streamed));
+    streamed.clear();
     clearTimeout(launchTimer);
     const version = str(msg.agent, 40);
     const pcHost = str(msg.pcHost, 64);
     setConn('online');
     log.info('agent connected', { version, pcHost });
     applySnapshot(msg.snapshot);
+    // What the agent's browser screen shows (agent 0.8.7+; known: false for older agents), so the TV
+    // screen feature can carry on after a reconnect, or turn off a screen this server did not open.
+    dispatchScreen({ t: 'screen-sync', known: Boolean(msg.screen && typeof msg.screen === 'object'), ...screenStateOf(msg.screen) });
     setNote(await rebuildNote(version, pcHost));
     await refreshApps();
   }

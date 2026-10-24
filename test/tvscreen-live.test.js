@@ -3,7 +3,9 @@
 // second starting at a key frame (H.264 + AAC from the page's own sound), and no JPEG frame from then
 // on. Frames come back when the TV reports it cannot play it, stops reporting, or live video is
 // turned off. Opening the screen again offers live video again; a TV whose agent went away while
-// playing starts a step lower, and after twice stays on frames. Mock TV, fake agent.
+// playing, or that took the stream and never played it, starts a step lower, and after twice stays
+// on frames. A capture that restarts mid-stream shows the page until the new stream plays. Mock TV,
+// fake agent.
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -22,7 +24,8 @@ const tag = (f) => f.toString('latin1', 0, 3);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe('tvscreen: live video on the TV', { skip }, () => {
-  let stack, b, agent, web;
+  let stack, b, agent, web, viewer;
+  const lowers = []; // the step offset every attach got (one per strike)
   const caps = Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, c.startsWith('avc1')]));
   const ready = (a = agent) => a.ws.send(JSON.stringify({ t: 'screen-live', state: 'ready', caps }));
   const stats = (a = agent) => a.ws.send(JSON.stringify({ t: 'screen-live', state: 'stats', lag: 0.1, dropped: 0, decoded: 120, stalls: 0 }));
@@ -33,8 +36,13 @@ describe('tvscreen: live video on the TV', { skip }, () => {
     stack = await startStack({ config: {
       browser: { edgePath: EDGE, idleMs: 120000, allowLoopback: true },
       // A short watchdog so the silent-TV case fits in a test.
-      liveVideo: { enabled: true, maxHeight: 1080, idleStopMs: 1000, statsGraceMs: 2000, statsLateMs: 1500, statsGoneMs: 3000 },
+      liveVideo: { enabled: true, maxHeight: 1080, idleStopMs: 1000, statsGraceMs: 2000, statsLateMs: 1500, statsGoneMs: 3000, startMs: 3000 },
     } });
+    // The real live video, with the TV screen's viewer and its start offset in view.
+    const realLive = stack.server.features.livevideo;
+    stack.server.features.livevideo = Object.create(realLive, {
+      attach: { value: (v, caps, options) => { viewer = v; lowers.push(options?.lower ?? 0); return realLive.attach(v, caps, options); } },
+    });
     b = stack.browser();
     await b.hello;
     agent = stack.agent({ version: '0.8.1' });
@@ -100,6 +108,88 @@ describe('tvscreen: live video on the TV', { skip }, () => {
     // No stats from the TV: after the grace and the watchdog, the stream stops.
     await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-stop'), { timeout: 15000, what: 'the fallback to frames' });
     await b.waitForState('tvscreen.live', (r) => r?.v?.state === 'off', { timeout: 5000 });
+  });
+
+  test('a TV that takes the stream but never plays it goes back to frames after the start deadline, and starts a step lower next time', async () => {
+    assert.equal((await b.send('tvscreen.live', { on: true })).ok, true); // forgets the strikes so far
+    await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer' });
+    agent.screen.length = 0;
+    agent.frames.length = 0;
+    ready();
+    // It reports, but decodes nothing and never says 'playing'.
+    const reporting = setInterval(() => agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'stats', lag: 0, dropped: 0, decoded: 0, stalls: 0 })), 500);
+    try {
+      await waitFor(() => agent.frames.some((f) => tag(f) === 'LVI'), { timeout: 30000, what: 'the stream' });
+      const t0 = Date.now();
+      await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-stop'), { timeout: 8000, what: 'the fallback to frames' });
+      assert.ok(Date.now() - t0 < 6000, `fell back after ${Date.now() - t0} ms`);
+    } finally {
+      clearInterval(reporting);
+    }
+    await b.waitForState('tvscreen.live', (r) => r?.v?.state === 'off', { timeout: 5000 });
+    const jpegs = agent.frames.filter(isJpeg).length;
+    await waitFor(() => agent.frames.filter(isJpeg).length > jpegs, { timeout: 10000, what: 'JPEG frames again' });
+    // Opened again: offered one step lower (one strike).
+    assert.equal((await b.send('tvscreen.close', {}, { timeout: 10000 })).ok, true);
+    agent.frames.length = 0;
+    agent.screen.length = 0;
+    assert.equal((await b.send('tvscreen.open', {}, { timeout: 40000 })).ok, true);
+    await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer on reopen' });
+    ready();
+    const statsTimer = setInterval(() => stats(), 500);
+    try {
+      await waitFor(() => agent.frames.some((f) => tag(f) === 'LVI'), { timeout: 30000, what: 'the stream after reopening' });
+      agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'playing', w: 1280, h: 720 }));
+      const init = parseMessage(agent.frames.find((f) => tag(f) === 'LVI'));
+      assert.deepEqual([init.info.width, init.info.height], [1280, 720], 'one step lower: 720p30');
+      assert.equal(lowers.at(-1), 1);
+    } finally {
+      clearInterval(statsTimer);
+    }
+    assert.equal((await b.send('tvscreen.live', { on: false })).ok, true);
+  });
+
+  test('a capture restart mid-stream: the TV drops its frozen player and shows the page, then gets the new stream, with no strike', async () => {
+    assert.equal((await b.send('tvscreen.live', { on: false })).ok, true);
+    agent.screen.length = 0;
+    assert.equal((await b.send('tvscreen.live', { on: true })).ok, true);
+    await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer' });
+    agent.frames.length = 0;
+    ready();
+    const statsTimer = setInterval(() => stats(), 500);
+    try {
+      await waitFor(() => agent.frames.some((f) => tag(f) === 'LVM'), { timeout: 30000, what: 'the stream' });
+      agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'playing', w: 1920, h: 1080 }));
+      await b.waitForState('tvscreen.live', (r) => r?.v?.state === 'streaming', { timeout: 5000 });
+      agent.screen.length = 0;
+      const jpegs = agent.frames.filter(isJpeg).length;
+      const inits = agent.frames.filter((f) => tag(f) === 'LVI').length;
+      // The capture page goes away (as when Edge drops it); livevideo restarts it and tells the viewer.
+      const dt = stack.server.features.browser.devtools();
+      const targets = await (await fetch(`http://127.0.0.1:${dt.port}/json/list`)).json();
+      const capture = targets.find((t) => /\/capture\?t=/.test(t.url));
+      assert.ok(capture, 'the capture page');
+      await fetch(`http://127.0.0.1:${dt.port}/json/close/${capture.id}`);
+      viewer.onRestart?.();
+      await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-stop'), { timeout: 5000, what: 'the frozen player dropped' });
+      await waitFor(() => agent.frames.filter(isJpeg).length > jpegs, { timeout: 5000, what: 'the page frame' });
+      assert.ok(agent.screen.some((m) => m.t === 'screen-toast' && /restarting/i.test(m.text)));
+      await waitFor(() => agent.frames.filter((f) => tag(f) === 'LVI').length > inits, { timeout: 20000, what: 'the new stream' });
+      agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'playing', w: 1920, h: 1080 }));
+      await b.waitForState('tvscreen.live', (r) => r?.v?.state === 'streaming', { timeout: 10000 });
+    } finally {
+      clearInterval(statsTimer);
+    }
+    // No strike: opened again, it starts where it did.
+    assert.equal((await b.send('tvscreen.close', {}, { timeout: 10000 })).ok, true);
+    agent.screen.length = 0;
+    const attached = lowers.length;
+    assert.equal((await b.send('tvscreen.open', {}, { timeout: 40000 })).ok, true);
+    await waitFor(() => agent.screen.some((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the offer on reopen' });
+    ready();
+    await waitFor(() => lowers.length > attached, { timeout: 5000, what: 'attached again' });
+    assert.equal(lowers.at(-1), 0, 'no step lower after a capture restart');
+    assert.equal((await b.send('tvscreen.live', { on: false })).ok, true);
   });
 
   test('reopening offers live video again; an agent lost during live video means one step lower, then frames only', async () => {

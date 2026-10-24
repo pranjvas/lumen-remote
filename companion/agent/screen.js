@@ -4,7 +4,7 @@
 // player (AVPlay) through Lumen's relay: full quality with sound. When AVPlay refuses a stream (clear
 // fMP4 HLS is the usual case on this TV), hls.js on a <video> element takes over (up to 1080p,
 // H.264/AAC), then a plain <video>: the order CineHD's media engine uses.
-// Runs on Chromium M69, so the syntax stays within ES2017.
+// Runs on Chromium M69, so the syntax stays within ES2017 (no ?. ?? or object spread).
 (function () {
   'use strict';
 
@@ -22,21 +22,38 @@
   // (DRM waits for a licence round trip through Lumen's relay, so it gets longer).
   const MSE_START_MS = 30000;
   const MSE_START_DRM_MS = 45000;
+  // AVPlay whose prepare never calls back (a black screen and no report): it counts as refused after
+  // this long. A big MP4 through the VPN can take a while to open.
+  const AVPLAY_START_MS = 40000;
   // Fatal hls.js media errors: recover at most this many times inside the window, then give up.
   const MEDIA_RECOVERIES = 2;
   const MEDIA_RECOVERY_WINDOW_MS = 30000;
+  // A stream that broke after it played (a VPN blip, a relay 502) continues where it was, at most this
+  // many times a minute, instead of starting over in another player.
+  const RESUMES = 2;
+  const RESUME_WINDOW_MS = 60000;
+  const RESUME_MIN_MS = 5000;
+  const LINK_DOWN_MS = 60000; // the PC not answering this long: the screen closes
+  const LINK_HINT = 'Lumen on the PC is not answering · reconnecting · Back closes';
 
   let send = function () { return false; };
+  let onClosed = function () {};
   let active = false;
   let registered = false;
   let pendingFrame = null;
   let decoding = false;
   let currentUrl = null;
-  let video = null; // { url, title, state, mode, engine, drm, started }
+  // { id, url, title, state, mode, engine, kind, drm, started, reported, played, position, resumes,
+  //   netRetries, reloaded, hidden, suspended, closed, resumeAt, attempt }
+  let video = null;
   const DECODER_HANDOVER_MS = 900; // live video's decoder released before AVPlay opens
   let hintTimer = null;
+  let toastTimer = null;
   let startTimer = null;
   let pointerSent = 0;
+  let linkDown = false;
+  let linkTimer = null;
+  let pendingPlay = null; // a screen-play that came while this page was in the background
 
   const root = document.getElementById('screen');
   const frame = document.getElementById('frame');
@@ -51,6 +68,7 @@
   function read(fn, fallback) {
     try { const v = fn(); return v === undefined ? fallback : v; } catch (e) { return fallback; }
   }
+  function pageHidden() { return !!(document && document.hidden); }
 
   function registerKeys() {
     if (registered) return;
@@ -64,17 +82,21 @@
     REGISTER.forEach(function (name) { read(function () { tizen.tvinputdevice.unregisterKey(name); }); });
   }
 
+  // ms 0: the hint stays until something replaces it.
   function showHint(text, ms) {
     hint.textContent = text;
     hint.className = 'hint show';
     clearTimeout(hintTimer);
+    hintTimer = null;
+    if (ms === 0) return;
     hintTimer = setTimeout(function () { hint.className = 'hint'; }, ms || 6000);
   }
 
   function toast(text) {
     toastEl.textContent = text;
     toastEl.className = 'toast show';
-    setTimeout(function () { toastEl.className = 'toast'; }, 3500);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.className = 'toast'; }, 3500);
   }
 
   // ---- frames ----
@@ -105,6 +127,8 @@
     e.stopPropagation();
     if (live) live.unmute();
     if (video) return videoKey(key);
+    // The PC is not answering: Back and Red still close the screen here.
+    if (linkDown && (key === 'back' || key === 'red')) return closeScreen();
     send({ t: 'screen-input', key: key, repeat: e.repeat === true });
   }
 
@@ -125,51 +149,79 @@
 
   // ---- the TV's own video player ----
 
-  function playVideo(url, title, fromStart, engine, drm) {
+  function avplayTime() { return read(function () { return webapis.avplay.getCurrentTime(); }, null); }
+
+  // A screen-video message about the current video (the PC matches `id` to the stream it sent).
+  function sendVideo(fields) {
+    const msg = { t: 'screen-video' };
+    Object.keys(fields).forEach(function (k) { msg[k] = fields[k]; });
+    if (video && typeof video.id === 'number' && msg.id === undefined) msg.id = video.id;
+    return send(msg);
+  }
+
+  function playVideo(url, title, fromStart, engine, drm, kind, startAt, id) {
     stopVideo(false);
     // One decoder for the TV's player and the live video: a live player that was showing needs a
     // moment to let it go, or AVPlay starts with sound and a black picture.
     const hadLive = !!(live && live.isShowing && live.isShowing());
     if (live) live.stop();
-    video = { url: url, title: title || '', state: 'loading', mode: 'avplay', engine: engine || null, drm: drm || null, started: false };
+    video = { id: typeof id === 'number' ? id : null, url: url, title: title || '', state: 'loading', mode: 'avplay', engine: engine || null, kind: kind || null,
+      drm: drm || null, started: false, reported: false, played: false, position: 0, resumes: [], netRetries: [], reloaded: false,
+      hidden: false, suspended: false, closed: false, resumeAt: 0, attempt: 0 };
     const mine = video;
-    // AVPlay is one player shared by every video: a callback from a video that has since been
-    // replaced (or moved to hls.js / <video>) must not act on the current one.
-    function current() { return video === mine && mine.mode === 'avplay'; }
     root.className = 'screen video';
     document.body.classList.add('video');
-    showHint((title ? title + ' · ' : '') + 'OK play/pause · ◀ ▶ 10 s · Back returns to the page', 7000);
+    showHint((title ? title + ' · ' : '') + 'OK play/pause · ◀ ▶ 10 s · Yellow convert · Back returns to the page', 7000);
     // Lumen found a format the TV's player does not take (fragmented-MP4 HLS): skip it.
     if (engine === 'hls') return refused(drm ? 'DRM-protected HLS' : 'fragmented-MP4 HLS', mine);
-    if (hadLive) setTimeout(function () { if (current()) startAvplay(); }, DECODER_HANDOVER_MS);
-    else startAvplay();
-    function startAvplay() {
+    if (hadLive) setTimeout(function () { if (video === mine) openAvplay(mine, startAt > 0 ? startAt : 0, fromStart); }, DECODER_HANDOVER_MS);
+    else openAvplay(mine, startAt > 0 ? startAt : 0, fromStart);
+  }
+
+  // AVPlay is one player shared by every video: a callback from a video that has since been replaced
+  // (or moved to hls.js / <video>), or from an earlier open of the same video, must not act on it.
+  function openAvplay(mine, startAtMs, fromStart) {
+    mine.attempt += 1;
+    mine.started = false;
+    const attempt = mine.attempt;
+    function current() { return video === mine && mine.mode === 'avplay' && mine.attempt === attempt; }
     let stage = 'webapis';
     try {
       if (typeof webapis === 'undefined' || !webapis.avplay) throw new Error('webapis.avplay is missing');
       stage = 'open';
-      webapis.avplay.open(url);
+      webapis.avplay.open(mine.url);
       stage = 'setDisplayRect';
       webapis.avplay.setDisplayRect(0, 0, 1920, 1080);
       stage = 'setListener';
       webapis.avplay.setListener({
-        onbufferingcomplete: function () { if (current()) report('playing'); },
+        onbufferingcomplete: function () { if (current()) { mine.reported = true; report('playing'); } },
         onstreamcompleted: function () { if (!current()) return; report('ended'); stopVideo(true); },
-        onerror: function (err) { if (current()) refused('onerror: ' + String(err), mine); },
-        oncurrentplaytime: function () {},
+        onerror: function (err) { if (current()) avplayError('onerror: ' + String(err), mine); },
+        // The clock is the one sure sign the video plays (a converted copy may never call prepare back).
+        oncurrentplaytime: function (ms) {
+          if (!current() || !(ms > 0)) return;
+          mine.played = true;
+          mine.position = ms;
+          if (!mine.reported) { mine.reported = true; report('playing'); }
+        },
       });
       stage = 'prepareAsync';
       webapis.avplay.prepareAsync(function () {
         if (!current()) return;
+        mine.started = true;
+        clearTimeout(startTimer);
+        startTimer = null;
         read(function () { webapis.avplay.play(); });
+        mine.reported = true;
         report('playing');
         // A stream Lumen is still converting grows while it plays, so the player joins at its live
-        // end; go back to the start once playback is running.
-        if (fromStart) setTimeout(function () { if (current()) read(function () { webapis.avplay.seekTo(0); }); }, 1200);
+        // end: back to the start once playback is running (or on to where a broken stream was).
+        const seekTo = startAtMs > 0 ? startAtMs : fromStart ? 0 : -1;
+        if (seekTo >= 0) setTimeout(function () { if (current()) read(function () { webapis.avplay.seekTo(seekTo); }); }, 1200);
         // AVPlay sometimes "plays" a stream it cannot decode, with a black screen and a clock that never
-        // moves; treat that as a refusal.
+        // moves; treat that as a refusal (not while in the background: the clock stops there).
         setTimeout(function () {
-          if (!current()) return;
+          if (!current() || pageHidden() || mine.hidden) return;
           const t = read(function () { return webapis.avplay.getCurrentTime(); }, 0);
           const state = read(function () { return webapis.avplay.getState(); }, '');
           if (state === 'PLAYING' && !(t > 0)) refused('AVPlay did not start (clock at ' + t + ')', mine);
@@ -177,10 +229,38 @@
       }, function (err) {
         if (current()) refused('prepare: ' + String(err && (err.name + ' ' + (err.message || '')) || err), mine);
       });
+      clearTimeout(startTimer);
+      startTimer = setTimeout(function () {
+        startTimer = null;
+        if (!current() || mine.started) return;
+        refused('AVPlay did not start within ' + Math.round(AVPLAY_START_MS / 1000) + ' s', mine);
+      }, AVPLAY_START_MS);
     } catch (e) {
       refused(stage + ': ' + String(e && (e.name + ' ' + (e.message || '')) || e), mine);
     }
+  }
+
+  function canResume(mine) {
+    const now = Date.now();
+    mine.resumes = mine.resumes.filter(function (t) { return now - t < RESUME_WINDOW_MS; });
+    if (mine.resumes.length >= RESUMES) return false;
+    mine.resumes.push(now);
+    return true;
+  }
+
+  // AVPlay's error after the video played a while: the same player opens it again where it was
+  // (never through stopVideo/playVideo: their 'stopped' would make the PC resume live video).
+  function avplayError(reason, mine) {
+    if (mine.played && mine.position > RESUME_MIN_MS && !pageHidden() && canResume(mine)) {
+      const at = mine.position;
+      read(function () { webapis.avplay.stop(); });
+      read(function () { webapis.avplay.close(); });
+      mine.state = 'loading';
+      sendVideo({ state: 'loading', error: 'retrying at ' + at, mode: 'avplay', position: at, played: true });
+      openAvplay(mine, at, false);
+      return;
     }
+    refused(reason, mine);
   }
 
   // ---- fallback: hls.js / <video> in this page (CineHD's order: AVPlay, hls.js MSE, plain video) ----
@@ -189,24 +269,49 @@
   function refused(reason, mine) {
     if (!video || (mine && video !== mine)) return;
     if (video.mode !== 'avplay') return failed(reason);
+    clearTimeout(startTimer);
+    startTimer = null;
     read(function () { webapis.avplay.stop(); });
     read(function () { webapis.avplay.close(); });
-    send({ t: 'screen-video', state: 'fallback', error: reason });
+    // In the background the decoder belongs to the app in front: no other player starts here.
+    if (pageHidden()) return stopHidden();
+    sendVideo({ state: 'fallback', error: reason });
     const url = video.url;
     const drm = video.drm;
-    // Lumen's engine:'hls' (it probed the playlist) and DRM (always HLS here) win over the URL's name,
-    // which need not say .m3u8 (a playlist served as application/vnd.apple.mpegurl from any path).
-    const isHls = video.engine === 'hls' || !!drm || /\.m3u8|\/relay\/x\//i.test(url) || /mpegurl/i.test(url);
-    if (isHls && window.Hls && window.Hls.isSupported()) return playHls(url, reason, drm);
+    const at = video.played ? video.position : 0;
+    // Lumen's engine:'hls' or kind:'hls' (it probed the playlist) and DRM (always HLS here) win over
+    // the URL's name, which need not say .m3u8 (a playlist served as application/vnd.apple.mpegurl).
+    const isHls = video.engine === 'hls' || video.kind === 'hls' || !!drm || /\.m3u8|\/relay\/x\//i.test(url) || /mpegurl/i.test(url);
+    if (isHls && window.Hls && window.Hls.isSupported()) return playHls(url, reason, drm, at);
     // A plain <video> has no EME setup here, so a DRM stream cannot play through it.
-    if (!drm && mse.canPlayType('video/mp4')) return playVideoElement(url, reason);
+    if (!drm && mse.canPlayType('video/mp4')) return playVideoElement(url, reason, at);
     failed(reason);
   }
 
+  // The PC shows its own message at the end of its ladder (it may still convert the stream).
   function failed(reason) {
+    if (!video) return;
+    if (pageHidden()) return stopHidden();
     report('error', reason);
-    toast('The TV could not play this video');
     stopVideo(true);
+  }
+
+  function stopHidden() {
+    stopVideo(false, 'hidden');
+  }
+
+  // AVPlay has its start deadline and "clock never moved" check; the in-page players get a start
+  // deadline too: a stream that never reaches 'playing' (keys that never arrive, endless non-fatal
+  // stalls, a relay that sends nothing, a play() the TV rejected) is reported as failed so Lumen can
+  // fall back.
+  function armMseStart(mine, mode) {
+    clearTimeout(startTimer);
+    const ms = mine.drm ? MSE_START_DRM_MS : MSE_START_MS;
+    startTimer = setTimeout(function () {
+      startTimer = null;
+      if (video !== mine || mine.mode !== mode || mine.started) return;
+      failed(mode + ': did not start within ' + Math.round(ms / 1000) + ' s');
+    }, ms);
   }
 
   function useMse(mode) {
@@ -214,26 +319,34 @@
     mine.mode = mode;
     root.className = 'screen video mse';
     mse.style.display = 'block';
-    mse.onplaying = function () { mine.started = true; clearTimeout(startTimer); startTimer = null; report('playing'); };
+    mse.onplaying = function () { mine.started = true; mine.reported = true; clearTimeout(startTimer); startTimer = null; report('playing'); };
     mse.onpause = function () { if (video) report('paused'); };
     mse.onended = function () { report('ended'); stopVideo(true); };
-    mse.onerror = function () { failed(mode + ': ' + String(mse.error && mse.error.code)); };
-    // AVPlay has its "clock never moved" check; the in-page players get a start deadline: a stream
-    // that never reaches 'playing' (keys that never arrive, endless non-fatal stalls, a relay that
-    // sends nothing, a play() the TV rejected) is reported as failed so Lumen can fall back.
-    clearTimeout(startTimer);
-    startTimer = setTimeout(function () {
-      startTimer = null;
-      if (video !== mine || mine.mode !== mode || mine.started) return;
-      failed(mode + ': did not start within ' + Math.round((mine.drm ? MSE_START_DRM_MS : MSE_START_MS) / 1000) + ' s');
-    }, mine.drm ? MSE_START_DRM_MS : MSE_START_MS);
+    mse.ontimeupdate = function () {
+      const t = read(function () { return mse.currentTime; }, 0);
+      if (video === mine && t > 0) { mine.played = true; mine.position = Math.round(t * 1000); }
+    };
+    mse.onerror = function () {
+      const code = mse.error && mse.error.code;
+      // A network error after the video played: load it again once, where it was.
+      if (mode === 'video' && code === 2 && mine.played && !mine.reloaded && video === mine) {
+        mine.reloaded = true;
+        mse.src = String(mine.url).split('#')[0] + '#t=' + mine.position / 1000;
+        mse.play().catch(function () {});
+        return;
+      }
+      failed(mode + ': ' + String(code));
+    };
+    armMseStart(mine, mode);
   }
 
   // drm: { keySystem: licence URL } (Lumen relays the licence request to the site's licence server);
-  // the TV's own DRM module (PlayReady / Widevine, through EME) decrypts.
-  function playHls(url, reason, drm) {
+  // the TV's own DRM module (PlayReady / Widevine, through EME) decrypts. at: ms to start from.
+  function playHls(url, reason, drm, at) {
     useMse('hls');
+    const mineVideo = video;
     const config = { enableWorker: false, maxBufferLength: 20, maxMaxBufferLength: 30, maxBufferSize: 16 * 1024 * 1024, capLevelToPlayerSize: false };
+    if (at > 0) config.startPosition = at / 1000;
     if (drm) {
       config.emeEnabled = true;
       config.drmSystems = {};
@@ -248,6 +361,8 @@
     const Details = window.Hls.ErrorDetails || {};
     const NO_RECOVERY = [Details.MANIFEST_INCOMPATIBLE_CODECS_ERROR || 'manifestIncompatibleCodecsError',
       Details.BUFFER_INCOMPATIBLE_CODECS_ERROR || 'bufferIncompatibleCodecsError'];
+    const NETWORK_RETRY = [Details.FRAG_LOAD_ERROR || 'fragLoadError', Details.FRAG_LOAD_TIMEOUT || 'fragLoadTimeOut',
+      Details.LEVEL_LOAD_ERROR || 'levelLoadError', Details.LEVEL_LOAD_TIMEOUT || 'levelLoadTimeOut'];
     let recoveries = 0;
     let lastRecovery = 0;
     function describe(data) {
@@ -281,30 +396,47 @@
           return;
         }
       }
+      // A network error once the video played (a VPN blip): loading goes on where it was, a couple
+      // of times a minute.
+      if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR && mineVideo && mineVideo.played && NETWORK_RETRY.indexOf(data.details) >= 0) {
+        const now = Date.now();
+        mineVideo.netRetries = mineVideo.netRetries.filter(function (t) { return now - t < RESUME_WINDOW_MS; });
+        if (mineVideo.netRetries.length < RESUMES) {
+          mineVideo.netRetries.push(now);
+          read(function () { mine.startLoad(); });
+          return;
+        }
+      }
       failed(describe(data));
     });
     hls.loadSource(url);
     hls.attachMedia(mse);
-    send({ t: 'screen-video', state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using hls.js' });
+    sendVideo({ state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using hls.js' });
   }
 
-  function playVideoElement(url, reason) {
+  function playVideoElement(url, reason, at) {
     useMse('video');
-    mse.src = url;
+    mse.src = at > 0 ? String(url).split('#')[0] + '#t=' + at / 1000 : url;
     mse.play().catch(function () {});
-    send({ t: 'screen-video', state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using <video>' });
+    sendVideo({ state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using <video>' });
+  }
+
+  function positionNow() {
+    if (!video) return null;
+    if (video.mode !== 'avplay') return Math.round(read(function () { return mse.currentTime; }, 0) * 1000);
+    return avplayTime() || video.position || null;
   }
 
   function report(state, error) {
     if (!video) return;
     video.state = state;
     const inPage = video.mode !== 'avplay';
-    send({ t: 'screen-video', state: state, error: error || null, mode: video.mode,
-      position: inPage ? Math.round(mse.currentTime * 1000) : read(function () { return webapis.avplay.getCurrentTime(); }, null),
+    sendVideo({ state: state, error: error || null, mode: video.mode, played: video.played === true,
+      position: positionNow(),
       duration: inPage ? Math.round((mse.duration || 0) * 1000) : read(function () { return webapis.avplay.getDuration(); }, null) });
   }
 
-  function stopVideo(backToPage) {
+  function stopVideo(backToPage, reason) {
     if (!video) return;
     clearTimeout(startTimer);
     startTimer = null;
@@ -313,20 +445,23 @@
       read(function () { webapis.avplay.close(); });
     } else {
       if (hls) { read(function () { hls.destroy(); }); hls = null; }
-      mse.onplaying = mse.onpause = mse.onended = mse.onerror = null;
+      mse.onplaying = mse.onpause = mse.onended = mse.onerror = mse.ontimeupdate = null;
       read(function () { mse.pause(); });
       mse.removeAttribute('src');
       read(function () { mse.load(); });
       mse.style.display = 'none';
     }
-    send({ t: 'screen-video', state: 'stopped' });
+    sendVideo(reason ? { state: 'stopped', reason: reason } : { state: 'stopped' });
     video = null;
     document.body.classList.remove('video');
     root.className = active ? 'screen' : 'screen off';
-    if (backToPage) showHint('Back to the page', 2500);
+    if (backToPage) showHint(linkDown ? LINK_HINT : 'Back to the page', linkDown ? 0 : 2500);
   }
 
   function videoKey(key) {
+    video.reported = true;
+    // Yellow on a video: Lumen converts it on the PC (a black picture, a refusal the TV did not report).
+    if (key === 'yellow') { send({ t: 'screen-input', key: 'convert' }); return undefined; }
     if (video.mode !== 'avplay') {
       if (key === 'back' || key === 'stop') return stopVideo(true);
       if (key === 'enter' || key === 'playpause' || key === 'play' || key === 'pause') {
@@ -346,13 +481,86 @@
     }
     if (key === 'left' || key === 'rewind') return read(function () { webapis.avplay.jumpBackward(SEEK_MS); });
     if (key === 'right' || key === 'ff') return read(function () { webapis.avplay.jumpForward(SEEK_MS); });
+    return undefined;
+  }
+
+  // ---- this page in the background (another app in front): the TV's one decoder is let go ----
+
+  function onHidden() {
+    if (!video) return;
+    const mine = video;
+    mine.hidden = true;
+    clearTimeout(startTimer);
+    startTimer = null;
+    if (mine.mode === 'avplay') {
+      try {
+        webapis.avplay.suspend();
+        mine.suspended = true;
+      } catch (e) {
+        mine.resumeAt = avplayTime() || mine.position || 0;
+        read(function () { webapis.avplay.stop(); });
+        read(function () { webapis.avplay.close(); });
+        mine.closed = true;
+      }
+    } else {
+      if (hls) { const h = hls; read(function () { h.stopLoad(); }); }
+      read(function () { mse.pause(); });
+    }
+    mine.state = 'paused';
+    sendVideo({ state: 'paused', reason: 'hidden', mode: mine.mode, played: mine.played === true, position: mine.position || null });
+  }
+
+  function onVisible() {
+    if (pendingPlay) {
+      const p = pendingPlay;
+      pendingPlay = null;
+      if (active) startPlay(p);
+      return;
+    }
+    if (!video || !video.hidden) return;
+    const mine = video;
+    mine.hidden = false;
+    if (mine.mode === 'avplay') {
+      if (mine.suspended) {
+        mine.suspended = false;
+        try {
+          try { webapis.avplay.restore(); } catch (e) { webapis.avplay.restore(mine.url, mine.position || 0, true); }
+          if (read(function () { return webapis.avplay.getState(); }, '') !== 'PLAYING') webapis.avplay.play();
+          mine.reported = true;
+          report('playing');
+        } catch (e) {
+          refused('restore: ' + String(e && (e.name || e.message) || e), mine);
+        }
+      } else if (mine.closed) {
+        mine.closed = false;
+        openAvplay(mine, mine.resumeAt || 0, false);
+      }
+      return;
+    }
+    if (hls) { const h = hls; read(function () { h.startLoad(-1); }); }
+    mse.play().catch(function () {});
+    if (!mine.started) armMseStart(mine, mine.mode);
+  }
+
+  function startPlay(msg) {
+    const startAt = typeof msg.startAt === 'number' && isFinite(msg.startAt) && msg.startAt > 0 ? msg.startAt : 0;
+    playVideo(msg.url, msg.title, msg.fromStart === true, msg.engine, msg.drm && typeof msg.drm === 'object' ? msg.drm : null,
+      msg.kind === 'hls' ? 'hls' : null, startAt, typeof msg.id === 'number' ? msg.id : null);
+  }
+
+  // ---- the link to the PC ----
+
+  function closeScreen() {
+    window.LumenScreen.stop();
+    read(function () { onClosed(); });
   }
 
   // ---- API for agent.js ----
 
   window.LumenScreen = {
-    init: function (sendFn) {
+    init: function (sendFn, options) {
       send = sendFn;
+      if (options && typeof options.onClosed === 'function') onClosed = options.onClosed;
       if (live) live.init(sendFn, document.getElementById('live'), root);
       document.addEventListener('keydown', onKey, true);
       document.addEventListener('mousemove', onPointer, true);
@@ -366,12 +574,52 @@
       showHint('◀ ▲ ▼ ▶ move · OK click · Back go back · CH ▲▼ scroll · Red close · Yellow play video on TV');
     },
     stop: function () {
+      pendingPlay = null;
       stopVideo(false);
       if (live) live.stop();
       active = false;
+      linkDown = false;
+      clearTimeout(linkTimer);
+      linkTimer = null;
       unregisterKeys();
       root.className = 'screen off';
     },
+    /** What the screen shows, for the hello (the PC carries on after a reconnect). */
+    state: function () {
+      return {
+        active: active,
+        hidden: pageHidden(),
+        video: video ? { state: video.state, mode: video.mode, position: positionNow(), id: video.id } : null,
+      };
+    },
+    /** Every few seconds while a video is in front: where its clock is (the PC's view of it drifts otherwise). */
+    heartbeat: function () {
+      if (!active || !video) return;
+      sendVideo({ state: video.state, mode: video.mode, position: positionNow(),
+        duration: video.mode !== 'avplay' ? Math.round((mse.duration || 0) * 1000) : read(function () { return webapis.avplay.getDuration(); }, null),
+        heartbeat: true });
+    },
+    /** The PC link dropped while the screen is on: say so, let Back and Red close it, and close it
+     *  after a minute. A video playing in the TV's own player keeps playing meanwhile. */
+    linkDown: function () {
+      if (!active) return;
+      linkDown = true;
+      if (!video) showHint(LINK_HINT, 0);
+      clearTimeout(linkTimer);
+      linkTimer = setTimeout(function () {
+        linkTimer = null;
+        if (linkDown && active) closeScreen();
+      }, LINK_DOWN_MS);
+    },
+    linkUp: function () {
+      if (!linkDown) return;
+      linkDown = false;
+      clearTimeout(linkTimer);
+      linkTimer = null;
+      if (hint.textContent === LINK_HINT) hint.className = 'hint';
+    },
+    hidden: onHidden,
+    visible: onVisible,
     // Binary messages: live video ('LV…', live.js) or a JPEG frame.
     frame: function (buffer) {
       // While the TV's own player is in front, live video waits: the TV has one decoder for both,
@@ -385,7 +633,10 @@
         cursor.style.transform = 'translate(' + Math.round(msg.x * 1920) + 'px,' + Math.round(msg.y * 1080) + 'px)';
         cursor.style.display = msg.visible === false ? 'none' : 'block';
       } else if (msg.t === 'screen-play') {
-        playVideo(msg.url, msg.title, msg.fromStart === true, msg.engine, msg.drm && typeof msg.drm === 'object' ? msg.drm : null);
+        // A hidden page (not in screen mode) never opens the TV's player.
+        if (!active) return;
+        if (pageHidden()) { pendingPlay = msg; return; }
+        startPlay(msg);
       } else if (msg.t.indexOf('screen-live') === 0) {
         if (live) live.message(msg);
         else send({ t: 'screen-live', state: 'unsupported', reason: 'no live player' });
