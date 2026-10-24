@@ -25,6 +25,7 @@ import { mountScreen } from './views/screen.js';
 import { createAsk } from './views/ask.js';
 import { watchIme } from './views/text.js';
 import { mountShortcuts, openHelp } from './views/shortcuts.js';
+import { mountInstallHint } from './ui/install-hint.js';
 
 const DESKTOP = matchMedia('(min-width: 980px)');
 
@@ -50,6 +51,7 @@ headerTheme.classList.add('only-desktop');
 $('#theme-slot').replaceWith(headerTheme);
 $('#help-btn').addEventListener('click', openHelp);
 mountBanners($('#banners'), ctx);
+mountInstallHint(ctx);
 const nav = mountNav($('#nav'), ctx);
 
 const ask = createAsk(ctx);
@@ -138,7 +140,8 @@ function show(view) {
 }
 
 function route() {
-  show(location.hash.replace(/^#\/?/, '') || 'remote');
+  // /browser is the Browser view's own home-screen app: it opens there.
+  show(location.hash.replace(/^#\/?/, '') || (location.pathname === '/browser' ? 'browser' : 'remote'));
 }
 
 ctx.on('navigate', (view) => {

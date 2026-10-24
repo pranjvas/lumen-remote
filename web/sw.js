@@ -1,11 +1,14 @@
 // Offline shell only: network-first for the app's static files, falling back to the cache.
 // API, upload, MCP and the live WebSocket are never cached or intercepted.
 
-const CACHE = 'lumen-shell-v14';
+const CACHE = 'lumen-shell-v15';
 const SHELL = [
   '/',
   '/index.html',
   '/manifest.webmanifest',
+  '/browser',
+  '/browser.webmanifest',
+  '/icons/lumen-browser.svg',
   '/css/tokens.css',
   '/css/base.css',
   '/css/components.css',
@@ -55,6 +58,6 @@ self.addEventListener('fetch', (event) => {
         }
         return response;
       })
-      .catch(() => caches.match(request).then((hit) => hit || (request.mode === 'navigate' ? caches.match('/') : Response.error()))),
+      .catch(() => caches.match(request).then((hit) => hit || (request.mode === 'navigate' ? caches.match(url.pathname === '/browser' ? '/browser' : '/') : Response.error()))),
   );
 });

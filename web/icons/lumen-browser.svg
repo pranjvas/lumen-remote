@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0" stop-color="#2a2218"/>
+      <stop offset="0.55" stop-color="#121419"/>
+      <stop offset="1" stop-color="#07080a"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffd089"/>
+      <stop offset="1" stop-color="#ffb454"/>
+    </linearGradient>
+    <radialGradient id="cap" cx="50%" cy="35%" r="65%">
+      <stop offset="0" stop-color="#2e333c"/>
+      <stop offset="1" stop-color="#16191e"/>
+    </radialGradient>
+  </defs>
+  <!-- Lumen's dial with a globe in the cap: the browser remote. -->
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="10"/>
+  <path d="M149.9 362.1A150 150 0 1 1 362.1 362.1" fill="none" stroke="url(#ring)" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="362.1" cy="362.1" r="15" fill="#ffd089"/>
+  <circle cx="256" cy="256" r="92" fill="url(#cap)" stroke="rgba(0,0,0,0.6)" stroke-width="3"/>
+  <g fill="none" stroke="#ffd089" stroke-width="9" stroke-linecap="round">
+    <circle cx="256" cy="256" r="54"/>
+    <ellipse cx="256" cy="256" rx="24" ry="54"/>
+    <path d="M202 256h108M210 228h92M210 284h92"/>
+  </g>
+</svg>
