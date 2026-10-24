@@ -353,7 +353,7 @@ const TOOLS = [
         muted: reading(store, 'audio.mute'),
         input: source && { ...source, label: labels[source.value] },
         picture,
-        sound: { mode: reading(store, 'audio.soundMode'), output: reading(store, 'audio.speaker') },
+        sound: { mode: reading(store, 'audio.soundMode'), output: reading(store, 'audio.speaker'), outputs: valueOf(store, 'audio.output') ?? null },
         app: foregroundApp(store),
         channel: valueOf(store, 'channel.current') ?? null,
         sleep: sleepState?.endsAt ? { minutesLeft: Math.max(0, Math.ceil((sleepState.endsAt - Date.now()) / 60_000)) } : null,
@@ -459,6 +459,26 @@ const TOOLS = [
         to = await send(hub, { cmd: 'volume.set', value: clamp(from + delta, [0, 100]) });
       }
       return changed('Volume', from, to);
+    },
+  },
+  {
+    name: 'set_sound_output',
+    description: 'Where the TV sound plays: "tv" (the TV speaker), "optical", or a Bluetooth speaker or headphones the TV has connected, by name ("Bose NC 700 Headphones") or as bt:<id>. Without output, only reports the current output and the Bluetooth speakers on offer. Headphones the TV has not connected (off, or paired only through Lumen Eyes) are not on offer: ask the user to turn them on near the TV; if they still do not appear, pair them in the TV\'s Sound Output menu (Settings → Sound → Sound Output → Bluetooth Speaker List).',
+    inputSchema: object({
+      output: { type: 'string', description: '"tv", "optical", a Bluetooth speaker\'s name, or bt:<id>' },
+    }, []),
+    async run({ output }, { hub }) {
+      const now = await send(hub, { cmd: 'audio.output' });
+      const name = (o, out) => (o === 'tv' ? 'TV speaker' : o === 'optical' ? 'Optical' : out?.bluetooth?.find((d) => `bt:${d.id}` === o)?.name ?? o);
+      if (!output) return { ok: true, current: name(now?.current, now), bluetooth: now?.bluetooth ?? [] };
+      const wanted = String(output).trim();
+      const byName = now?.bluetooth?.find((d) => d.name.toLowerCase() === wanted.toLowerCase())
+        ?? now?.bluetooth?.find((d) => d.name.toLowerCase().includes(wanted.toLowerCase()));
+      const keyword = wanted.toLowerCase();
+      const target = keyword === 'tv' || keyword === 'optical' ? keyword : /^bt:/i.test(wanted) ? `bt:${wanted.slice(3)}` : byName ? `bt:${byName.id}` : null;
+      if (!target) fail(`No connected Bluetooth speaker is called "${wanted.slice(0, 60)}". On offer: ${['TV speaker', 'Optical', ...(now?.bluetooth ?? []).map((d) => d.name)].join(', ')}`, 'UNAVAILABLE');
+      const after = await send(hub, { cmd: 'audio.output.set', output: target });
+      return { ok: true, output: name(after?.current ?? target, after ?? now), summary: `Sound now plays on ${name(after?.current ?? target, after ?? now)}` };
     },
   },
   {

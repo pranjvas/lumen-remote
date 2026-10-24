@@ -100,7 +100,8 @@ export function mountSettings(root, ctx) {
       else if (g.id === 'network') rows = networkRows(ctx, scope);
       else if (g.id === 'bluetooth') rows = bluetoothRows(ctx, scope);
       else if (g.id === 'phone') rows = phoneRows();
-      else rows = (byGroup.get(g.id) || []).map((s) => settingRow(ctx, s, scope));
+      // Sound Output (Internal / External) is the Sound output row's job (soundExtras), with names.
+      else rows = (byGroup.get(g.id) || []).filter((s) => s.key !== 'audio.speaker').map((s) => settingRow(ctx, s, scope));
       if (g.id === 'sound') rows.unshift(...soundExtras(ctx, scope));
       if (!rows.length) continue;
       const id = `set-${g.id}`;
@@ -442,7 +443,56 @@ function soundExtras(ctx, { watch, own }) {
   sw.addEventListener('click', () => ctx.volume.toggleMute({ el: sw }));
   const mute = rowShell({ key: 'audio.mute', label: 'Mute', type: 'toggle' }, sw);
   watch(['audio.mute'], () => sw.setAttribute('aria-checked', ctx.state.value('audio.mute', false) ? 'true' : 'false'));
-  return [vol, mute];
+  return [vol, mute, soundOutputRow(ctx, { watch })];
+}
+
+// Where the TV's sound goes: its speaker, the optical out, or a Bluetooth speaker or headphones the
+// TV has connected (audio.output). Headphones connected only through Lumen Eyes are not among them:
+// the TV sends sound to the ones it paired in its own Sound Output menu.
+const SOUND_MENU = 'Settings → Sound → Sound Output → Bluetooth Speaker List';
+function soundOutputRow(ctx, { watch }) {
+  const host = h('div', { class: 'row-enum' });
+  const note = h('span', { class: 'row-note', hidden: true });
+  const row = rowShell({ key: 'audio.output', label: 'Sound output', hint: 'TV speaker, optical, or Bluetooth headphones and speakers', type: 'enum' }, host, { sub: note });
+  let seg = null;
+  let sig = '';
+  const labelOf = (o, out) => (o === 'tv' ? 'TV Speaker' : o === 'optical' ? 'Optical'
+    : out?.bluetooth?.find((d) => `bt:${d.id}` === o)?.name ?? 'Bluetooth');
+
+  async function select(opt) {
+    seg.setPending(opt);
+    const ack = await ctx.cmd('audio.output.set', { output: opt }, { el: row, timeoutMs: 20000 });
+    seg.setPending(null);
+    if (ack.ok) toast(`Sound on ${labelOf(opt, ack.value)}`, { level: 'ok' });
+    else seg.set(ctx.state.value('audio.output', null)?.current);
+  }
+
+  function update() {
+    const out = ctx.state.value('audio.output', null);
+    if (!out) {
+      fill(host, h('span', { class: 'row-text', text: '—' }));
+      sig = '';
+    } else {
+      const opts = ['tv', ...out.bluetooth.map((d) => `bt:${d.id}`), 'optical'];
+      const next = JSON.stringify(out.bluetooth);
+      if (next !== sig || !seg) {
+        sig = next;
+        seg = createSegmented({ options: opts, value: out.current, label: 'Sound output', format: (o) => labelOf(o, out), onSelect: select });
+        fill(host, seg.el);
+      }
+      seg.set(out.current);
+    }
+    // Paired Bluetooth headphones and speakers the TV is not offering: how to get them here.
+    const listed = new Set((out?.bluetooth ?? []).map((d) => d.name));
+    const waiting = (ctx.state.value('bluetooth.state', null)?.devices ?? []).filter((d) => d.kind === 'AudioVideo' && !listed.has(d.name));
+    note.textContent = waiting.length
+      ? `${waiting.map((d) => d.name).join(', ')}: turn on near the TV. Not listed once on? Pair it on the TV: ${SOUND_MENU}`
+      : '';
+    note.hidden = !waiting.length;
+  }
+  watch(['audio.output', 'bluetooth.state'], update);
+  ctx.cmd('audio.output', {}, { silent: true }); // a fresh read: a speaker may have connected since
+  return row;
 }
 
 /* ---------- Device ---------- */

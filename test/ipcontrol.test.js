@@ -55,6 +55,7 @@ describe('IP Control client', { skip }, () => {
   const resetMock = () => {
     mock.setPictureMode('Standard');
     Object.assign(mock.options, { ipcFail: {}, ipcTransform: {}, ipcErrorStyle: 'nested', ipcDelayMs: 0 });
+    Object.assign(mock.state, { speaker: 'Internal', btSpeakers: [], bt: null });
   };
 
   test('GET sends only the AccessToken and publishes normalised values', async () => {
@@ -213,6 +214,34 @@ describe('IP Control client', { skip }, () => {
     const settled = ipcRequests('getTVStates').length;
     await sleep(500);
     assert.equal(ipcRequests('getTVStates').length, settled, 'no polls with zero clients');
+  });
+
+  test('sound output: the TV speaker, a Bluetooth speaker the TV connected (by name), or optical; read back each time', async () => {
+    const { ipc, store } = make();
+    await ipc.start();
+    assert.deepEqual((await ipc.readOutput()).value, { current: 'tv', bluetooth: [] });
+    // Headphones paired in the TV's Sound Output menu (seen 24 Oct: deviceId BT-1).
+    mock.state.btSpeakers = [{ deviceId: 'BT-1', deviceName: 'Bose NC 700 Headphones' }];
+    const sent = ipcRequests('externalSpeakerControl').length;
+    const bt = (await ipc.setOutput('bt:BT-1')).value;
+    assert.deepEqual(bt, { current: 'bt:BT-1', bluetooth: [{ id: 'BT-1', name: 'Bose NC 700 Headphones' }] });
+    const set = ipcRequests('externalSpeakerControl').slice(sent).filter((r) => r.kind === 'set');
+    assert.deepEqual(set.map((r) => r.params), [{ deviceId: 'BT-1' }]);
+    assert.equal(store.get('audio.speaker').v, 'External');
+    assert.equal(store.get('audio.output').v.current, 'bt:BT-1');
+    assert.equal((await ipc.setOutput('tv')).value.current, 'tv');
+    assert.equal(store.get('audio.speaker').v, 'Internal');
+    mock.state.btSpeakers = [];
+    assert.equal((await ipc.setOutput('optical')).value.current, 'optical');
+  });
+
+  test('sound output: a Bluetooth speaker the TV has not connected is refused before anything is sent; bad names are invalid', async () => {
+    const { ipc } = make();
+    await ipc.start();
+    const sent = ipcRequests('externalSpeakerControl').filter((r) => r.kind === 'set').length;
+    await assert.rejects(ipc.setOutput('bt:BT-9'), (err) => err.code === 'UNAVAILABLE' && /not connected/.test(err.message));
+    assert.equal(ipcRequests('externalSpeakerControl').filter((r) => r.kind === 'set').length, sent, 'no SET for a speaker that is not there');
+    await assert.rejects(ipc.setOutput('bluetooth'), (err) => err.code === 'INVALID');
   });
 
   test('power: only powerControl powerOff / powerOn, never param-less or reboot', async () => {

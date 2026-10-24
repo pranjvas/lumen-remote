@@ -469,11 +469,66 @@ export function createIpControl({ config, data, log: rootLog, store }) {
     return false;
   }
 
+  // ---- sound output: the TV speaker, the optical out, or a Bluetooth speaker ----
+  // speakerSelect says internal or external; externalSpeakerControl lists the Bluetooth speakers the
+  // TV has connected ({} when none) and, given { deviceId }, sends the sound to one of them (seen
+  // 24 Oct on the Q95T: [{ deviceId: 'BT-1', deviceName: 'Bose NC 700 Headphones' }]). Bluetooth
+  // headphones connected outside the TV's own menu (Lumen Eyes) are not listed: the TV pairs them itself.
+  let lastSpeaker = null;
+  async function readOutput(priority) {
+    const speaker = (await readStates(priority))['audio.speaker'] ?? null;
+    lastSpeaker = speaker;
+    let raw = null;
+    try {
+      raw = await call('externalSpeakerControl', null, priority);
+    } catch (err) {
+      if (!(err instanceof LumenError) || err.code === 'NOT_PAIRED') throw err;
+    }
+    const bluetooth = (Array.isArray(raw) ? raw : []).filter((d) => d && d.deviceId != null).slice(0, 8)
+      .map((d) => ({ id: String(d.deviceId).slice(0, 40), name: String(d.deviceName ?? d.deviceId).slice(0, 80) }));
+    // External with a Bluetooth speaker listed is that speaker (the TV sends the sound to one external
+    // output at a time); with none, the optical / audio out.
+    const current = speaker === 'Internal' ? 'tv' : speaker === 'External' ? (bluetooth.length ? `bt:${bluetooth[0].id}` : 'optical') : null;
+    const value = { current, bluetooth };
+    store.set('audio.output', value, { src: 'live', via: 'ipc:externalSpeakerControl' });
+    return value;
+  }
+
+  const OUTPUT_SETTLE_MS = [400, 700, 700, 1000, 1200, 1500];
+  /** output: 'tv', 'optical' or 'bt:<deviceId>' (a Bluetooth speaker the TV has connected). → the output read back. */
+  async function setOutput(output) {
+    const wanted = String(output ?? '');
+    if (wanted === 'tv') await call('speakerSelectControl', { speakerSelect: 'Internal' }, 'user');
+    else if (wanted === 'optical') await call('speakerSelectControl', { speakerSelect: 'AudioOut/Optical' }, 'user');
+    else if (/^bt:[\w.:-]{1,40}$/.test(wanted)) {
+      const id = wanted.slice(3);
+      const now = await readOutput('user');
+      if (!now.bluetooth.some((d) => d.id === id)) {
+        throw new LumenError('UNAVAILABLE', 'That Bluetooth speaker is not connected to the TV. Turn it on near the TV: it reconnects, then choose it again');
+      }
+      await call('externalSpeakerControl', { deviceId: id }, 'user');
+    } else throw invalid("output must be 'tv', 'optical' or 'bt:<deviceId>'");
+    // The TV takes a moment to move the sound (a Bluetooth link a second or two): read back until it has.
+    let after = null;
+    for (const ms of OUTPUT_SETTLE_MS) {
+      await sleep(ms);
+      after = await readOutput('user');
+      if (after.current === wanted) return { value: after };
+    }
+    const where = after.current === 'tv' ? 'the TV speaker' : after.current === 'optical' ? 'the optical out'
+      : after.bluetooth.find((d) => `bt:${d.id}` === after.current)?.name ?? 'another output';
+    throw new LumenError('FAILED', `The TV kept its sound on ${where}`);
+  }
+
   const statesLoop = createLoop(async () => {
     const on = tvState() === 'on';
     if (on && !wasOn) unavailable.clear();
     wasOn = on;
-    if (await pollable()) await readStates('poll');
+    if (!(await pollable())) return;
+    const before = lastSpeaker;
+    lastSpeaker = (await readStates('poll'))['audio.speaker'] ?? lastSpeaker;
+    // The speaker changed (a Bluetooth device connected or left, the TV menu): which output it is now.
+    if (lastSpeaker !== before || !store.get('audio.output')) await readOutput('poll');
   }, statesMs, quiet);
 
   const pictureLoop = createLoop(async () => {
@@ -591,5 +646,5 @@ export function createIpControl({ config, data, log: rootLog, store }) {
     return {};
   }
 
-  return { start, stop, setDemand, get, set, setSetting, refresh, power, pair };
+  return { start, stop, setDemand, get, set, setSetting, refresh, power, pair, readOutput: () => readOutput('user').then((value) => ({ value })), setOutput };
 }

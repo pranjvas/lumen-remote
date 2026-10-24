@@ -219,6 +219,9 @@ export async function startMockTv(options = {}) {
     pictureSize: LIVE.getTVStates.pictureSize,
     soundMode: LIVE.getTVStates.soundMode,
     speaker: LIVE.speakerSelectControl.speakerSelect,
+    // Bluetooth speakers the TV has connected (externalSpeakerControl); bt: the one the sound goes to.
+    btSpeakers: [],
+    bt: null,
     picture: { ...BASE_PICTURE },
     pictureScopes: new Map(),
     apps,
@@ -852,12 +855,21 @@ export async function startMockTv(options = {}) {
       case 'soundModeControl':
         setEnum('soundMode', oneOf('Standard', 'Optimized', 'Amplify'), (v) => { state.soundMode = v; changed('soundMode', v); });
         return { soundMode: state.soundMode };
+      // As the Q95T answers (24 Oct): reads 'Internal' or 'External' (optical and Bluetooth alike);
+      // only Internal and AudioOut/Optical can be set here ('Bluetooth' is a -32002).
       case 'speakerSelectControl':
-        setEnum('speakerSelect', oneOf('Internal', 'AudioOut/Optical'), (v) => { state.speaker = v; changed('speaker', v); });
-        return { speakerSelect: state.speaker };
+        setEnum('speakerSelect', oneOf('Internal', 'AudioOut/Optical'), (v) => { state.speaker = v; state.bt = null; changed('speaker', v); });
+        return { speakerSelect: state.speaker === 'Internal' ? 'Internal' : 'External' };
+      // The Bluetooth speakers the TV has connected ({} when none); { deviceId } sends the sound to one.
       case 'externalSpeakerControl':
-        if (set) throw new RpcError(-32002);
-        return {};
+        if (set) {
+          if (!state.btSpeakers.some((d) => d.deviceId === set.deviceId)) throw new RpcError(-32002);
+          state.speaker = 'External';
+          state.bt = set.deviceId;
+          changed('speaker', 'External');
+          return { deviceId: set.deviceId };
+        }
+        return state.btSpeakers.length ? state.btSpeakers.map((d) => ({ ...d })) : {};
       case 'directVolumeControl':
         if (state.speaker !== 'Internal') throw new RpcError(-32002); // the TV volume is meaningless on an external output
         setEnum('volume', int(0, 100), (volume) => changeAudio({ volume: stored(volume) }));

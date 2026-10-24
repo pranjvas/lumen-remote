@@ -689,6 +689,18 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return feature('tracked', 'set', name, value);
     },
 
+    // Where the TV's sound goes (audio.output: { current: 'tv' | 'optical' | 'bt:<id>', bluetooth: [{ id, name }] }).
+    'audio.output': async () => {
+      requireTvOn();
+      return call('ipc', 'readOutput');
+    },
+
+    'audio.output.set': async ({ output }) => {
+      text(output, 'output', { max: 44, pattern: /^(tv|optical|bt:[\w.:-]{1,40})$/ });
+      requireTvOn();
+      return touching(['audio.speaker', 'audio.output'], () => call('ipc', 'setOutput', output));
+    },
+
     'settings.refresh': async ({ group = 'all' }) => {
       oneOf(group, 'group', ['picture', 'sound', 'all']);
       requireTvOn();
