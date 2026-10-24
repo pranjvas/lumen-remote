@@ -3,8 +3,9 @@
 // the screen. Lumen opens the agent again once (at most twice in ten minutes) and puts the screen
 // back (screen mode, live video offer, pointer, the latest frame); a page behind another app is not
 // brought back; an agent that does not come back closes the screen, so Lumen's browser can idle; an
-// agent that kept its screen through a link blip carries on; a TV left showing the screen by an
-// earlier run of this server turns it off at its first key. Mock TV, fake agents, a scripted
+// agent that kept its screen through a link blip carries on; a close while the screen is being put
+// back wins; a TV left showing the screen by an earlier run of this server turns it off at its
+// first key. Mock TV, fake agents, a scripted
 // browser page and live video stand-in (no Edge).
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,6 +16,8 @@ const AGENT_APP = 'lumenrmt01.LumenAgent';
 
 describe('tvscreen: the TV agent going away and coming back', () => {
   let stack, b, agent, sink, real;
+  let slowStart = 0; // ms the browser takes to be ready (ensureRunning), and the calls waiting on it
+  let starting = 0;
   const page = { url: null, playing: false, pauses: 0, lastInput: 0, videos: [] };
   const live = []; // calls the live video stand-in got: ['attach', lower] | ['pause'] | ['resume'] | ['detach']
 
@@ -59,7 +62,11 @@ describe('tvscreen: the TV agent going away and coming back', () => {
     real = stack.server.features.browser;
     const fake = Object.create(real);
     Object.assign(fake, {
-      async ensureRunning() {},
+      async ensureRunning() {
+        if (!slowStart) return;
+        starting += 1;
+        try { await sleep(slowStart); } finally { starting -= 1; }
+      },
       async open(url) { setPage(url); return { value: { url } }; },
       async nav() { return {}; },
       async input() { return {}; },
@@ -178,6 +185,26 @@ describe('tvscreen: the TV agent going away and coming back', () => {
     await waitFor(() => requestsOf(agent, true).length === 1, { timeout: 5000, message: 'screen on again' });
     await waitFor(() => screenOf(agent, 'screen-cursor').length > 0, { timeout: 3000, message: 'the pointer' });
     assert.ok(tvOn());
+  });
+
+  test('a close while a reconnect puts the screen back wins: the screen stays closed and the page keeps its own size', async () => {
+    assert.ok(tvOn());
+    slowStart = 800; // the reopen waits on the browser, and the close comes meanwhile
+    try {
+      await kill();
+      agent = await connect({ active: false, video: null });
+      await online();
+      await waitFor(() => starting > 0, { timeout: 3000, message: 'the screen being put back' });
+      ok(await b.send('tvscreen.close', {}, { timeout: 10000 }));
+      await waitFor(() => starting === 0, { timeout: 3000, message: 'the reopen done waiting' });
+      await sleep(300);
+      assert.equal(tvOn(), false, 'the screen stays closed');
+      assert.equal(sink, null, 'no frame sink (it would lock the page at the TV\'s 1280×720)');
+      assert.equal(requestsOf(agent, true).length, 0, 'the agent is not told to show the screen');
+    } finally {
+      slowStart = 0;
+    }
+    await openScreen();
   });
 
   test('an agent that reconnects without saying hello yet is not taken for one showing the screen: Video → TV turns the screen on first', async () => {

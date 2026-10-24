@@ -183,7 +183,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let bringingFront = 0;
   let lastRemoteInput = 0; // OK / clicks from the TV remote or the trackpad
   let lastYoutube = null; // { id, at } of the last video opened in the TV's YouTube app
-  let generation = 0; // bumped by close(): an automatic hand-off started before it never reopens the screen
+  let generation = 0; // bumped by close(): an automatic hand-off or an open started before it never reopens the screen
   // Every hand-off (automatic, Yellow, Video → TV, the AI tool) runs one at a time, so a video is
   // never handed over twice at once (two relay sessions, two screen-plays, two YouTube launches).
   let handOffChain = Promise.resolve();
@@ -558,6 +558,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
    *  the agent back in screen mode and in front (after it reconnected or went to the background). */
   async function open({ url, restore = false } = {}) {
     opening += 1;
+    // A close while this open waits (Red, Close TV, a phone closing it while a reconnect puts the
+    // screen back) wins: the screen is not turned on again behind it. The agent may have been told
+    // to show it after the close's own 'off', so it is told 'off' once more.
+    const gen = generation;
+    const closedMeanwhile = (told) => {
+      if (gen === generation) return;
+      if (told) agent()?.request?.('screen', { on: false }).catch(() => {});
+      throw cancelled();
+    };
     try {
       ensureSubscribed();
       await ensureAgent();
@@ -568,10 +577,13 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
         await feature.ensureRunning();
         if (!store.get('browser.url')?.v) await feature.nav('home', { userInput: !restore });
       }
+      closedMeanwhile(false);
       await adapter.request('screen', { on: true });
+      closedMeanwhile(true);
       screenSent = true;
       agentHidden = false;
       if (appId && rest) await rest.launch(appId).catch((err) => log.debug('agent bring-to-front failed', { message: err.message }));
+      closedMeanwhile(true);
       clearLoss();
       if (!on) {
         on = true;
@@ -604,9 +616,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
 
   async function close() {
     clearLoss();
+    // Bumped even when the screen is not on yet: an open still waiting for the agent then stays closed.
+    generation += 1;
     if (!on) return { value: { on: false } };
     on = false;
-    generation += 1;
     releaseJob(true);
     clearInterval(autoTimer);
     autoTimer = null;
@@ -715,6 +728,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
         toast(why === 'relaunched' ? 'Lumen is back after the TV closed it' : 'Lumen’s browser is back on the TV');
         log.info('browser shown on the TV again', { why });
       } catch (err) {
+        if (err.cancelled) return; // closed meanwhile (and maybe opened again since): not this reopen's to undo
         log.info('Lumen’s browser could not be shown on the TV again', { message: err.message });
         await close();
       }

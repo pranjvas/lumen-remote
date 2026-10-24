@@ -755,7 +755,7 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
     assert.equal(env.agentLaunches(), n + 1, 'at most once every 5 s');
   });
 
-  test('a converted video paused on the TV outlives the reaper; once the player stops or the screen closes, it goes after the idle time', async () => {
+  test('a converted video paused on the TV outlives the reaper; once the player stops it is released for the idle time; a close stops it at once', async () => {
     // The real transcoder with a stand-in ffmpeg: a finished copy (ENDLIST), as a short film's copy is
     // long before the film ends. A paused AVPlay fetches nothing, so only the hold keeps it.
     const dataDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'lumen-hold-'));
@@ -812,13 +812,10 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
       tc.reap();
       assert.equal(tc.existing(source)?.id, id, 'held again while it plays');
 
-      // The screen closed: released, then reaped after the idle time.
+      // The screen closed: nobody can come back to it, so its ffmpeg job is stopped at once (the TV
+      // screen's own rule, which the conversion-jobs suite checks with the stand-in converter too).
       ok(await b.send('tvscreen.close', {}, { timeout: 10000 }));
-      tc.reap();
-      assert.equal(tc.existing(source)?.id, id);
-      await sleep(300);
-      tc.reap();
-      assert.equal(tc.existing(source), null, 'reaped once nothing holds it');
+      assert.equal(tc.existing(source), null, 'stopped on close');
       assert.equal((await fetch(play.url)).status, 404);
     } finally {
       stack.server.features.transcode = fakeTc;
