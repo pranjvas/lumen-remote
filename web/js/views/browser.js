@@ -986,7 +986,8 @@ export function mountBrowser(root, ctx) {
   let alignRun = 0;
   async function alignTv() {
     const run = ++alignRun;
-    const ack = await ctx.live.send('browser.pointer', { native: true }, { timeoutMs: 5000 });
+    // A plain read: it must not put the phone in charge (that held the TV pointer's moves and clicks back).
+    const ack = await ctx.live.send('browser.pointer', {}, { timeoutMs: 5000 });
     const at = ack?.ok ? ack.value?.native : null;
     if (!at || run !== alignRun || !Number.isFinite(at.x) || !Number.isFinite(at.y)) return;
     ptr = { x: clamp(at.x, 0, 1), y: clamp(at.y, 0, 1) };

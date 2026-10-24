@@ -257,6 +257,26 @@ describe('tvscreen: Lumen browser on the TV', { skip }, () => {
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
   });
+
+  test('asking where the pointers are does not hold the TV pointer back: its moves and taps reach the page at once', async () => {
+    // Seen 24 Oct: the phone asks after every stroke; that put it "in charge" for 2.5 s, and the TV
+    // pointer's moves and taps in that time never reached the page.
+    ok(await b.send('browser.openOnTv', {}, { timeout: 40000 }));
+    await b.waitForState('tvscreen.on', (r) => r?.v === true, { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 2600)); // the test before steered with the pad: its 2.5 s are over
+    ok(await b.send('browser.pointer', { native: true })); // a read, as phones before 24 Oct ask
+    agent.sendScreenInput({ pointer: { x: 0.7, y: 0.6 } });
+    await waitFor(async () => near(ok(await b.send('browser.pointer', { native: true })).x, 0.7), { timeout: 5000, what: 'the page pointer to follow the TV pointer' });
+    const page = stack.server.features.browser;
+    await page.evaluate('log.length = 0');
+    ok(await b.send('browser.pointer', { native: true })); // a read, as phones before 24 Oct ask
+    agent.sendScreenInput({ pointer: { x: 0.4, y: 0.5 }, click: true }); // a tap: the TV clicks where its pointer is
+    await waitFor(async () => (await pageLog('click')).length === 1, { timeout: 5000, what: 'the tap on the page' });
+    const [w] = await page.evaluate('[innerWidth]');
+    assert.ok(Math.abs((await pageLog('click'))[0][1] - 0.4 * w) <= 2, 'the tap lands under the TV pointer');
+    agent.sendScreenInput({ key: 'red' });
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
+  });
 });
 
 // The trackpad's validation (hub browser.pointer) and the pointer's edges (tvscreen.pointer) need no

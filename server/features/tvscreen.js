@@ -361,7 +361,11 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   const PAD_AUTHORITY_MS = 2500;
 
   async function pointer({ dx = 0, dy = 0, x, y, action = 'move', button = 'left', deltaX = 0, deltaY = 0, native = false } = {}) {
-    if (native) padUntil = Date.now() + PAD_AUTHORITY_MS;
+    // Only the pad steering the pointer (a position, a move, a click) puts it in charge. Asking where
+    // the pointers are does not: the phone asks after every stroke, and that held the TV pointer's own
+    // moves and clicks back for 2.5 s (the page's mouse stayed behind it, taps were lost; 24 Oct).
+    const steering = x !== undefined || y !== undefined || dx !== 0 || dy !== 0 || action !== 'move';
+    if (native && steering) padUntil = Date.now() + PAD_AUTHORITY_MS;
     const next = {
       x: Math.min(1 - EDGE, Math.max(EDGE, x ?? cursor.x + dx)),
       y: Math.min(1 - EDGE, Math.max(EDGE, y ?? cursor.y + dy)),
