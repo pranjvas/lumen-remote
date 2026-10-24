@@ -53,7 +53,8 @@ describe('tvscreen: live video on the TV', { skip }, () => {
     await waitFor(() => agent.frames.some(isJpeg), { timeout: 15000, what: 'frames before live video' });
     ready();
     const jpegsAtAttach = agent.frames.filter(isJpeg).length;
-    const statsTimer = setInterval(() => stats(), 500);
+    // Every 2 s, as live.js reports (the PC ticks every second: half its ticks have no report).
+    const statsTimer = setInterval(() => stats(), 2000);
     try {
       await waitFor(() => agent.frames.some((f) => tag(f) === 'LVM'), { timeout: 30000, what: 'live video fragments' });
       const live = agent.frames.filter((f) => !isJpeg(f)).map(parseMessage);

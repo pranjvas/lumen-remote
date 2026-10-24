@@ -1,9 +1,13 @@
 // Lumen Agent: live video of Lumen's browser. The PC captures its browser page with its sound,
 // encodes it (H.264 or HEVC + AAC) and sends fragmented MP4 over the agent socket: an init message
 // ('LVI') then media fragments ('LVM'), each tagged with a stream generation. This plays them through
-// MSE on a <video> under the pointer, kept at the live edge (small drift: a slightly faster rate;
-// large: a jump), trims old buffer, recovers from stalls, and reports to the PC once a second so it
-// can adapt the bitrate and resolution. When MSE refuses the stream the PC falls back to JPEG frames.
+// MSE on a <video> under the pointer, kept near the live edge (small drift: a slightly faster rate;
+// larger lag is shed by the PC, which skips media and keeps the timeline seamless), trims old buffer,
+// and reports to the PC every 2 s so it can adapt the bitrate and resolution. A player that gets
+// stuck, never starts or fails after it has played is never seeked: the PC starts it over (a new
+// MediaSource), and when that happens again soon it steps down for a while (not for good: none of
+// these say the TV cannot play the format). A stream MSE refuses before it ever plays is refused:
+// the PC tries the next format down, then JPEG frames.
 // Runs on Chromium M69 (Tizen 5.5): ES2017 syntax only (no ?. ?? or object spread).
 (function () {
   'use strict';
@@ -11,17 +15,23 @@
   // Media arrives ~160 ms at a time, so the player stays a little behind the newest frame: closer,
   // it would run dry between fragments and stall. This TV's decoder lands every seek on the key frame
   // before the target (a key frame comes every second), and a seek flushes the hardware pipeline,
-  // which can freeze this page's script for good: so the player seeks as little as it can, only onto
-  // key frames it has seen arrive, and catches up on small drift by playing slightly faster.
+  // which can get this page killed within seconds: so the player seeks once, at its start, onto a key
+  // frame it has seen arrive, and never again. Small drift is caught up by playing slightly faster.
   const SOFT_LAG = 0.9; // above this the rate goes up a little
   const CALM_LAG = 0.45; // back to normal speed below this
+  const CATCH_UP_LAG = 1.5; // the faster rate only below this: further behind, the PC sheds the lag
   const CATCH_UP_RATE = 1.1;
-  const HARD_LAG = 3; // above this the player jumps to the newest key frame
-  const JUMP_GAP_MS = 8000; // at least this long between two jumps
   const KEEP_BEHIND = 4; // seconds of played video kept in the buffer
   const TRIM_EVERY = 10; // control ticks (500 ms) between buffer trims: remove() is not cheap here
   const MAX_QUEUE_BYTES = 8 * 1024 * 1024; // appends waiting beyond this: start over from a key frame
-  const STALL_MS = 2500;
+  const STALL_MS = 2500; // a clock that has not moved this long with frames ahead: a stall
+  const STUCK_MS = 6000; // still stalled this long after: stuck, the PC starts the player over
+  const SEEK_STUCK_MS = 3000; // a seek that has not finished in this long: stuck
+  const START_MS = 8000; // a player that has not started this long after its creation: started over
+  const RESYNC_GAP_MS = 30000; // at most one restart for lag or a hole asked by this page per this long
+  const FAR_LAG = 6; // last resort: this far behind ...
+  const FAR_MS = 10000; // ... for this long, or
+  const OUT_MS = 3000; // the playhead outside every buffered range this long: a restart
   const VIDEO_TIMESCALE = 90000; // the PC's fMP4 video track (server/util/fmp4.js)
   // This TV's web engine is slow: the PC sends a few large fragments a second, this page appends them
   // one at a time (all that waited, in one append), checks the live edge twice a second, trims the
@@ -48,10 +58,21 @@
   let failed = false;
   let ticks = 0;
   let keys = []; // media times (s) of the latest key frames that arrived, oldest first
-  let lastJump = 0;
-  let jumps = 0;
+  let jumps = 0; // seeks after the start: none any more (still reported for the PC's rate control)
+  let createdAt = 0;
+  let moved = false; // the clock has moved since this player started
+  let stuckSince = 0; // a stall began (the clock stopped with frames ahead)
+  let seekingSince = 0;
+  let farSince = 0;
+  let outSince = 0;
+  let askedAt = 0; // a fresh start was asked of the PC: nothing is judged until its init comes
+  let asks = 0; // fresh starts asked since the PC's last init
+  let lastResyncAt = 0; // across players (not reset in create())
 
   function now() { return Date.now(); }
+  function noop() {}
+  function r2(v) { return Math.round(v * 100) / 100; }
+  function note(kind, data) { if (window.LumenBox) window.LumenBox.note(kind, data); }
 
   function probe(list) {
     const out = {};
@@ -86,6 +107,7 @@
     mime = null;
     gen = -1;
     waitInit = true;
+    askedAt = asks = 0;
     started = false;
     if (el) {
       el.onplaying = el.onerror = el.onwaiting = null;
@@ -107,10 +129,13 @@
     stalls = 0;
     jumps = 0;
     keys = [];
-    lastJump = 0;
     jumped = false;
     lastTime = -1;
     lastProgress = now();
+    createdAt = now();
+    moved = false;
+    stuckSince = seekingSince = farSince = outSince = 0;
+    if (el.playbackRate !== 1) el.playbackRate = 1;
     source.addEventListener('sourceopen', function () {
       if (ms !== source) return;
       try {
@@ -120,7 +145,7 @@
         return;
       }
       sb.addEventListener('updateend', pump);
-      sb.addEventListener('error', function () { if (ms === source) refuse('SourceBuffer error'); });
+      sb.addEventListener('error', function () { if (ms === source) fail('SourceBuffer error'); });
       pump();
     });
     el.style.display = 'block';
@@ -135,7 +160,7 @@
     };
     el.onerror = function () {
       if (ms !== source) return;
-      refuse('video error ' + (el.error ? el.error.code + ' ' + (el.error.message || '') : ''));
+      fail('video error ' + (el.error ? el.error.code + ' ' + (el.error.message || '') : ''));
     };
     el.onwaiting = function () { if (ms === source) lastProgress = Math.min(lastProgress, now()); };
     objectUrl = URL.createObjectURL(source);
@@ -150,6 +175,18 @@
     failed = true;
     teardown();
     report('refused', { reason: String(reason).slice(0, 160) });
+  }
+
+  // The player failed. One that never played: the TV cannot play this stream (refused). One that
+  // has played: the format is fine, the player broke; the PC starts it over (and steps down for a
+  // while when that keeps happening).
+  function fail(reason) {
+    if (failed) return;
+    if (!started && !moved) { refuse(reason); return; }
+    failed = true;
+    teardown();
+    lastResyncAt = now();
+    report('resync', { reason: 'error', on: String(reason).slice(0, 160) });
   }
 
   // ---- appending ----
@@ -177,16 +214,21 @@
         trim(true);
         resync('quota');
       } else {
-        refuse('appendBuffer: ' + (e && e.name));
+        fail('appendBuffer: ' + (e && e.name));
       }
     }
   }
 
-  function resync(why) {
+  // The PC answers with a fresh init segment (reset: a new MediaSource) and a key frame.
+  function resync(why, detail) {
     queue = [];
     queued = 0;
     waitInit = true;
-    report('resync', { reason: why });
+    askedAt = now();
+    asks += 1;
+    const extra = { reason: why };
+    if (detail) extra.on = detail;
+    report('resync', extra);
   }
 
   function trim(hard) {
@@ -225,55 +267,102 @@
     const start = ranges.start(ranges.length - 1);
     const end = ranges.end(ranges.length - 1);
     for (let i = keys.length - 1; i >= 0; i--) {
-      if (keys[i] >= start - 0.01 && keys[i] < end - 0.1 && keys[i] > after) return keys[i];
+      if (keys[i] >= start - 0.03 && keys[i] < end - 0.1 && keys[i] > after) return keys[i];
     }
     return null;
   }
 
-  function jumpTo(t, why) {
-    lastJump = now();
-    jumps += 1;
-    if (window.LumenBox) window.LumenBox.note('live-jump', { why: why, from: Math.round(el.currentTime * 100) / 100, to: Math.round(t * 100) / 100 });
-    if (el.playbackRate !== 1) el.playbackRate = 1;
-    el.currentTime = t;
+  function setRate(to, t, lag) {
+    el.playbackRate = to;
+    note('live-rate', { to: to, t: r2(t), lag: r2(lag) });
+  }
+
+  // The player is stuck (its clock stopped with frames ahead, or a seek never finished). It is not
+  // seeked: the PC starts it over from a key frame in a new MediaSource, every time (a stuck player
+  // left alone is a frozen picture). The PC counts how often: again within two minutes, it steps
+  // down for a while. Never a refusal: the TV can play the format.
+  function stuck(why) {
+    const t = now();
+    stuckSince = seekingSince = 0;
+    lastProgress = t;
+    lastResyncAt = t;
+    resync('stuck', why);
+  }
+
+  // Last resort for a player that is far behind or in a hole (the PC normally sheds lag itself).
+  function restart(why) {
+    farSince = outSince = 0;
+    const t = now();
+    if (t - lastResyncAt < RESYNC_GAP_MS) return;
+    lastResyncAt = t;
+    resync(why);
   }
 
   function control() {
-    if (!sb || !el || !el.buffered.length) return;
+    if (!el || !ms) return;
+    const at = now();
+    if (askedAt) {
+      // A fresh start was asked: this player is not judged again (that would ask again every check).
+      // The PC answers at once; no answer in a while, it is asked once more, and then this player
+      // gives up (the PC goes back to frames) rather than show a frozen picture for good.
+      if (at - askedAt >= START_MS) {
+        if (asks >= 2) { teardown(); report('error', { reason: 'no fresh start from the PC' }); }
+        else resync('no answer');
+      }
+      return;
+    }
+    // No start (no 'playing', a clock that never moved, or a MediaSource that never opened): the PC
+    // starts it over. Not a refusal: a slow start (the TV's one decoder just released by its own
+    // player) does not mean the TV cannot play the format.
+    if (!started && !moved && at - createdAt >= START_MS) { lastResyncAt = at; resync('stuck', 'start'); return; }
+    if (!sb || !el.buffered.length) return;
     const ranges = el.buffered;
     const end = ranges.end(ranges.length - 1);
     const t = el.currentTime;
     const lag = end - t;
     if (!started && !jumped) {
-      // First data: start on the newest key frame (the stream itself starts on one).
+      // First data: start on the newest key frame (the stream itself starts on one). The only seek.
       jumped = true;
       const k = newestKey(ranges, -1);
       const from = k === null ? ranges.start(ranges.length - 1) : k;
       if (Math.abs(from - t) > 0.05) el.currentTime = from;
-      lastJump = now();
       const p = el.play();
-      if (p && p.catch) p.catch(function () { el.muted = true; el.play().catch(function () {}); });
+      if (p && p.catch) p.catch(function () { el.muted = true; el.play().catch(noop); });
       return;
     }
-    if (el.seeking) return;
+    if (el.seeking) {
+      // A seek that never finishes would hold this loop for good.
+      seekingSince = seekingSince || at;
+      if (at - seekingSince > SEEK_STUCK_MS) stuck('seeking');
+      return;
+    }
+    seekingSince = 0;
+    let rate = el.playbackRate;
+    if (lag > SOFT_LAG && lag < CATCH_UP_LAG) rate = CATCH_UP_RATE;
+    else if (lag < CALM_LAG || lag >= CATCH_UP_LAG) rate = 1;
+    if (rate !== el.playbackRate) setRate(rate, t, lag);
+    if (el.paused) el.play().catch(noop);
+    if (t !== lastTime) {
+      if (lastTime >= 0) {
+        moved = true;
+        if (t < lastTime - 0.05) note('live-back', { from: r2(lastTime), to: r2(t) });
+      }
+      lastTime = t;
+      lastProgress = at;
+      stuckSince = 0;
+    } else if (lag > 0.3 && at - lastProgress >= STALL_MS) {
+      // A clock that does not move while frames are buffered ahead: a stall (one per episode).
+      lastProgress = at;
+      if (!stuckSince) { stalls += 1; stuckSince = at; }
+      el.play().catch(noop);
+    }
+    if (stuckSince && at - stuckSince >= STUCK_MS) { stuck('clock'); return; }
     let inRange = false;
     for (let i = 0; i < ranges.length; i++) if (t >= ranges.start(i) - 0.05 && t <= ranges.end(i)) inRange = true;
-    const canJump = now() - lastJump > JUMP_GAP_MS;
-    if (!inRange || lag > HARD_LAG) {
-      // In a hole (a skipped stretch) or far behind: on to the newest key frame, now and then.
-      const k = canJump || !inRange ? newestKey(ranges, t + 0.5) : null;
-      if (k !== null && (canJump || now() - lastJump > 1500)) { jumpTo(k, inRange ? 'behind' : 'hole'); return; }
-    }
-    if (lag > SOFT_LAG && el.playbackRate === 1) el.playbackRate = CATCH_UP_RATE;
-    else if (lag < CALM_LAG && el.playbackRate !== 1) el.playbackRate = 1;
-    if (el.paused) el.play().catch(function () {});
-    // A clock that does not move while frames are buffered ahead is a stall: on past it.
-    if (t !== lastTime) { lastTime = t; lastProgress = now(); } else if (lag > 0.3 && now() - lastProgress > STALL_MS) {
-      stalls += 1;
-      lastProgress = now();
-      const k = newestKey(ranges, t + 0.2);
-      if (k !== null && now() - lastJump > 1500) jumpTo(k, 'stall');
-    }
+    outSince = inRange ? 0 : outSince || at;
+    farSince = lag > FAR_LAG ? farSince || at : 0;
+    if (outSince && at - outSince > OUT_MS) restart('hole');
+    else if (farSince && at - farSince > FAR_MS) restart('behind');
     ticks += 1;
     if (ticks % TRIM_EVERY === 0) trim(false);
   }
@@ -309,6 +398,7 @@
     if (!ms || info.reset || family(type) !== family(mime)) create(type);
     gen = g;
     waitInit = false;
+    askedAt = asks = 0;
     queue.push(data);
     queued += data.byteLength;
     pump();

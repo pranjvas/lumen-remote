@@ -50,7 +50,7 @@ function configureVideo(next) {
     ...(isHevc ? { hevc: { format: 'annexb' } } : { avc: { format: 'avc' } }),
   };
   if (!venc || venc.state === 'closed') {
-    venc = new VideoEncoder({
+    const enc = new VideoEncoder({
       output: (chunk, md) => {
         if (md && md.decoderConfig && encoded) {
           const d = md.decoderConfig;
@@ -62,13 +62,35 @@ function configureVideo(next) {
         stats.bytes += chunk.byteLength;
         if (ws.readyState === 1) ws.send(header(2, chunk.type === 'key', chunk.timestamp, data));
       },
-      error: (e) => { fail('video encoder', e); venc = null; forceKey = true; },
+      // A failed encoder is replaced (the TV would show a frozen picture with sound until then).
+      error: (e) => { if (venc !== enc) return; fail('video encoder', e); venc = null; forceKey = true; reviveVideo(); },
     });
+    venc = enc;
   }
   venc.configure(config);
   encoded = { ...next, format: isHevc ? 'annexb' : 'avc' };
   cfg = encoded;
   forceKey = true;
+}
+
+// A new video encoder for the current config a second after the last one failed (at most one try
+// a second); Lumen counts failures that keep coming and drops the step.
+let reviveTimer = null;
+function reviveVideo() {
+  if (reviveTimer || stopped) return;
+  reviveTimer = setTimeout(() => {
+    reviveTimer = null;
+    if (stopped || !cfg || (venc && venc.state !== 'closed')) return;
+    try {
+      configureVideo(cfg);
+      sendJson({ t: 'error', where: 'video encoder', message: 'recreated', recovered: true });
+    } catch (e) {
+      fail('video encoder', e);
+      try { if (venc) venc.close(); } catch (e2) { /* closed already */ }
+      venc = null;
+      reviveVideo();
+    }
+  }, 1000);
 }
 
 function encodeFrame(frame, ts) {
