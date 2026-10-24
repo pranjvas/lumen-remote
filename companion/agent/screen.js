@@ -33,6 +33,7 @@
   let decoding = false;
   let currentUrl = null;
   let video = null; // { url, title, state, mode, engine, drm, started }
+  const DECODER_HANDOVER_MS = 900; // live video's decoder released before AVPlay opens
   let hintTimer = null;
   let startTimer = null;
   let pointerSent = 0;
@@ -126,7 +127,10 @@
 
   function playVideo(url, title, fromStart, engine, drm) {
     stopVideo(false);
-    if (live) live.stop(); // one decoder for the TV's player
+    // One decoder for the TV's player and the live video: a live player that was showing needs a
+    // moment to let it go, or AVPlay starts with sound and a black picture.
+    const hadLive = !!(live && live.isShowing && live.isShowing());
+    if (live) live.stop();
     video = { url: url, title: title || '', state: 'loading', mode: 'avplay', engine: engine || null, drm: drm || null, started: false };
     const mine = video;
     // AVPlay is one player shared by every video: a callback from a video that has since been
@@ -137,6 +141,9 @@
     showHint((title ? title + ' · ' : '') + 'OK play/pause · ◀ ▶ 10 s · Back returns to the page', 7000);
     // Lumen found a format the TV's player does not take (fragmented-MP4 HLS): skip it.
     if (engine === 'hls') return refused(drm ? 'DRM-protected HLS' : 'fragmented-MP4 HLS', mine);
+    if (hadLive) setTimeout(function () { if (current()) startAvplay(); }, DECODER_HANDOVER_MS);
+    else startAvplay();
+    function startAvplay() {
     let stage = 'webapis';
     try {
       if (typeof webapis === 'undefined' || !webapis.avplay) throw new Error('webapis.avplay is missing');
@@ -172,6 +179,7 @@
       });
     } catch (e) {
       refused(stage + ': ' + String(e && (e.name + ' ' + (e.message || '')) || e), mine);
+    }
     }
   }
 

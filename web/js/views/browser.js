@@ -764,26 +764,17 @@ export function mountBrowser(root, ctx) {
   let native = { dx: 0, dy: 0 };
   let nativeFrame = 0;
   let nativeSync = 0;
-  // After a stroke the phone's position is the one that counts: the page's pointer is put exactly
-  // there, then the TV's pointer is checked and nudged towards it, a few times if it lands off.
+  // The TV's pointer is the one the owner aims with: after a stroke (or a tap) the phone's pointer
+  // takes the TV pointer's real position, so the two always show the same spot. (Nudging the TV
+  // towards the phone's estimate left them apart, as the TV accelerates its pointer its own way.)
   let alignRun = 0;
-  const ALIGN_TRIES = 3;
   async function alignTv() {
     const run = ++alignRun;
-    const target = { ...ptr };
-    const placed = await ctx.live.send('browser.pointer', { x: target.x, y: target.y, native: true }, { timeoutMs: 5000 });
-    if (!placed?.ok) return;
-    for (let i = 0; i < ALIGN_TRIES; i++) {
-      await new Promise((r) => setTimeout(r, 250));
-      if (run !== alignRun) return; // a new stroke took over
-      const ack = await ctx.live.send('browser.pointer', { native: true }, { timeoutMs: 5000 });
-      const at = ack?.ok ? ack.value?.native : null;
-      if (!at || run !== alignRun) return;
-      const ex = target.x - at.x;
-      const ey = target.y - at.y;
-      if (Math.abs(ex) < 0.006 && Math.abs(ey) < 0.01) return;
-      ctx.live.post('pointer.move', { dx: clamp(Math.round(ex * 1920), -400, 400), dy: clamp(Math.round(ey * 1080), -400, 400) });
-    }
+    const ack = await ctx.live.send('browser.pointer', { native: true }, { timeoutMs: 5000 });
+    const at = ack?.ok ? ack.value?.native : null;
+    if (!at || run !== alignRun || !Number.isFinite(at.x) || !Number.isFinite(at.y)) return;
+    ptr = { x: clamp(at.x, 0, 1), y: clamp(at.y, 0, 1) };
+    placePointer();
   }
 
   const flushNative = () => {
@@ -835,6 +826,7 @@ export function mountBrowser(root, ctx) {
         clearTimeout(nativeSync);
         alignRun += 1;
         ctx.cmd('pointer.click', { button: button === 'right' ? 'right' : 'left' });
+        nativeSync = setTimeout(alignTv, 300);
         pad.classList.remove('is-tap');
         void pad.offsetWidth;
         pad.classList.add('is-tap');
