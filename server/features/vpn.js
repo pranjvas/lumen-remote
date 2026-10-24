@@ -13,6 +13,13 @@ const CONF_FILE = 'vpn/wg.conf';
 const STATE_FILE = 'vpn/state.json';
 const MAX_CONF_BYTES = 8192;
 const RESTART_BACKOFF_MS = [5000, 10000, 30000];
+// A tunnel can stay "up" while it carries nothing (seen 24 Oct: every site failed through it until
+// a manual reload). While up, a connection through it is tried every PROBE_EVERY_MS; two failures
+// in a row restart the tunnel. The proxy outlives the restart, so the browser keeps its page.
+const PROBE_EVERY_MS = 45000;
+const PROBE_TIMEOUT_MS = 8000;
+const PROBE_TARGET = ['1.1.1.1', 443]; // an address, so a dead tunnel is not mistaken for DNS trouble
+const PROBE_FAILS_TO_RESTART = 2;
 const STOP_TIMEOUT_MS = 5000;
 const NO_CONF = 'No VPN configuration: save the WireGuard .conf as data/vpn/wg.conf';
 
@@ -225,6 +232,71 @@ export function createVpn({ config, data, log: rootLog, store, seams = {} }) {
     publishAll();
   }
 
+  // ---------- health ----------
+
+  let probeTimer = null;
+  let probeFails = 0;
+  let probing = false;
+
+  // One connection through the tunnel: resolves true when it opens, false on failure or time-out.
+  function probeOnce() {
+    return new Promise((resolve) => {
+      let stream;
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { stream?.destroy?.(); } catch { /* already closed */ }
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), PROBE_TIMEOUT_MS);
+      try {
+        stream = tunnel?.connect(...PROBE_TARGET);
+      } catch {
+        finish(false);
+        return;
+      }
+      if (!stream) { finish(false); return; }
+      stream.once('connect', () => finish(true));
+      stream.once('error', () => finish(false));
+      stream.once('close', () => finish(false));
+    });
+  }
+
+  async function probe() {
+    if (probing || stopped || !enabled || state() !== 'up') { probeFails = 0; return; }
+    probing = true;
+    try {
+      const ok = await probeOnce();
+      if (ok) { probeFails = 0; return; }
+      probeFails += 1;
+      log.warn('vpn tunnel check failed', { fails: probeFails });
+      if (probeFails < PROBE_FAILS_TO_RESTART || stopped || !enabled) return;
+      probeFails = 0;
+      log.warn('vpn tunnel is up but carries nothing; restarting it');
+      await run(async () => {
+        if (stopped || !enabled) return;
+        await stopTunnel();
+        await startTunnel().catch(() => {}); // a failed start schedules its own retry
+      });
+    } finally {
+      probing = false;
+    }
+  }
+
+  function startProbes() {
+    clearInterval(probeTimer);
+    probeFails = 0;
+    probeTimer = setInterval(() => { probe().catch((err) => log.debug('vpn check failed', { message: err.message })); }, PROBE_EVERY_MS);
+    probeTimer.unref?.();
+  }
+
+  function stopProbes() {
+    clearInterval(probeTimer);
+    probeTimer = null;
+  }
+
   // ---------- proxy ----------
 
   // The proxy outlives tunnel restarts, so it sees whichever tunnel is current.
@@ -251,6 +323,7 @@ export function createVpn({ config, data, log: rootLog, store, seams = {} }) {
   async function bringUp() {
     await startProxy();
     await startTunnel();
+    startProbes();
   }
 
   async function tearDown() {
@@ -258,6 +331,7 @@ export function createVpn({ config, data, log: rootLog, store, seams = {} }) {
     retryTimer = null;
     retries = 0;
     error = null;
+    stopProbes();
     await stopProxy();
     await stopTunnel();
   }
