@@ -3,8 +3,69 @@
 import { describe, test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createRelay, relayRefusal, rewritePlaylist, siteOf } from '../server/features/relay.js';
+import {
+  avcLevel, chooseVariant, createRelay, levelTooLow, parseHlsMaster, parseSps, readMp4Sps, readTsSps, relayRefusal, rewritePlaylist, siteOf,
+} from '../server/features/relay.js';
 import { createTestLog } from './helpers.js';
+
+// The SPS of a 1920x1080 High-profile stream labelled level 3.0 (MaxFS 1620, it needs 8160): the
+// TV's player shows it black with sound.
+const SPS_1080_L30 = '6764001eacd940780227e5c044';
+
+/** A Baseline SPS NAL (hex) for widthMbs × heightMbs at level_idc `level`. */
+function baselineSps(level, widthMbs, heightMbs) {
+  const bits = [];
+  const u = (n, v) => { for (let k = n - 1; k >= 0; k--) bits.push((v >> k) & 1); };
+  const ue = (v) => { const x = v + 1; const n = Math.floor(Math.log2(x)); u(n, 0); u(n + 1, x); };
+  u(8, 66); u(8, 0xc0); u(8, level);
+  ue(0); ue(0); ue(2); ue(1); u(1, 0); // sps id, log2_max_frame_num-4, poc type 2, refs, gaps
+  ue(widthMbs - 1); ue(heightMbs - 1); u(1, 1); u(1, 1); u(1, 0); u(1, 0); // frame_mbs_only, direct_8x8, no crop, no VUI
+  u(1, 1);
+  while (bits.length % 8) bits.push(0);
+  const out = [0x67];
+  let zeros = 0;
+  for (let i = 0; i < bits.length; i += 8) {
+    const b = parseInt(bits.slice(i, i + 8).join(''), 2);
+    if (zeros >= 2 && b <= 3) { out.push(3); zeros = 0; }
+    out.push(b);
+    zeros = b === 0 ? zeros + 1 : 0;
+  }
+  return Buffer.from(out).toString('hex');
+}
+
+/** One 188-byte TS packet (adaptation-field stuffing when the payload is short). */
+function tsPacket(pid, payload, pusi = false) {
+  const head = Buffer.from([0x47, (pusi ? 0x40 : 0) | (pid >> 8), pid & 0xff, 0x10]);
+  if (payload.length >= 184) return Buffer.concat([head, payload.subarray(0, 184)]);
+  head[3] = 0x30;
+  const stuff = 184 - payload.length;
+  const af = stuff === 1 ? Buffer.from([0]) : Buffer.concat([Buffer.from([stuff - 1, 0]), Buffer.alloc(stuff - 2, 0xff)]);
+  return Buffer.concat([head, af, payload]);
+}
+
+/** A tiny MPEG-TS segment: PAT, PMT (H.264 on PID 0x100, or `streamType`) and one PES with the SPS. */
+function tsSegment(spsHex, { streamType = 0x1b } = {}) {
+  const pat = Buffer.from([0, 0x00, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+  const pmt = Buffer.from([0, 0x02, 0xb0, 18, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, streamType, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0]);
+  const es = Buffer.concat([Buffer.from('0000000109f0', 'hex'), Buffer.from('00000001', 'hex'), Buffer.from(spsHex, 'hex'), Buffer.from('0000000168ce3c80', 'hex')]);
+  const pes = Buffer.concat([Buffer.from([0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1]), es]);
+  return Buffer.concat([tsPacket(0, pat, true), tsPacket(0x1000, pmt, true), tsPacket(0x100, pes, true), tsPacket(0x100, Buffer.alloc(184, 0xaa))]);
+}
+
+/** An MP4 head: ftyp + moov (one avc1 track with this SPS); mdat first when moovLast. */
+function mp4Head(spsHex, { moovLast = false } = {}) {
+  const box = (type, ...parts) => { const body = Buffer.concat(parts); const h = Buffer.alloc(8); h.writeUInt32BE(body.length + 8); h.write(type, 4, 'latin1'); return Buffer.concat([h, body]); };
+  const sps = Buffer.from(spsHex, 'hex');
+  const len = Buffer.alloc(2);
+  len.writeUInt16BE(sps.length);
+  const avcC = box('avcC', Buffer.from([1, sps[1], sps[2], sps[3], 0xff, 0xe1]), len, sps, Buffer.from([1, 0, 4, 0x68, 0xce, 0x3c, 0x80]));
+  const avc1 = box('avc1', Buffer.alloc(78), avcC);
+  const stsd = box('stsd', Buffer.from([0, 0, 0, 0, 0, 0, 0, 1]), avc1);
+  const moov = box('moov', box('mvhd', Buffer.alloc(100)), box('trak', box('tkhd', Buffer.alloc(84)), box('mdia', box('mdhd', Buffer.alloc(24)), box('minf', box('stbl', stsd)))));
+  const ftyp = box('ftyp', Buffer.from('isom\0\0\0\0isomavc1', 'latin1'));
+  const mdat = box('mdat', Buffer.alloc(1000, 1));
+  return moovLast ? Buffer.concat([ftyp, mdat, moov]) : Buffer.concat([ftyp, moov, mdat]);
+}
 
 // The test upstreams listen on 127.0.0.1, which the relay refuses unless loopback is allowed.
 const LOOPBACK_OK = { browser: { allowLoopback: true } };
@@ -231,7 +292,11 @@ describe('relay', () => {
       const pre = await fetch(stream.url, { method: 'OPTIONS', headers: { 'access-control-request-headers': 'range' } });
       assert.equal(pre.status, 204);
       assert.match(pre.headers.get('access-control-allow-methods'), /POST/);
-      assert.deepEqual(await relay.probeHls(stream.token), { fmp4: true, endlist: true, drm: true });
+      // No levelLow / audioOnly keys unless found: the probe's shape is otherwise unchanged.
+      assert.deepEqual(await relay.probeHls(stream.token), {
+        fmp4: true, endlist: true, drm: true, master: true,
+        variants: [{ index: 0, bandwidth: 1, width: null, height: null, codecs: null, audio: null, uri: `${up}/v/media.m3u8` }],
+      });
       // A stream token never accepts POSTs.
       assert.equal((await fetch(stream.url, { method: 'POST', body: 'x' })).status, 404);
       // A licence token resolves the real licence server, then forwards the challenge there.
@@ -322,12 +387,277 @@ describe('relay licence requests', () => {
   });
 });
 
+describe('HLS variants and H.264 levels', () => {
+  test('parseHlsMaster: one entry per STREAM-INF (I-frame playlists are not variants), indexes as ffmpeg numbers programmes', () => {
+    const text = [
+      '#EXTM3U',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",DEFAULT=YES,URI="audio/en.m3u8"',
+      '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,RESOLUTION=640x360,URI="iframe360.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=800000,AVERAGE-BANDWIDTH=700000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2",AUDIO="aud"',
+      '360/index.m3u8',
+      '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=190000,RESOLUTION=1280x720,URI="iframe720.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="aud"',
+      'https://cdn.example/720/index.m3u8',
+      '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"',
+      '1080/index.m3u8?sig=1',
+    ].join('\r\n');
+    const variants = parseHlsMaster(text, 'https://site.example/v/master.m3u8');
+    assert.deepEqual(variants.map((v) => [v.index, v.height, v.bandwidth]), [[0, 360, 800000], [1, 720, 2500000], [2, 1080, 6000000]]);
+    assert.deepEqual(variants[0], { index: 0, bandwidth: 800000, width: 640, height: 360, codecs: 'avc1.42c01e,mp4a.40.2', audio: 'aud', uri: 'https://site.example/v/360/index.m3u8' });
+    assert.equal(variants[1].uri, 'https://cdn.example/720/index.m3u8');
+    assert.equal(variants[2].uri, 'https://site.example/v/1080/index.m3u8?sig=1');
+    assert.deepEqual(parseHlsMaster('#EXTM3U\n#EXTINF:4,\nseg.ts\n'), []);
+  });
+
+  test('chooseVariant: the best up to 1080p to encode, up to 2160p to copy (H.264 before HEVC); the smallest above when none fits', () => {
+    const v = (index, height, bandwidth, codecs = 'avc1.640028,mp4a.40.2') => ({ index, width: Math.round((height * 16) / 9), height, bandwidth, codecs, audio: null, uri: `${height}.m3u8` });
+    const ladder = [v(0, 360, 800e3), v(1, 720, 2.5e6), v(2, 1080, 6e6), v(3, 2160, 16e6)];
+    assert.equal(chooseVariant(ladder, { copy: false }).height, 1080);
+    assert.equal(chooseVariant(ladder, { copy: true }).height, 2160);
+    const hevcTop = [v(0, 360, 800e3), v(1, 1080, 6e6), v(2, 2160, 20e6, 'hvc1.2.4.L153.B0,mp4a.40.2')];
+    assert.equal(chooseVariant(hevcTop, { copy: true }).index, 1, 'HEVC is passed over for a copy');
+    assert.equal(chooseVariant(hevcTop, { copy: false }).index, 1);
+    assert.equal(chooseVariant([v(0, 1440, 9e6), v(1, 2160, 16e6)], { copy: false }).height, 1440, 'nothing up to 1080p: the smallest above');
+    assert.equal(chooseVariant([v(0, 1080, 6e6), { ...v(1, null, 9e9, 'mp4a.40.2'), width: null }], { copy: false }).index, 0, 'audio-only variants never count');
+    assert.equal(chooseVariant([], { copy: true }), null);
+    assert.equal(chooseVariant(undefined), null);
+  });
+
+  test('avcLevel / levelTooLow / parseSps: the label against the picture size', () => {
+    assert.deepEqual(avcLevel('avc1.64001E'), { profile: 100, level: 30 });
+    assert.deepEqual(avcLevel('avc3.4d401f'), { profile: 77, level: 31 });
+    assert.deepEqual(avcLevel('avc1.42F00B'), { profile: 66, level: 9 }, 'level_idc 11 with constraint_set3 on Baseline is 1b');
+    assert.deepEqual(avcLevel('avc1.66.30'), { profile: 66, level: 30 });
+    assert.equal(avcLevel('hvc1.1.6.L93.B0'), null);
+    assert.equal(levelTooLow(30, 1920, 1080), true);
+    assert.equal(levelTooLow(31, 1280, 720), false);
+    assert.equal(levelTooLow(40, 1920, 1088), false);
+    assert.equal(levelTooLow(99, 1920, 1080), false, 'an unknown level is not judged');
+    const sps = parseSps(Buffer.from(SPS_1080_L30, 'hex'));
+    assert.deepEqual({ level: sps.level, w: sps.w, h: sps.h, profile: sps.profile }, { level: 30, w: 1920, h: 1088, profile: 100 });
+    const s720 = parseSps(Buffer.from(baselineSps(31, 80, 45), 'hex'));
+    assert.deepEqual({ level: s720.level, w: s720.w, h: s720.h }, { level: 31, w: 1280, h: 720 });
+    const ts = readTsSps(tsSegment(SPS_1080_L30));
+    assert.deepEqual({ level: ts.level, w: ts.w, h: ts.h }, { level: 30, w: 1920, h: 1088 });
+    assert.equal(readTsSps(tsSegment(SPS_1080_L30, { streamType: 0x24 })), null, 'HEVC is not read as H.264');
+    assert.equal(readTsSps(Buffer.from('not a transport stream')), null);
+    assert.throws(() => parseSps(Buffer.from('6764', 'hex')), /SPS/);
+    const mp4 = readMp4Sps(mp4Head(SPS_1080_L30));
+    assert.deepEqual({ level: mp4.level, w: mp4.w, h: mp4.h }, { level: 30, w: 1920, h: 1088 });
+    assert.equal(readMp4Sps(mp4Head(SPS_1080_L30, { moovLast: true })), null, 'moov at the end is not in the head');
+  });
+});
+
+describe('HLS probe', () => {
+  const playlist = (res, text) => { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end(text); };
+  const media = (lines) => `#EXTM3U\n#EXT-X-TARGETDURATION:4\n${lines.join('\n')}\n#EXT-X-ENDLIST\n`;
+
+  test('levelLow from the SPS of the first segment (Range 0-65535, the page\'s headers), from CODECS, and none when the level fits', async () => {
+    const s = await relayStack((req, res) => {
+      const p = new URL(req.url, 'http://x').pathname;
+      if (p === '/low/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg0.ts', '#EXTINF:4,', 'seg1.ts']));
+      if (p === '/low/seg0.ts') {
+        const body = tsSegment(SPS_1080_L30);
+        res.writeHead(206, { 'content-type': 'video/mp2t', 'content-range': `bytes 0-${body.length - 1}/${body.length * 50}` });
+        return res.end(body);
+      }
+      if (p === '/codecs/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64001E,mp4a.40.2"\nmedia.m3u8\n');
+      if (p === '/codecs/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'missing.ts']));
+      if (p === '/ok720/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"\nmedia.m3u8\n');
+      if (p === '/ok720/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
+      if (p === '/ok720/seg.ts') { res.writeHead(200, { 'content-type': 'video/mp2t' }); return res.end(tsSegment(baselineSps(31, 80, 45))); }
+      // CODECS says 3.0, the segment's own SPS says 4.0: the SPS wins for the variant it came from.
+      if (p === '/relabelled/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64001E"\nmedia.m3u8\n');
+      if (p === '/relabelled/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
+      if (p === '/relabelled/seg.ts') { res.writeHead(200, { 'content-type': 'video/mp2t' }); return res.end(tsSegment(baselineSps(40, 120, 68))); }
+      // Another variant's CODECS still counts (AVPlay switches up to it).
+      if (p === '/ladder/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,CODECS="avc1.42c01e"\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64001e"\nhigh.m3u8\n');
+      if (p === '/ladder/low.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
+      if (p === '/ladder/seg.ts') { res.writeHead(200, { 'content-type': 'video/mp2t' }); return res.end(tsSegment(baselineSps(30, 40, 23))); }
+      // EXT-X-BYTERANGE: the first segment is a sub-range of one file.
+      if (p === '/br/media.m3u8') return playlist(res, media(['#EXTINF:4,', '#EXT-X-BYTERANGE:900@376', 'all.ts']));
+      if (p === '/br/all.ts') {
+        const body = Buffer.concat([Buffer.alloc(376, 0xff), tsSegment(SPS_1080_L30)]);
+        const [, a, b] = /bytes=(\d+)-(\d+)/.exec(req.headers.range);
+        const part = body.subarray(Number(a), Number(b) + 1);
+        res.writeHead(206, { 'content-type': 'video/mp2t', 'content-range': `bytes ${a}-${Number(a) + part.length - 1}/${body.length}` });
+        return res.end(part);
+      }
+      res.writeHead(404);
+      return res.end();
+    });
+    try {
+      const reg = (p) => s.relay.register(`${s.up}${p}`, { referer: 'https://site.example/', cookie: 'sid=1' }).token;
+      const low = await s.relay.probeHls(reg('/low/media.m3u8'));
+      assert.deepEqual(low, { fmp4: false, endlist: true, drm: false, levelLow: { level: 30, w: 1920, h: 1088, from: 'sps' } });
+      const segReq = s.seen.find((x) => x.url === '/low/seg0.ts');
+      assert.equal(segReq.headers.range, 'bytes=0-65535');
+      assert.equal(segReq.headers.referer, 'https://site.example/');
+      assert.equal(segReq.headers.cookie, 'sid=1');
+      assert.equal(s.seen.some((x) => x.url === '/low/seg1.ts'), false, 'only the first segment is read');
+
+      const codecs = await s.relay.probeHls(reg('/codecs/master.m3u8'));
+      assert.deepEqual(codecs.levelLow, { level: 30, w: 1920, h: 1080, from: 'codecs' });
+      assert.equal(codecs.master, true);
+      assert.equal(codecs.variants.length, 1);
+
+      const ok720 = await s.relay.probeHls(reg('/ok720/master.m3u8'));
+      assert.equal('levelLow' in ok720, false, JSON.stringify(ok720));
+      assert.equal('audioOnly' in ok720, false);
+      assert.equal('levelLow' in await s.relay.probeHls(reg('/relabelled/master.m3u8')), false, 'the SPS overrides CODECS for its variant');
+      assert.deepEqual((await s.relay.probeHls(reg('/ladder/master.m3u8'))).levelLow, { level: 30, w: 1920, h: 1080, from: 'codecs' });
+
+      const br = await s.relay.probeHls(reg('/br/media.m3u8'));
+      assert.equal(s.seen.find((x) => x.url === '/br/all.ts').headers.range, 'bytes=376-1275');
+      assert.deepEqual(br.levelLow, { level: 30, w: 1920, h: 1088, from: 'sps' });
+    } finally {
+      s.close();
+    }
+  });
+
+  test('a hanging first segment still gives the probe within its budget, without a level verdict', async () => {
+    const hung = [];
+    const s = await relayStack((req, res) => {
+      if (req.url === '/hang/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
+      if (req.url === '/hang/seg.ts') { hung.push(res); return undefined; } // never answers
+      if (req.url === '/drip/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
+      if (req.url === '/drip/seg.ts') { res.writeHead(200, { 'content-type': 'video/mp2t' }); res.write(Buffer.from([0x47])); hung.push(res); return undefined; } // starts, then stalls
+      res.writeHead(404);
+      return res.end();
+    });
+    try {
+      for (const p of ['/hang/media.m3u8', '/drip/media.m3u8']) {
+        const t0 = Date.now();
+        const probe = await s.relay.probeHls(s.relay.register(`${s.up}${p}`).token);
+        const took = Date.now() - t0;
+        assert.deepEqual(probe, { fmp4: false, endlist: true, drm: false }, p);
+        assert.ok(took < 4000, `${p}: ${took} ms`);
+      }
+    } finally {
+      for (const r of hung) r.destroy();
+      s.close();
+    }
+  });
+
+  test('DRM keys in any attribute order, in the master\'s session keys too; audio-only playlists; AES-128 skips the segment read', async () => {
+    const s = await relayStack((req, res) => {
+      const p = new URL(req.url, 'http://x').pathname;
+      if (p === '/order/media.m3u8') return playlist(res, media(['#EXT-X-KEY:KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,AA=="', '#EXTINF:4,', 'seg.ts']));
+      if (p === '/session/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-SESSION-KEY:KEYFORMAT="com.apple.streamingkeydelivery",METHOD=SAMPLE-AES,URI="skd://x"\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia.m3u8\n');
+      if (p === '/session/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
+      if (p === '/aac/media.m3u8') return playlist(res, media(['#EXTINF:4,', 'audio_000.aac?x=1']));
+      if (p === '/mp4a/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2"\naudio.m3u8\n');
+      if (p === '/mp4a/audio.m3u8') return playlist(res, media(['#EXTINF:4,', 'a0.ts']));
+      // An audio-only fallback listed first, video after it: a video stream.
+      if (p === '/mixed/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=64000,CODECS="mp4a.40.5"\naudio.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"\nvideo.m3u8\n');
+      if (p === '/mixed/audio.m3u8') return playlist(res, media(['#EXTINF:4,', 'a0.aac']));
+      if (p === '/aes/media.m3u8') return playlist(res, media(['#EXT-X-KEY:METHOD=AES-128,URI="key.bin"', '#EXTINF:4,', 'seg.ts']));
+      res.writeHead(404);
+      return res.end();
+    });
+    try {
+      const probe = (p) => s.relay.probeHls(s.relay.register(`${s.up}${p}`).token);
+      assert.equal((await probe('/order/media.m3u8')).drm, true, 'KEYFORMAT before METHOD');
+      assert.equal((await probe('/session/master.m3u8')).drm, true, 'EXT-X-SESSION-KEY in the master');
+      assert.equal(s.seen.some((x) => x.url.endsWith('/seg.ts')), false, 'no segment read for DRM streams');
+      const aac = await probe('/aac/media.m3u8');
+      assert.equal(aac.audioOnly, true);
+      assert.equal(s.seen.some((x) => x.url.startsWith('/aac/audio_000')), false, 'no SPS read for audio');
+      assert.equal((await probe('/mp4a/master.m3u8')).audioOnly, true);
+      assert.equal('audioOnly' in await probe('/mixed/master.m3u8'), false, 'a master with video variants is not audio only');
+      const aes = await probe('/aes/media.m3u8');
+      assert.deepEqual(aes, { fmp4: false, endlist: true, drm: false });
+      assert.equal(s.seen.some((x) => x.url === '/aes/seg.ts'), false, 'encrypted segments are not read');
+    } finally {
+      s.close();
+    }
+  });
+
+  test('probeFile reads an MP4\'s avcC from its first 256 KB (moov first only)', async () => {
+    const s = await relayStack((req, res) => {
+      const body = req.url === '/front.mp4' ? mp4Head(SPS_1080_L30) : req.url === '/ok.mp4' ? mp4Head(baselineSps(40, 120, 68)) : req.url === '/end.mp4' ? mp4Head(SPS_1080_L30, { moovLast: true }) : null;
+      if (!body) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': body.length });
+      res.end(body);
+    });
+    try {
+      const probe = (p) => s.relay.probeFile(s.relay.register(`${s.up}${p}`).token);
+      assert.deepEqual(await probe('/front.mp4'), { levelLow: { level: 30, w: 1920, h: 1088, from: 'sps' } });
+      assert.equal(s.seen.find((x) => x.url === '/front.mp4').headers.range, 'bytes=0-262143');
+      assert.deepEqual(await probe('/ok.mp4'), {});
+      assert.deepEqual(await probe('/end.mp4'), {});
+      assert.deepEqual(await probe('/missing.mp4'), {});
+    } finally {
+      s.close();
+    }
+  });
+});
+
+describe('relay ranges', () => {
+  /** An upstream that honours Range (206 with Content-Range) for every path in `files`. */
+  const ranged = (files) => (req, res) => {
+    const p = new URL(req.url, 'http://x').pathname;
+    const f = files[p];
+    if (!f) { res.writeHead(404); res.end(); return; }
+    const body = Buffer.isBuffer(f.body) ? f.body : Buffer.from(f.body);
+    const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+    if (!m) { res.writeHead(200, { 'content-type': f.type, 'content-length': body.length }); res.end(body); return; }
+    const a = Number(m[1]);
+    const b = m[2] ? Math.min(Number(m[2]), body.length - 1) : body.length - 1;
+    res.writeHead(206, { 'content-type': f.type, 'content-range': `bytes ${a}-${b}/${body.length}`, 'content-length': b - a + 1 });
+    res.end(body.subarray(a, b + 1));
+  };
+
+  test('playlists are fetched whole and rewritten even when the TV asks for a range; other ranges pass through as 206', async () => {
+    const big = Buffer.alloc(5 * 1024 * 1024, 0x30);
+    const s = await relayStack(ranged({
+      '/v/master.m3u8': { type: 'application/vnd.apple.mpegurl', body: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia.m3u8\n' },
+      '/api/manifest': { type: 'text/plain', body: '#EXTM3U\n#EXTINF:4,\n/v/seg.ts\n' },
+      '/v/seg.ts': { type: 'video/mp2t', body: Buffer.alloc(4096, 0x47) },
+      '/big': { type: 'text/plain', body: big },
+    }));
+    const lanBase = `http://127.0.0.1:${s.lan.port}/relay/`;
+    const relayed = (text) => text.split('\n').filter((l) => l && !l.startsWith('#'));
+    try {
+      const master = await fetch(s.relay.register(`${s.up}/v/master.m3u8`).url, { headers: { range: 'bytes=0-' } });
+      assert.equal(master.status, 200);
+      const [variant] = relayed(await master.text());
+      assert.ok(variant.startsWith(lanBase), variant);
+      assert.equal(s.seen.find((x) => x.url === '/v/master.m3u8').headers.range, undefined, 'no Range upstream for a playlist URL');
+
+      // No .m3u8 in the URL: the Range goes upstream, and the whole-body 206 is still rewritten.
+      const manifest = await fetch(s.relay.register(`${s.up}/api/manifest`).url, { headers: { range: 'bytes=0-' } });
+      assert.equal(manifest.status, 200);
+      assert.equal(manifest.headers.get('content-range'), null);
+      const [seg] = relayed(await manifest.text());
+      assert.ok(seg.startsWith(lanBase), seg);
+      assert.equal(s.seen.find((x) => x.url === '/api/manifest').headers.range, 'bytes=0-');
+
+      // A segment range and a large whole-body 206 pass through untouched.
+      const part = await fetch(seg, { headers: { range: 'bytes=0-717' } });
+      assert.equal(part.status, 206);
+      assert.equal(part.headers.get('content-range'), 'bytes 0-717/4096');
+      assert.equal((await part.arrayBuffer()).byteLength, 718);
+      const whole = await fetch(s.relay.register(`${s.up}/big`).url, { headers: { range: 'bytes=0-' } });
+      assert.equal(whole.status, 206);
+      assert.equal(whole.headers.get('content-range'), `bytes 0-${big.length - 1}/${big.length}`);
+      assert.equal((await whole.arrayBuffer()).byteLength, big.length);
+    } finally {
+      s.close();
+    }
+  });
+});
+
 describe('transcode', () => {
   test('ffmpeg arguments: page headers, VPN proxy, copy vs H.264/AAC encode, HLS event playlist', async () => {
     const { ffmpegArgs } = await import('../server/features/transcode.js');
     const enc = ffmpegArgs({ input: 'https://v.example/a.mp4', headers: { referer: 'https://v.example/', cookie: 'a=1' }, proxyUrl: 'http://127.0.0.1:5000', outDir: 'D' });
     assert.equal(enc[enc.indexOf('-http_proxy') + 1], 'http://127.0.0.1:5000');
-    assert.match(enc[enc.indexOf('-headers') + 1], /Referer: https:\/\/v\.example\/\r\nCookie: a=1\r\n/);
+    assert.match(enc[enc.indexOf('-headers') + 1], /Referer: https:\/\/v\.example\/\r\n/);
+    // The cookie is scoped to the input's site (-cookies), never a header sent to every host.
+    assert.doesNotMatch(enc[enc.indexOf('-headers') + 1], /Cookie/i);
+    // (A second line for plain http through the proxy, whose absolute URI ffmpeg matches paths against.)
+    assert.equal(enc[enc.indexOf('-cookies') + 1], 'a=1; path=/; domain=v.example\na=1; path=http://; domain=v.example');
     assert.equal(enc[enc.indexOf('-c:v') + 1], 'libx264');
     assert.equal(enc[enc.indexOf('-c:a') + 1], 'aac');
     assert.equal(enc[enc.indexOf('-hls_playlist_type') + 1], 'event');

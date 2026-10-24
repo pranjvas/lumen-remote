@@ -247,6 +247,11 @@ function readBody(res, max, { drain = false } = {}) {
 }
 
 const PLAYLIST_SNIFF_BYTES = 64;
+/** A 206 whose Content-Range is the whole body (bytes 0-N/N+1), no larger than a playlist can be. */
+const wholeBody = (h) => {
+  const m = /^bytes 0-(\d+)\/(\d+)$/.exec(String(h['content-range'] ?? ''));
+  return Boolean(m) && Number(m[1]) + 1 === Number(m[2]) && Number(m[2]) <= MAX_PLAYLIST_BYTES;
+};
 const looksLikePlaylist = (head) => /^﻿?\s*#EXTM3U/.test(head.toString('utf8'));
 
 /** The first `bytes` bytes of a response (fewer when it ends sooner), leaving the rest unread and paused. */
@@ -290,6 +295,356 @@ export function rewritePlaylist(text, base, toRelay) {
     const abs = webUrl(trimmed, base);
     return abs ? toRelay(abs.href) : line;
   }).join('\n');
+}
+
+// ---------- what the TV's own player can show: HLS variants, H.264 levels ----------
+
+// MaxFS (the largest frame, in 16×16 macroblocks) per H.264 level_idc (H.264 Table A-1; 9 is 1b).
+// AVPlay sizes its decoder by the level: a 1080p stream labelled 3.0 plays with sound and a black
+// picture while reporting 'playing'. Desktop decoders ignore the label.
+const MAX_FS = { 9: 99, 10: 99, 11: 396, 12: 396, 13: 396, 20: 396, 21: 792, 22: 1620, 30: 1620, 31: 3600, 32: 5120, 40: 8192, 41: 8192, 42: 8704, 50: 22080, 51: 36864, 52: 36864 };
+const HIGH_PROFILES = new Set([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]);
+const AUDIO_CODEC = /^(mp4a|ac-3|ec-3|ac-4|mp3|opus|flac|fLaC|alac|dtsc|dtse|dtsh|dtsl|dtsx|mhm1|mha1)(\.|$)/i;
+const AUDIO_SEGMENT = /\.(aac|mp3|ac3|ec3|eac3|m4a|vtt)$/i;
+const NO_COPY_CODECS = /(^|[\s,])(hvc1|hev1|av01|vp09)(\.|$|[\s,])/i;
+const DRM_KEY = /#EXT-X-(SESSION-)?KEY:[^\r\n]*\bMETHOD=SAMPLE-AES/;
+const ENCRYPTED_KEY = /#EXT-X-KEY:[^\r\n]*\bMETHOD=(?!NONE\b)/i;
+const LEVEL_BUDGET_MS = 2500; // the level check's own budget inside probeHls / probeFile
+const PROBE_SOFT_MS = 5000; // tvscreen gives the whole probe 6 s: the level check never makes it miss that
+const SEGMENT_HEAD_BYTES = 64 * 1024;
+const FILE_HEAD_BYTES = 256 * 1024;
+
+const levelOf = (levelIdc, profile, constraints) => (levelIdc === 9 || (levelIdc === 11 && (constraints & 0x10) && profile < 100) ? 9 : levelIdc);
+
+/** True when a w×h picture is larger than H.264 `level` (level_idc; 9 is 1b) allows. Frame size only. */
+export function levelTooLow(level, w, h) {
+  const max = MAX_FS[level];
+  return Boolean(max && w > 0 && h > 0 && Math.ceil(w / 16) * Math.ceil(h / 16) > max);
+}
+
+/** An avc1/avc3 codec string's { profile, level } ("avc1.64001E", or the old "avc1.100.30"), or null. */
+export function avcLevel(codec) {
+  const m = /^avc[13]\.(?:([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})|(\d+)\.(\d+))$/i.exec(String(codec ?? '').trim());
+  if (!m) return null;
+  if (m[1]) {
+    const profile = parseInt(m[1], 16);
+    return { profile, level: levelOf(parseInt(m[3], 16), profile, parseInt(m[2], 16)) };
+  }
+  return { profile: Number(m[4]), level: Number(m[5]) };
+}
+
+const codecList = (codecs) => String(codecs ?? '').split(',').map((c) => c.trim()).filter(Boolean);
+const audioOnlyCodecs = (codecs) => { const list = codecList(codecs); return list.length > 0 && list.every((c) => AUDIO_CODEC.test(c)); };
+
+/** An HLS attribute list (`BANDWIDTH=1,CODECS="a,b"`) → { BANDWIDTH: '1', CODECS: 'a,b' }. */
+function hlsAttributes(text) {
+  const out = {};
+  const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
+  let m;
+  while ((m = re.exec(text))) out[m[1].toUpperCase()] = m[2].startsWith('"') ? m[2].slice(1, -1) : m[2];
+  return out;
+}
+
+/**
+ * The variants of an HLS master playlist, one per #EXT-X-STREAM-INF (I-frame playlists are not
+ * variants): { index, bandwidth, width, height, codecs, audio, uri }. `index` counts STREAM-INF
+ * entries only, which is ffmpeg's program id for that variant (-map 0:p:<index>:v:0).
+ */
+export function parseHlsMaster(text, baseUrl = undefined) {
+  const out = [];
+  let attrs = null;
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^#EXT-X-STREAM-INF:/i.test(line)) { attrs = hlsAttributes(line.slice(line.indexOf(':') + 1)); continue; }
+    if (line.startsWith('#') || !attrs) continue;
+    const res = /^(\d+)x(\d+)$/i.exec(attrs.RESOLUTION ?? '');
+    const abs = baseUrl ? webUrl(line, baseUrl) : null;
+    out.push({
+      index: out.length, bandwidth: Number(attrs.BANDWIDTH) || 0, width: res ? Number(res[1]) : null, height: res ? Number(res[2]) : null,
+      codecs: attrs.CODECS ?? null, audio: attrs.AUDIO ?? null, uri: abs ? abs.href : line,
+    });
+    attrs = null;
+  }
+  return out;
+}
+
+/**
+ * The variant worth converting: the highest bandwidth up to 1080p for an encode, up to 2160p for a
+ * copy (which also passes over HEVC, AV1 and VP9 variants while an H.264 one exists); when none fits,
+ * the smallest above that. Audio-only variants never count. → a variant, or null without any.
+ */
+export function chooseVariant(variants, { copy = false } = {}) {
+  const list = (Array.isArray(variants) ? variants : []).filter((v) => v && !audioOnlyCodecs(v.codecs));
+  if (!list.length) return null;
+  const cap = copy ? 2160 : 1080;
+  const usable = copy ? list.filter((v) => !NO_COPY_CODECS.test(v.codecs ?? '')) : list;
+  const pool = usable.length ? usable : list;
+  const fit = pool.filter((v) => !(v.height > cap));
+  if (fit.length) return fit.reduce((best, v) => (v.bandwidth > best.bandwidth || (v.bandwidth === best.bandwidth && (v.height ?? 0) > (best.height ?? 0)) ? v : best));
+  return pool.reduce((best, v) => (v.height < best.height ? v : best));
+}
+
+/** A bit reader over an RBSP; reading past the end throws. */
+function bitReader(bytes) {
+  let pos = 0;
+  const end = bytes.length * 8;
+  const bit = () => {
+    if (pos >= end) throw new Error('short SPS');
+    const b = (bytes[pos >> 3] >> (7 - (pos & 7))) & 1;
+    pos += 1;
+    return b;
+  };
+  const u = (n) => { let v = 0; for (let k = 0; k < n; k++) v = v * 2 + bit(); return v; };
+  const ue = () => {
+    let zeros = 0;
+    while (!bit()) if (++zeros > 31) throw new Error('bad SPS');
+    return 2 ** zeros - 1 + u(zeros);
+  };
+  const se = () => { const k = ue(); return k & 1 ? (k + 1) / 2 : -k / 2; };
+  return { u, ue, se };
+}
+
+/**
+ * An H.264 sequence parameter set (a NAL unit, header byte first) →
+ * { profile, constraints, level, chroma, bitDepth, refs, w, h, mbs }: w and h are the coded size
+ * (macroblocks × 16, before cropping), mbs the frame size the level limits. Throws on a bad SPS.
+ */
+export function parseSps(nal) {
+  const rbsp = [];
+  let zeros = 0;
+  for (let i = 1; i < nal.length; i++) {
+    const b = nal[i];
+    if (zeros >= 2 && b === 3) { zeros = 0; continue; } // emulation prevention (00 00 03)
+    rbsp.push(b);
+    zeros = b === 0 ? zeros + 1 : 0;
+  }
+  const r = bitReader(rbsp);
+  const profile = r.u(8);
+  const constraints = r.u(8);
+  const levelIdc = r.u(8);
+  r.ue(); // seq_parameter_set_id
+  let chroma = 1;
+  let bitDepth = 8;
+  if (HIGH_PROFILES.has(profile)) {
+    chroma = r.ue();
+    if (chroma === 3) r.u(1);
+    bitDepth = r.ue() + 8;
+    r.ue();
+    r.u(1);
+    if (r.u(1)) {
+      for (let k = 0; k < (chroma !== 3 ? 8 : 12); k++) {
+        if (!r.u(1)) continue;
+        let last = 8;
+        let next = 8;
+        for (let j = 0; j < (k < 6 ? 16 : 64); j++) {
+          if (next !== 0) next = (last + r.se() + 256) % 256;
+          last = next === 0 ? last : next;
+        }
+      }
+    }
+  }
+  r.ue(); // log2_max_frame_num_minus4
+  const poc = r.ue();
+  if (poc === 0) r.ue();
+  else if (poc === 1) {
+    r.u(1);
+    r.se();
+    r.se();
+    const cycle = r.ue();
+    if (cycle > 255) throw new Error('bad SPS');
+    for (let k = 0; k < cycle; k++) r.se();
+  }
+  const refs = r.ue();
+  r.u(1);
+  const wMbs = r.ue() + 1;
+  const mapUnits = r.ue() + 1;
+  const frameMbsOnly = r.u(1);
+  const hMbs = mapUnits * (2 - frameMbsOnly);
+  if (wMbs > 1024 || hMbs > 1024) throw new Error('bad SPS');
+  return { profile, constraints, level: levelOf(levelIdc, profile, constraints), chroma, bitDepth, refs, w: wMbs * 16, h: hMbs * 16, mbs: wMbs * hMbs };
+}
+
+/** The first SPS in an H.264 Annex B elementary stream, parsed, or null. */
+function firstSps(es) {
+  for (let i = 0; i + 3 < es.length; i++) {
+    if (es[i] !== 0 || es[i + 1] !== 0 || es[i + 2] !== 1 || (es[i + 3] & 0x1f) !== 7) continue;
+    let end = es.length;
+    for (let j = i + 4; j + 2 < es.length; j++) if (es[j] === 0 && es[j + 1] === 0 && es[j + 2] <= 1) { end = j; break; }
+    try { return parseSps(es.subarray(i + 3, end)); } catch { return null; }
+  }
+  return null;
+}
+
+const TS_PACKET = 188;
+
+/** A PSI section in a TS payload (pointer field first) → { s: its start, end: before the CRC }, or null. */
+function psiSection(pay) {
+  const s = 1 + pay[0];
+  if (s + 3 > pay.length) return null;
+  const length = ((pay[s + 1] & 0x0f) << 8) | pay[s + 2];
+  return { s, end: Math.min(pay.length, s + 3 + length - 4) };
+}
+
+/** The H.264 elementary stream in the first bytes of an MPEG-TS file (PAT → PMT → PES), or null. */
+function tsH264Es(buf) {
+  let start = -1;
+  for (let i = 0; i < TS_PACKET && i < buf.length; i++) {
+    if (buf[i] === 0x47 && (i + TS_PACKET >= buf.length || buf[i + TS_PACKET] === 0x47)) { start = i; break; }
+  }
+  if (start < 0) return null;
+  let pmtPid = -1;
+  let videoPid = -1;
+  const es = [];
+  for (let i = start; i + TS_PACKET <= buf.length; i += TS_PACKET) {
+    if (buf[i] !== 0x47) break;
+    const pusi = (buf[i + 1] & 0x40) !== 0;
+    const pid = ((buf[i + 1] & 0x1f) << 8) | buf[i + 2];
+    const afc = (buf[i + 3] >> 4) & 3;
+    let p = i + 4;
+    if (afc & 2) p += 1 + buf[p];
+    if (!(afc & 1) || p >= i + TS_PACKET) continue;
+    const pay = buf.subarray(p, i + TS_PACKET);
+    if (pid === 0 && pusi && pmtPid < 0) {
+      const sec = psiSection(pay);
+      if (!sec || pay[sec.s] !== 0x00) continue;
+      for (let q = sec.s + 8; q + 4 <= sec.end; q += 4) {
+        if (((pay[q] << 8) | pay[q + 1]) !== 0) { pmtPid = ((pay[q + 2] & 0x1f) << 8) | pay[q + 3]; break; }
+      }
+    } else if (pid === pmtPid && pusi && videoPid < 0) {
+      const sec = psiSection(pay);
+      if (!sec || pay[sec.s] !== 0x02 || sec.s + 12 > pay.length) continue;
+      const infoLength = ((pay[sec.s + 10] & 0x0f) << 8) | pay[sec.s + 11];
+      for (let q = sec.s + 12 + infoLength; q + 5 <= sec.end; q += 5 + (((pay[q + 3] & 0x0f) << 8) | pay[q + 4])) {
+        if (pay[q] === 0x1b) { videoPid = ((pay[q + 1] & 0x1f) << 8) | pay[q + 2]; break; }
+      }
+      if (videoPid < 0) return null; // no H.264 in the programme (HEVC, audio only)
+    } else if (pid === videoPid) {
+      if (pusi) {
+        if (pay.length < 9 || pay[0] !== 0 || pay[1] !== 0 || pay[2] !== 1) continue;
+        const at = 9 + pay[8];
+        if (at < pay.length) es.push(pay.subarray(at));
+      } else if (es.length) {
+        es.push(pay);
+      }
+    }
+  }
+  return es.length ? Buffer.concat(es) : null;
+}
+
+/** The first H.264 SPS in the first bytes of an MPEG-TS segment (see parseSps), or null. */
+export function readTsSps(buf) {
+  const es = tsH264Es(buf);
+  return es ? firstSps(es) : null;
+}
+
+/** MP4 boxes between start and end (headers that do not fit end the walk). */
+function* mp4Boxes(buf, start, end) {
+  let p = start;
+  while (p + 8 <= end) {
+    let size = buf.readUInt32BE(p);
+    const type = buf.toString('latin1', p + 4, p + 8);
+    let head = 8;
+    if (size === 1) {
+      if (p + 16 > end) return;
+      size = Number(buf.readBigUInt64BE(p + 8));
+      head = 16;
+    } else if (size === 0) {
+      size = Number.MAX_SAFE_INTEGER - p; // to the end of the file
+    }
+    if (size < head) return;
+    yield { type, body: p + head, end: p + size };
+    p += size;
+  }
+}
+
+function mp4Child(buf, box, type, skip = 0) {
+  for (const b of mp4Boxes(buf, box.body + skip, Math.min(box.end, buf.length))) if (b.type === type) return b;
+  return null;
+}
+
+/**
+ * The SPS of the first H.264 track in the first bytes of an MP4 (moov → … → avcC), parsed, or null:
+ * also null when the media comes before the moov (moov at the end of the file).
+ */
+export function readMp4Sps(buf) {
+  let moov = null;
+  for (const b of mp4Boxes(buf, 0, buf.length)) {
+    if (b.type === 'moov') { moov = b; break; }
+    if (b.type === 'mdat' || b.type === 'moof') return null;
+  }
+  if (!moov) return null;
+  for (const trak of mp4Boxes(buf, moov.body, Math.min(moov.end, buf.length))) {
+    if (trak.type !== 'trak') continue;
+    let box = trak;
+    for (const type of ['mdia', 'minf', 'stbl', 'stsd']) { box = box && mp4Child(buf, box, type); }
+    if (!box) continue;
+    for (const entry of mp4Boxes(buf, box.body + 8, Math.min(box.end, buf.length))) { // stsd: version, flags, count
+      if (entry.type !== 'avc1' && entry.type !== 'avc3') continue;
+      const avcC = mp4Child(buf, entry, 'avcC', 78); // after the visual sample entry's fixed fields
+      if (!avcC || avcC.body + 8 > buf.length || !(buf[avcC.body + 5] & 0x1f)) return null;
+      const length = buf.readUInt16BE(avcC.body + 6);
+      const at = avcC.body + 8;
+      if (at + length > buf.length) return null;
+      try { return parseSps(buf.subarray(at, at + length)); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+/** Up to `max` bytes from the start of a response; then the response is destroyed (never read past). */
+function readPrefix(res, max) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks).subarray(0, max)); } };
+    const fail = (err) => { if (!settled) { settled = true; reject(err); } };
+    res.on('data', (c) => {
+      if (settled) return;
+      chunks.push(c);
+      size += c.length;
+      if (size >= max) { done(); res.destroy(); }
+    });
+    res.on('end', done);
+    res.on('error', (err) => (size ? done() : fail(err)));
+    res.on('close', () => (size ? done() : fail(new Error('the stream closed early'))));
+    res.resume();
+  });
+}
+
+/** Rejects when `promise` takes longer than `ms`. */
+function withinBudget(promise, ms) {
+  let timer = null;
+  return Promise.race([promise, new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error('over budget')), ms); })])
+    .finally(() => clearTimeout(timer));
+}
+
+/** The first segment of a media playlist: { url, range: { length, offset } | null }, or null. */
+function firstSegment(text, base) {
+  let range = null;
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const br = /^#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?/i.exec(line);
+    if (br) { range = { length: Number(br[1]), offset: Number(br[2] ?? 0) }; continue; }
+    if (line.startsWith('#')) continue;
+    const abs = webUrl(line, base);
+    return abs ? { url: abs.href, range } : null;
+  }
+  return null;
+}
+
+/** levelLow from the variants' CODECS and RESOLUTION, one per variant (null when it fits). */
+function codecLevels(variants) {
+  return variants.map((v) => {
+    if (!v.width || !v.height) return null;
+    for (const codec of codecList(v.codecs)) {
+      const avc = avcLevel(codec);
+      if (avc && levelTooLow(avc.level, v.width, v.height)) return { level: avc.level, w: v.width, h: v.height, from: 'codecs' };
+    }
+    return null;
+  });
 }
 
 // config.browser.allowLoopback (tests that serve their own pages on 127.0.0.1) also lets the relay reach
@@ -366,19 +721,99 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
   }
 
   /**
-   * What kind of HLS a registered stream is: { fmp4 } is true when its media playlist uses
-   * fragmented MP4 segments (EXT-X-MAP), which the TV's own player does not play.
-   * { drm } is true for DRM-encrypted (SAMPLE-AES) streams.
+   * The first `max` bytes of `target` (Range from `offset`), with the session's headers and the
+   * destination policy; 200 and 206 both count. Gives up (destroying the response) after budgetMs.
+   */
+  async function fetchHead(session, target, { offset = 0, max, budgetMs }) {
+    let res = null;
+    let over = false;
+    const timer = setTimeout(() => { over = true; res?.destroy(); }, budgetMs);
+    try {
+      const range = `bytes=${offset}-${offset + max - 1}`;
+      ({ res } = await fetchFollow(target, upstreamOptions({ headersFor: (u) => upstreamHeaders(session, u, { range, 'accept-encoding': 'identity' }), timeoutMs: budgetMs })));
+      if (over) { res.destroy(); throw new Error('over budget'); }
+      if (res.statusCode !== 200 && res.statusCode !== 206) { res.destroy(); throw new LumenError('FAILED', `The stream answered ${res.statusCode}`); }
+      return await readPrefix(res, max);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // levelLow for an HLS stream: CODECS + RESOLUTION of every variant (AVPlay switches between them),
+  // and the SPS in the first variant's first segment, which replaces what CODECS says about that variant.
+  async function hlsLevel(session, { variants, media, mediaUrl, budgetMs }) {
+    const fromCodecs = codecLevels(variants);
+    const seg = firstSegment(media, mediaUrl);
+    let sps = null;
+    if (seg && budgetMs >= 200 && !/#EXT-X-MAP/.test(media) && !ENCRYPTED_KEY.test(media)) {
+      const max = seg.range ? Math.min(seg.range.length, SEGMENT_HEAD_BYTES) : SEGMENT_HEAD_BYTES;
+      if (max > 0) {
+        const head = await withinBudget(fetchHead(session, seg.url, { offset: seg.range?.offset ?? 0, max, budgetMs }), budgetMs).catch(() => null);
+        sps = head ? readTsSps(head) : null;
+      }
+    }
+    if (sps) {
+      if (levelTooLow(sps.level, sps.w, sps.h)) return { level: sps.level, w: sps.w, h: sps.h, from: 'sps' };
+      fromCodecs[0] = null;
+    }
+    return fromCodecs.find(Boolean) ?? null;
+  }
+
+  /**
+   * What kind of HLS a registered stream is:
+   * - fmp4: its media playlist uses fragmented MP4 segments (EXT-X-MAP), which the TV's own player
+   *   does not play; endlist: it is a finished (VOD) playlist;
+   * - drm: DRM-encrypted (SAMPLE-AES, in the master's session keys or the media playlist);
+   * - master: true for a master playlist, with its `variants` (parseHlsMaster);
+   * - audioOnly: true when the stream carries no video (every variant's CODECS is audio, or a
+   *   single stream's segments are audio or subtitles);
+   * - levelLow: { level, w, h, from: 'sps' | 'codecs' } when an H.264 level is too low for its
+   *   picture (the TV's player shows black). It and audioOnly are only there when found, and the
+   *   level check never fails or holds up the probe (its own budget, within tvscreen's 6 s).
    */
   async function probeHls(token) {
+    const startedAt = Date.now();
     const session = live(token);
     if (!session?.target) throw new LumenError('NOT_FOUND', 'Unknown stream');
-    let { text, url } = await fetchPlaylist(session, session.target);
-    const variant = /#EXT-X-STREAM-INF/.test(text) ? text.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith('#')) : null;
-    if (variant) ({ text, url } = await fetchPlaylist(session, new URL(variant, url).href));
+    const first = await fetchPlaylist(session, session.target);
+    let { text, url } = first;
+    const master = /#EXT-X-STREAM-INF/.test(first.text);
+    const variants = master ? parseHlsMaster(first.text, first.url) : [];
+    if (master) {
+      const next = variants[0]?.uri ?? first.text.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith('#'));
+      if (next) ({ text, url } = await fetchPlaylist(session, new URL(next, first.url).href));
+    }
     // SAMPLE-AES (FairPlay, Widevine, PlayReady): only a licensed DRM player can decrypt it.
-    const drm = /#EXT-X-(SESSION-)?KEY:METHOD=SAMPLE-AES/.test(text);
-    return { fmp4: /#EXT-X-MAP/.test(text), endlist: /#EXT-X-ENDLIST/.test(text), drm };
+    const drm = DRM_KEY.test(first.text) || DRM_KEY.test(text);
+    const out = { fmp4: /#EXT-X-MAP/.test(text), endlist: /#EXT-X-ENDLIST/.test(text), drm };
+    if (master) out.master = true;
+    if (variants.length) out.variants = variants;
+    // Audio only: every variant's CODECS is audio, or a single stream's segments are audio or
+    // subtitles. A master that lists an audio-only fallback before its video variants is video.
+    const seg = firstSegment(text, url);
+    const audioOnly = (variants.length > 0 && variants.every((v) => audioOnlyCodecs(v.codecs)))
+      || Boolean(seg && variants.length <= 1 && AUDIO_SEGMENT.test(new URL(seg.url).pathname));
+    if (audioOnly) out.audioOnly = true;
+    if (!drm && !audioOnly) {
+      try {
+        const budgetMs = Math.min(LEVEL_BUDGET_MS, PROBE_SOFT_MS - (Date.now() - startedAt));
+        const low = await withinBudget(hlsLevel(session, { variants, media: text, mediaUrl: url, budgetMs }), Math.max(budgetMs, 0) + 50);
+        if (low) out.levelLow = low;
+      } catch { /* no level verdict: never a failed probe */ }
+    }
+    return out;
+  }
+
+  /**
+   * levelLow for a plain video file (an MP4 with its moov in the first 256 KB): { levelLow } when
+   * the H.264 level is too low for the picture, else {}. Never throws for an unreadable file.
+   */
+  async function probeFile(token) {
+    const session = live(token);
+    if (!session?.target) throw new LumenError('NOT_FOUND', 'Unknown stream');
+    const head = await withinBudget(fetchHead(session, session.target, { max: FILE_HEAD_BYTES, budgetMs: LEVEL_BUDGET_MS }), LEVEL_BUDGET_MS + 50).catch(() => null);
+    const sps = head ? readMp4Sps(head) : null;
+    return sps && levelTooLow(sps.level, sps.w, sps.h) ? { levelLow: { level: sps.level, w: sps.w, h: sps.h, from: 'sps' } } : {};
   }
 
   /** A relay URL serving `body` (a Buffer) as `type`. */
@@ -490,6 +925,9 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     const passed = {};
     for (const name of PASS_REQUEST) if (req.headers[name] && name !== 'accept-encoding') passed[name] = req.headers[name];
     passed['accept-encoding'] = 'identity';
+    // AVPlay asks for every URL with Range: bytes=0-. A playlist is fetched whole: a 206 of it would
+    // otherwise pass through unrewritten, and the TV would fetch its URIs itself (outside the VPN).
+    if (isPlaylist(null, target.href)) { delete passed.range; delete passed['if-range']; }
     let upstream;
     try {
       upstream = await fetchFollow(target.href, upstreamOptions({ method: req.method, headersFor: (u) => upstreamHeaders(session, u, passed) }));
@@ -504,8 +942,10 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     // A playlist served with another type from a URL without .m3u8 is still a playlist to hls.js (it only
     // checks for #EXTM3U), so the body decides too: left unrewritten, its URIs would be fetched by the TV
     // itself, outside the VPN.
+    // A 206 holding the whole body (bytes 0-N/N+1, small enough for a playlist) counts as a full reply.
+    const complete = up.statusCode === 200 || (up.statusCode === 206 && wholeBody(up.headers));
     let sniffed = null;
-    if (up.statusCode === 200 && req.method === 'GET' && !isPlaylist(type, finalUrl)) {
+    if (complete && req.method === 'GET' && !isPlaylist(type, finalUrl)) {
       try {
         sniffed = await readHead(up, PLAYLIST_SNIFF_BYTES);
       } catch (err) {
@@ -516,7 +956,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
         return;
       }
     }
-    if (up.statusCode === 200 && req.method === 'GET' && (isPlaylist(type, finalUrl) || looksLikePlaylist(sniffed.head))) {
+    if (complete && req.method === 'GET' && (isPlaylist(type, finalUrl) || looksLikePlaylist(sniffed.head))) {
       try {
         const rest = sniffed?.ended ? Buffer.alloc(0) : await readBody(up, MAX_PLAYLIST_BYTES - (sniffed?.head.length ?? 0));
         const text = Buffer.concat([sniffed?.head ?? Buffer.alloc(0), rest]).toString('utf8');
@@ -561,6 +1001,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
       return count;
     },
     probeHls,
+    probeFile,
     convertedUrl: (job) => `${base()}/x/${job}/index.m3u8`,
     proxyUrl: () => vpn()?.proxyUrl?.() ?? null,
     setDemand() {},
