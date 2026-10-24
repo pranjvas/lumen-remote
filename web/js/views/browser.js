@@ -342,7 +342,9 @@ export function mountBrowser(root, ctx) {
     const stage = handoff && typeof handoff === 'object' && typeof handoff.stage === 'string' ? handoff.stage : null;
     const converted = stage === 'copy' || stage === 'encode';
     const active = VIDEO_ACTIVE.has(video);
-    if (handoff?.converting === true || (converted && video === 'loading')) return { tone: 'warn', text: 'Converting for the TV…', busy: true };
+    // Only while ffmpeg runs. Once the copy is sent, the TV plays it but the video stays 'loading' (the
+    // agent sends no 'playing' for a converted stream), so a converted 'loading' shows no chip.
+    if (handoff?.converting === true) return { tone: 'warn', text: 'Converting for the TV…', busy: true };
     if (stage !== 'drm') {
       if (video === 'error') return { tone: 'bad', text: 'The TV could not play the video', short: 'TV player failed', action: 'Convert for TV', run: convertForTv };
       if (active && stage && !converted) return { tone: 'info', text: 'Black picture?', action: 'Convert for TV', run: convertForTv };

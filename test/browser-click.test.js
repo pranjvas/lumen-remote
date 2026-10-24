@@ -422,9 +422,15 @@ describe('browser clicks land on the element under the pointer', { skip }, () =>
         await chipShows({ text: 'Still frames (live video off after 2 drops)', action: 'Turn live on' }, 'live video off');
         await actionSends('tvscreen.live', { on: true });
         put('tvscreen.liveBlocked', false);
+        // While ffmpeg runs the server says converting (and the video 'fallback').
         put('tvscreen.handoff', { stage: 'copy', converting: true });
-        put('tvscreen.video', 'loading');
+        put('tvscreen.video', 'fallback');
         await chipShows({ text: 'Converting for the TV…', action: null }, 'a conversion');
+        // Then the converted copy goes to the TV: the video stays 'loading' while the TV plays it (the
+        // agent sends no 'playing' for that path), so the chip must not still say it is converting.
+        put('tvscreen.handoff', { stage: 'copy', converting: false });
+        put('tvscreen.video', 'loading');
+        await chipShows(null, 'the converted copy sent to the TV');
         put('tvscreen.handoff', { stage: 'direct', converting: false });
         put('tvscreen.video', 'playing');
         await chipShows({ text: 'Black picture?', action: 'Convert for TV' }, 'the TV playing the page’s own stream');
