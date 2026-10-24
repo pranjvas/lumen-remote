@@ -76,9 +76,14 @@ export const CAPTURE_TITLE = 'LumenLiveCapture-7f3a';
 const PAGE_SCRIPT = `(() => {
   if (window !== top) return;
   const nativeOpen = window.open;
+  // A plain window.open to another site is an ad (pop-unders on video pages): blocked, as a browser's
+  // pop-up blocker would; it used to replace the page itself, with no way back to it.
+  const site = (h) => String(h || '').split('.').slice(-2).join('.');
   window.open = function (url, name, features) {
     if (features && /width|height|popup/i.test(String(features))) return nativeOpen.call(window, url, name, features);
-    if (url) location.assign(url);
+    let target = null;
+    try { target = url ? new URL(url, location.href) : null; } catch (e) { target = null; }
+    if (target && /^https?:$/.test(target.protocol) && site(target.hostname) === site(location.hostname)) location.assign(target.href);
     return null;
   };
   addEventListener('click', (event) => {

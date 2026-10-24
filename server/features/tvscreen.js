@@ -546,7 +546,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     if (current?.job && current.job !== known?.id) tc?.stopJob(current.job);
     current = { pick, title: store.get('browser.title')?.v ?? '', stage: 'direct', job: null };
     // A video already converted (or known not to play directly) goes straight to the converted copy.
-    if (known || convert) {
+    // An H.264 HLS stream goes through the copy stage (no re-encode): sites label 1080p with a level
+    // too low for it, and the TV's player then shows a black picture while reporting it plays.
+    const relabel = pick.kind === 'hls' && engine === 'avplay' && !!tc?.available?.() && config.tvscreen?.relabelHls !== false;
+    if (known || convert || relabel) {
       current.stage = known && !known.copy ? 'copy' : 'direct';
       if (await fallback(known ? 'converted before' : 'conversion requested')) await pausePage();
       return { value: { kind: pick.kind, title: current.title, converted: true } };
