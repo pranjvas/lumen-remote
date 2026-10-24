@@ -1,8 +1,9 @@
 // The TV agent's live video player (companion/agent/live.js), run in a vm with a fake MediaSource and
 // <video>: the offer answer with the TV's codec support, init → SourceBuffer, fragments of the
 // current stream only, refusal of a format the TV does not take, the quota and backlog resync, the
-// start on a key frame (the only seek: seeks get this TV's page killed), a stuck player started over
-// by the PC and then refused, and the stop. Also: the agent's scripts stay within the TV's ES2017 engine.
+// start on a key frame (the only seek: seeks get this TV's page killed), a stuck, unstarted or broken
+// player started over by the PC (never refused: the PC steps down for a while when it keeps
+// happening), and the stop. Also: the agent's scripts stay within the TV's ES2017 engine.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -195,7 +196,7 @@ function run(env, secs, until = () => false, { moving = false } = {}) {
   }
 }
 
-test('a clock that never moves is never seeked: one restart by the PC after ~9 s, then refused', async () => {
+test('a clock that never moves is never seeked: the PC starts it over after ~9 s, every time, never refused', async () => {
   const env = setup();
   const { sent, writes } = env;
   const t0 = await started(env);
@@ -204,35 +205,72 @@ test('a clock that never moves is never seeked: one restart by the PC after ~9 s
   assert.equal(writes.length, seeks, 'no seek while stuck');
   const resyncs = sent.filter((m) => m.state === 'resync');
   assert.equal(resyncs.length, 1);
-  assert.equal(resyncs[0].reason, 'stuck');
+  assert.deepEqual([resyncs[0].reason, resyncs[0].on], ['stuck', 'clock']);
   const secs = (env.clock.now - t0) / 1000;
   assert.ok(secs >= 6 && secs <= 9.5, `restart asked after ${secs} s`);
-  // The PC starts it over (a reset init: a new MediaSource); that one is stuck too: refused.
+  run(env, 5); // waiting for the PC's fresh start: not asked again on every check
+  assert.equal(sent.filter((m) => m.state === 'resync').length, 1);
+  // The PC starts it over (a reset init: a new MediaSource); that one is stuck too: started over
+  // again (the PC counts the restarts and steps down for a while). The TV can play the format.
   const t1 = await started(env, { gen: 2, at: 30 });
   const seeks2 = writes.length;
-  run(env, 20, () => sent.some((m) => m.state === 'refused'));
-  assert.equal(sent.at(-1).state, 'refused');
-  assert.match(sent.at(-1).reason, /^stuck/);
+  run(env, 20, () => sent.filter((m) => m.state === 'resync').length === 2);
+  assert.equal(sent.filter((m) => m.state === 'resync').length, 2, 'a second restart');
   assert.ok((env.clock.now - t1) / 1000 <= 9.5);
-  assert.equal(sent.filter((m) => m.state === 'resync').length, 1, 'no second restart');
+  assert.ok(!sent.some((m) => m.state === 'refused'), 'never refused');
   assert.equal(writes.length, seeks2, 'no seek on the second player either');
 });
 
-test('a player that never starts is refused within ~8 s (no playing, or no sourceopen)', async () => {
+test('a player that never starts is started over after ~8 s, not refused (no playing, or no sourceopen)', async () => {
   const env = setup();
   const t0 = await started(env, { playing: false });
-  run(env, 20, () => env.sent.some((m) => m.state === 'refused'));
-  assert.ok(env.sent.some((m) => m.state === 'refused'), 'refused');
+  run(env, 20, () => env.sent.some((m) => m.state === 'resync' || m.state === 'refused'));
+  const ask = env.sent.find((m) => m.state === 'resync');
+  assert.ok(ask, 'a fresh start asked');
+  assert.deepEqual([ask.reason, ask.on], ['stuck', 'start']);
   const secs = (env.clock.now - t0) / 1000;
-  assert.ok(secs >= 7.5 && secs <= 8.5, `refused after ${secs} s`);
-  assert.ok(!env.sent.some((m) => m.state === 'resync'));
+  assert.ok(secs >= 7.5 && secs <= 8.5, `asked after ${secs} s`);
+  assert.ok(!env.sent.some((m) => m.state === 'refused'), 'a slow start is not a format the TV cannot play');
 
   const quiet = setup();
   quiet.live.data(init(1)); // the MediaSource never opens
   const t1 = quiet.clock.now;
-  for (let i = 0; i < 40 && !quiet.sent.some((m) => m.state === 'refused'); i++) { quiet.clock.now += 500; quiet.tick(500); }
-  assert.equal(quiet.sent.at(-1).state, 'refused');
+  for (let i = 0; i < 40 && !quiet.sent.some((m) => m.state === 'resync'); i++) { quiet.clock.now += 500; quiet.tick(500); }
+  assert.equal(quiet.sent.at(-1).state, 'resync');
   assert.ok((quiet.clock.now - t1) / 1000 <= 8.5);
+  // The PC does not answer: asked once more, then this player gives up (the PC goes back to frames).
+  for (let i = 0; i < 80 && !quiet.sent.some((m) => m.state === 'error'); i++) { quiet.clock.now += 500; quiet.tick(500); }
+  assert.deepEqual(quiet.sent.map((m) => [m.state, m.reason]), [['resync', 'stuck'], ['resync', 'no answer'], ['error', 'no fresh start from the PC']]);
+  assert.ok((quiet.clock.now - t1) / 1000 <= 24.5);
+  for (let i = 0; i < 40; i++) { quiet.clock.now += 500; quiet.tick(500); }
+  assert.equal(quiet.sent.length, 3, 'nothing more');
+});
+
+test('a player error before it ever played is a refusal; after it played, the PC starts it over', async () => {
+  const env = setup();
+  env.live.data(init(1));
+  env.ms().open();
+  await flush();
+  env.video.error = { code: 4, message: 'format' };
+  env.video.onerror();
+  assert.equal(env.sent.at(-1).state, 'refused');
+  assert.match(env.sent.at(-1).reason, /^video error 4/);
+
+  const later = setup();
+  await started(later);
+  run(later, 2, undefined, { moving: true });
+  const source = later.ms();
+  later.video.error = { code: 3, message: 'decode' };
+  later.video.onerror();
+  const msg = later.sent.at(-1);
+  assert.deepEqual([msg.state, msg.reason], ['resync', 'error']);
+  assert.match(msg.on, /^video error 3/);
+  assert.equal(later.live.isShowing(), false, 'the broken player is gone');
+  source.buffers[0].listeners.error.forEach((fn) => fn()); // the old player's SourceBuffer fails too
+  assert.equal(later.sent.filter((m) => m.state === 'resync').length, 1, 'reported once');
+  await started(later, { gen: 2, at: 30 }); // the PC's fresh start
+  assert.equal(later.live.isShowing(), true);
+  assert.ok(!later.sent.some((m) => m.state === 'refused'), 'never refused');
 });
 
 test('a seek that never finishes counts as stuck', async () => {
@@ -246,8 +284,11 @@ test('a seek that never finishes counts as stuck', async () => {
   const restart = sent.find((m) => m.state === 'resync');
   assert.deepEqual([restart.reason, restart.on], ['stuck', 'seeking']);
   assert.ok((env.clock.now - t0) / 1000 > 3 && (env.clock.now - t0) / 1000 <= 4);
-  run(env, 10, () => sent.some((m) => m.state === 'refused'));
-  assert.equal(sent.at(-1).state, 'refused', 'stuck again soon after: refused');
+  // The PC starts it over; stuck again soon after: started over again, never refused.
+  await started(env, { gen: 2, at: 30 });
+  run(env, 10, () => sent.filter((m) => m.state === 'resync').length === 2);
+  assert.deepEqual(sent.filter((m) => m.state === 'resync').map((m) => m.on), ['seeking', 'seeking']);
+  assert.ok(!sent.some((m) => m.state === 'refused'));
 });
 
 test('last resort only: far behind for 10 s asks the PC for a restart, at most once per 30 s', async () => {
@@ -261,9 +302,13 @@ test('last resort only: far behind for 10 s asks the PC for a restart, at most o
   const secs = (env.clock.now - t0) / 1000;
   assert.equal(sent.find((m) => m.state === 'resync').reason, 'behind');
   assert.ok(secs >= 10 && secs <= 11, `after ${secs} s`);
-  run(env, 25, undefined, { moving: true }); // still behind (the PC did not answer): no more for now
+  // The PC starts it over; the new player is far behind again at once: no more for now.
+  await started(env, { gen: 2, at: 30 });
+  run(env, 1, undefined, { moving: true });
+  env.ranges[0][1] = env.video.currentTime + 7;
+  run(env, 15, undefined, { moving: true });
   assert.equal(sent.filter((m) => m.state === 'resync').length, 1);
-  assert.equal(writes.length, 1, 'never a seek');
+  assert.equal(writes.length, 2, 'never a seek, only the start of each player');
 });
 
 test('played video is removed every few seconds, not on every check', async () => {

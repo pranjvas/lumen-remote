@@ -561,14 +561,16 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
  * runtimeError }) → { bitrate?, step?, cause? } (changes only), { resync: true } (start the viewer's
  * player over), or { exhausted: true } when no step is left. Starts at startIndex (never at a probe
  * step); a probe step above is tried once after probeAfter quiet seconds and dropped at its first
- * trouble. The TV's signals are judged over its last reports, not per tick: a tick without a report
- * neither clears them nor counts as quiet. A format the TV refused, a failed probe and a failing
- * encoder block their step for good; a step left for dropped frames or repeated player errors is
- * held for ten minutes and then tried again.
+ * trouble (a TV that lags on its reports included). The TV's signals are judged over its last
+ * reports, not per tick: a tick without a report neither clears them nor counts as quiet. A format
+ * the TV refused, a failed probe and a failing encoder block their step for good; a step left for
+ * dropped frames, repeated player errors or a TV player that asks to start over again within two
+ * minutes (stuck, never started, failed while playing) is held for ten minutes and then tried again.
  */
 const PROBE_GRACE_TICKS = 4;
 const HOLD_MS = 10 * 60 * 1000;
 const ERROR_WINDOW_MS = 10 * 60 * 1000;
+const RESTART_AGAIN_MS = 2 * 60 * 1000;
 const TV_LAG_TROUBLE_SEC = 1.5;
 const UP_CAUSES = new Set(['congestion', 'decode', 'error']);
 
@@ -584,6 +586,7 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
   const blocked = new Set(); // for good: formats the TV refused, failed probes, failing encoders
   const held = new Map(); // step → until (ms): left for dropped frames or player errors
   let errors = []; // when the TV's player failed at run time (not its format)
+  let restarts = []; // when the TV's player asked to start over at this step
   let tvHist = []; // the TV's last 3 reports: { stall, decode }
   let troubleHist = []; // the TV's last 4 reports: trouble of any kind
   let lastTvTrouble = false; // the latest report showed trouble (carried over ticks without one)
@@ -592,9 +595,13 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
   function moveTo(next, cause) {
     if (next === index || next < 0 || next >= ladder.length) return null;
     if (next > index && cause !== 'probe-failed') lowered.push({ from: index, at: ticks, cause });
+    // Only a probe starts a probe: any other move ends one (a step left while still on trial must
+    // not leave the trial running on the step it went to).
+    if (cause !== 'probe') probing = null;
     index = next;
     bitrate = Math.min(ladder[index].bitrate.start, ladder[index].bitrate.max);
     good = bad = 0;
+    restarts = [];
     tvHist = [];
     troubleHist = [];
     lastTvTrouble = false;
@@ -618,7 +625,9 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
         lastTvTrouble = entry.stall || entry.decode;
       }
       const tvStalled = tvFresh && (stalls > 0 || jumps > 0 || resyncs > 0);
-      const trouble = refused || runtimeError || drops > 0 || queueSec > QUEUE_LIMIT_SEC || tvStalled || dropRatio > 0.1 || statsLate;
+      // The TV's player stalls, restarts or lags on 2 of its last 3 reports.
+      const tvCongested = !!entry && tvHist.filter((e) => e.stall).length >= 2;
+      const trouble = refused || runtimeError || drops > 0 || queueSec > QUEUE_LIMIT_SEC || tvStalled || tvCongested || dropRatio > 0.1 || statsLate;
       // A probe step goes at its first trouble, for good: after a few seconds of grace, since the
       // switch itself (a new size from a key frame, maybe a new player on the TV) comes in a burst.
       if (probing && trouble && !refused && !runtimeError && ticks - probing.at <= PROBE_GRACE_TICKS) return null;
@@ -649,6 +658,19 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
           return next < 0 ? { exhausted: true } : moveTo(next, 'error');
         }
       }
+      // The TV's player asked to start over (it got stuck, never started, or failed while playing; the
+      // PC started it over already): again within two minutes at this step, the step is held for ten
+      // minutes and the next one down is used. Never for good: a slow start (the TV's one decoder just
+      // released by its own player) or two bad minutes must not cost a step until the server restarts.
+      if (resyncs > 0) {
+        const t = now();
+        restarts = [...restarts.filter((x) => t - x < RESTART_AGAIN_MS), ...new Array(resyncs).fill(t)];
+        const next = below();
+        if (restarts.length >= 2 && next >= 0) {
+          held.set(index, t + HOLD_MS);
+          return moveTo(next, 'error');
+        }
+      }
       // Dropped frames on 2 of the TV's last 3 reports: it cannot decode this step.
       if (entry && tvHist.filter((e) => e.decode).length >= 2) {
         const next = below();
@@ -662,7 +684,6 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
       // Congestion: the link (dropped or queued fragments, a late report) or the TV's player (stalls,
       // restarts or lag on 2 of its last 3 reports). The bitrate goes down to the step's floor, then
       // the step: at once for the TV, after 3 seconds at the floor for the link.
-      const tvCongested = !!entry && tvHist.filter((e) => e.stall).length >= 2;
       const pcCongested = drops > 0 || queueSec > QUEUE_LIMIT_SEC || statsLate;
       const { min, max } = ladder[index].bitrate;
       if (pcCongested || tvCongested) {
@@ -768,7 +789,9 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   const settings = { enabled: false, maxHeight: 1080, maxFps: 60, probeAfterSec: 30, preferHevc: true, idleStopMs: 15_000, gopSeconds: 1, fragmentMs: FRAGMENT_MS,
     statsLateMs: STATS_LATE_MS, statsGoneMs: STATS_GONE_MS, statsGraceMs: STATS_GRACE_MS,
     // Internal timings (tests shorten them).
-    pickTimeoutMs: PICK_TIMEOUT_MS, retryMs: RETRY_MS, browserTimeoutMs: BROWSER_TIMEOUT_MS, controlMs: 1000, ...config.liveVideo };
+    // noStreamMs: a capture that is up and has sent no stream for this long is started again (default
+    // statsGraceMs + statsGoneMs, the time a TV that went quiet gets).
+    pickTimeoutMs: PICK_TIMEOUT_MS, retryMs: RETRY_MS, browserTimeoutMs: BROWSER_TIMEOUT_MS, controlMs: 1000, noStreamMs: null, ...config.liveVideo };
   const ev = (cdp, expression, opts = {}) => evaluate(cdp, expression, { timeoutMs: settings.browserTimeoutMs, ...opts });
   const token = randomBytes(24).toString('hex');
   let server = null; // loopback HTTP + WebSocket server for the capture page
@@ -794,8 +817,10 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   let stopped = false;
   let emptyStats = 0; // capture reports in a row with frames but no encoded bytes
   let encoderErrors = []; // times of video encoder failures the capture page did not recover from
+  let captureUpAt = null; // when the running capture started (lumenStart answered); null while none runs
+  let noStreamRestarted = false; // a capture that sent no stream was started again once already
   // viewer → { tvStats, prevTv, refused, refusedIndex, runtimeError, resyncs, since, lastStatsAt,
-  // onFallback, onRestart, lagRun, stallHist, last }
+  // onFallback, onRestart, lagRun, stallHist, last, fellBack }
   const viewers = new Map();
 
   const publish = (value) => store.set('tvscreen.live', value, { src: 'derived', via: 'livevideo' });
@@ -955,6 +980,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     await feature.fitContents().catch((err) => log.debug('could not size the page for capture', { message: err.message }));
     sendPage(stepConfig(step, rate.bitrate));
     retry = 0;
+    captureUpAt = Date.now();
     log.info('live video started', { step: step.name, codec: step.codec.family, bitrate: rate.bitrate, audio: started?.audio ?? false });
     publishState('starting');
   }
@@ -970,6 +996,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   function stopCapture() {
     clearTimeout(retryTimer);
     retryTimer = null;
+    captureUpAt = null;
     sendPage({ t: 'stop' });
     const target = captureTarget;
     captureTarget = null;
@@ -1014,7 +1041,14 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
       return;
     }
     retry = 0;
-    for (const v of [...viewers.values()]) v.onFallback?.(`live video could not start: ${err.message}`);
+    for (const v of [...viewers.values()]) fallBack(v, `live video could not start: ${err.message}`);
+  }
+
+  // A viewer goes back to frames once (tvscreen detaches it); nothing more is judged for it.
+  function fallBack(v, reason) {
+    if (v.fellBack) return;
+    v.fellBack = true;
+    v.onFallback?.(reason);
   }
 
   // ---- muxer output ----
@@ -1022,6 +1056,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   function onMuxed(m) {
     if (m.kind === 'init') {
       log.info('live video stream', { codec: m.codec, size: `${m.width}x${m.height}`, fps: m.fps, audio: m.audio, reset: m.reset });
+      noStreamRestarted = false;
       // The encoder's exact codec string (HEVC can come out as High tier) and the one the TV said it
       // takes for this step: the TV's player uses the first it accepts.
       const tv = rate?.step?.codec?.tv;
@@ -1039,7 +1074,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     if (!change) return false;
     if (change.exhausted) {
       const list = viewer ? [viewers.get(viewer)].filter(Boolean) : [...viewers.values()];
-      for (const v of list) v.onFallback?.(exhaustedReason);
+      for (const v of list) fallBack(v, exhaustedReason);
       return true;
     }
     if (change.resync && viewer) fanout.resync(viewer);
@@ -1071,7 +1106,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   function controlTick() {
     if (!rate) { publishState(); return; }
     for (const [viewer, v] of viewers) {
-      if (v.paused) continue;
+      if (v.paused || v.fellBack) continue;
       const sent = fanout.takeStats(viewer);
       // A refusal or a player error is acted on at once: the stream that follows comes from it.
       if (v.refused || v.runtimeError) {
@@ -1084,9 +1119,23 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
       const tv = v.tvStats;
       v.tvStats = null;
       // Nothing counts before the TV has had an init since it (re)started: a start can take a while
-      // (a capture retried), and the TV reports only once it has a stream.
+      // (a capture retried), and the TV reports only once it has a stream. But a capture that is up
+      // and sends no stream (its encoder never gives anything, or every frame is the wrong size)
+      // would leave the TV on its last picture for good: it is started again once, then the TV goes
+      // back to frames (not a strike: the TV did nothing wrong).
       if (!sent?.initAt || sent.initAt < v.since) {
         if (tv) v.prevTv = tv;
+        const waitedMs = captureUpAt !== null && muxer && !capturing ? Date.now() - Math.max(v.since, captureUpAt) : 0;
+        if (waitedMs > (settings.noStreamMs ?? settings.statsGraceMs + settings.statsGoneMs)) {
+          if (!noStreamRestarted) {
+            noStreamRestarted = true;
+            log.warn('the capture sends no video; starting it again', { waitedMs, step: rate.step.name });
+            onCaptureLost('the capture sent no video');
+          } else {
+            log.warn('the capture sends no video; back to frames', { waitedMs, step: rate.step.name });
+            fallBack(v, 'live video could not start: the capture sent no video');
+          }
+        }
         continue;
       }
       const prev = v.prevTv;
@@ -1104,14 +1153,14 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
         v.stallHist = [...v.stallHist, stalls > 0].slice(-4);
         if (v.lagRun >= 3 || v.stallHist.filter(Boolean).length >= 3) {
           log.warn('the TV player is stuck on the live video', { lag, stalls: v.stallHist.filter(Boolean).length });
-          v.onFallback?.('the TV player is stuck');
+          fallBack(v, 'the TV player is stuck');
           continue;
         }
       }
       // The TV reports every 2 s once it plays (statsGraceMs allowed after the init). A TV that stops
       // reporting is starved or frozen: the stream gets lighter, and then it goes back to frames.
       const quietMs = Date.now() - (v.lastStatsAt ?? sent.initAt + settings.statsGraceMs);
-      if (quietMs > settings.statsGoneMs) { log.warn('the TV stopped reporting on the live video', { quietMs }); v.onFallback?.('the TV stopped reporting'); continue; }
+      if (quietMs > settings.statsGoneMs) { log.warn('the TV stopped reporting on the live video', { quietMs }); fallBack(v, 'the TV stopped reporting'); continue; }
       const signals = {
         drops: sent.drops,
         queueSec: viewer.buffered ? viewer.buffered() / Math.max(1, rate.bitrate / 8) : 0,
@@ -1152,8 +1201,11 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
    * onRestart(reason) (optional: the capture is being restarted, the TV will get a new stream) }.
    * tvCaps: { [tv codec string]: boolean } from the TV's MediaSource.isTypeSupported.
    * options.lower: start this many steps below the usual start (the TV's page died on live video before).
-   * → { pause(), resume(), resync(), report(stats), refused() (the TV cannot play this format),
-   *     error() (its player failed while playing: started over; twice, a step down), detach() }.
+   * → { pause(), resume(), resync(reason) (the TV's player asked to start over: started over; again
+   *     within 2 minutes, the step is held for 10 minutes), report(stats), refused(reason) (the TV
+   *     cannot play this format: its step is blocked; a reason starting 'stuck' is a stuck player,
+   *     handled as resync), error() (its player failed while playing: started over; twice in 10
+   *     minutes, the step is held), detach() }. The agent's reason is optional.
    */
   function attach(viewer, tvCaps = {}, options = {}) {
     if (!settings.enabled) throw new LumenError('UNAVAILABLE', 'Live video is turned off');
@@ -1176,11 +1228,13 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     ensureCapture().catch(startFailed);
     // A capture still running (the TV came straight back) is already streaming.
     publishState(page && muxer?.initSent ? 'streaming' : 'starting');
+    // The TV's player asked to start over (stuck, never started, failed while playing, behind, a full
+    // buffer): a fresh player now; counted as trouble, and again within 2 minutes the step is held.
+    const restartAsked = () => { const v = viewers.get(viewer); if (v) v.resyncs += 1; fanout.resync(viewer); };
     return {
       pause: () => { const v = viewers.get(viewer); if (v) v.paused = true; fanout.pause(viewer); },
       resume: () => { const v = viewers.get(viewer); if (v) { v.paused = false; restartWatch(v); } fanout.resume(viewer); },
-      // The TV's player asked to start over (stuck, behind, a full buffer): counted as trouble.
-      resync: () => { const v = viewers.get(viewer); if (v) v.resyncs += 1; fanout.resync(viewer); },
+      resync: () => restartAsked(),
       report: (stats) => {
         const v = viewers.get(viewer);
         if (!v) return;
@@ -1190,7 +1244,12 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
         if (fanout.noteLag(viewer, stats?.lag)) log.debug('the TV is behind on the live video; skipping ahead', { lag: stats.lag });
       },
       // The step the refusal came in on is the one blamed (not whatever the step is at the next tick).
-      refused: () => { const v = viewers.get(viewer); if (v) { v.refused = true; v.refusedIndex = rate?.index ?? null; restartWatch(v); } },
+      // A stuck player is not a format the TV cannot play: it is started over, never blocked.
+      refused: (reason) => {
+        if (/^stuck/.test(String(reason ?? ''))) { restartAsked(); return; }
+        const v = viewers.get(viewer);
+        if (v) { v.refused = true; v.refusedIndex = rate?.index ?? null; restartWatch(v); }
+      },
       error: () => {
         const v = viewers.get(viewer);
         if (!v) return;
@@ -1212,6 +1271,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     clearTimeout(retryTimer);
     retryTimer = null;
     retry = 0;
+    noStreamRestarted = false;
     publishState('off');
     // A viewer that comes straight back (the TV's player closed, the agent reconnected) finds the
     // capture still running.

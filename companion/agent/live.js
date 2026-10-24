@@ -4,8 +4,10 @@
 // MSE on a <video> under the pointer, kept near the live edge (small drift: a slightly faster rate;
 // larger lag is shed by the PC, which skips media and keeps the timeline seamless), trims old buffer,
 // and reports to the PC every 2 s so it can adapt the bitrate and resolution. A player that gets
-// stuck is never seeked: the PC starts it over (a new MediaSource), and a second time it is refused,
-// so the PC steps down. When MSE refuses the stream the PC falls back to JPEG frames.
+// stuck, never starts or fails after it has played is never seeked: the PC starts it over (a new
+// MediaSource), and when that happens again soon it steps down for a while (not for good: none of
+// these say the TV cannot play the format). A stream MSE refuses before it ever plays is refused:
+// the PC tries the next format down, then JPEG frames.
 // Runs on Chromium M69 (Tizen 5.5): ES2017 syntax only (no ?. ?? or object spread).
 (function () {
   'use strict';
@@ -25,9 +27,8 @@
   const STALL_MS = 2500; // a clock that has not moved this long with frames ahead: a stall
   const STUCK_MS = 6000; // still stalled this long after: stuck, the PC starts the player over
   const SEEK_STUCK_MS = 3000; // a seek that has not finished in this long: stuck
-  const START_MS = 8000; // a player that has not started this long after its creation: refused
-  const STUCK_AGAIN_MS = 120000; // stuck again within this long: refused (the PC steps down)
-  const RESYNC_GAP_MS = 30000; // at most one restart asked by this page per this long
+  const START_MS = 8000; // a player that has not started this long after its creation: started over
+  const RESYNC_GAP_MS = 30000; // at most one restart for lag or a hole asked by this page per this long
   const FAR_LAG = 6; // last resort: this far behind ...
   const FAR_MS = 10000; // ... for this long, or
   const OUT_MS = 3000; // the playhead outside every buffered range this long: a restart
@@ -64,10 +65,9 @@
   let seekingSince = 0;
   let farSince = 0;
   let outSince = 0;
-  // Across players (not reset in create()): a player stuck again soon after is refused.
-  let lastStuckAt = 0;
-  let stuckCount = 0;
-  let lastResyncAt = 0;
+  let askedAt = 0; // a fresh start was asked of the PC: nothing is judged until its init comes
+  let asks = 0; // fresh starts asked since the PC's last init
+  let lastResyncAt = 0; // across players (not reset in create())
 
   function now() { return Date.now(); }
   function noop() {}
@@ -107,6 +107,7 @@
     mime = null;
     gen = -1;
     waitInit = true;
+    askedAt = asks = 0;
     started = false;
     if (el) {
       el.onplaying = el.onerror = el.onwaiting = null;
@@ -144,7 +145,7 @@
         return;
       }
       sb.addEventListener('updateend', pump);
-      sb.addEventListener('error', function () { if (ms === source) refuse('SourceBuffer error'); });
+      sb.addEventListener('error', function () { if (ms === source) fail('SourceBuffer error'); });
       pump();
     });
     el.style.display = 'block';
@@ -159,7 +160,7 @@
     };
     el.onerror = function () {
       if (ms !== source) return;
-      refuse('video error ' + (el.error ? el.error.code + ' ' + (el.error.message || '') : ''));
+      fail('video error ' + (el.error ? el.error.code + ' ' + (el.error.message || '') : ''));
     };
     el.onwaiting = function () { if (ms === source) lastProgress = Math.min(lastProgress, now()); };
     objectUrl = URL.createObjectURL(source);
@@ -174,6 +175,18 @@
     failed = true;
     teardown();
     report('refused', { reason: String(reason).slice(0, 160) });
+  }
+
+  // The player failed. One that never played: the TV cannot play this stream (refused). One that
+  // has played: the format is fine, the player broke; the PC starts it over (and steps down for a
+  // while when that keeps happening).
+  function fail(reason) {
+    if (failed) return;
+    if (!started && !moved) { refuse(reason); return; }
+    failed = true;
+    teardown();
+    lastResyncAt = now();
+    report('resync', { reason: 'error', on: String(reason).slice(0, 160) });
   }
 
   // ---- appending ----
@@ -201,7 +214,7 @@
         trim(true);
         resync('quota');
       } else {
-        refuse('appendBuffer: ' + (e && e.name));
+        fail('appendBuffer: ' + (e && e.name));
       }
     }
   }
@@ -211,6 +224,8 @@
     queue = [];
     queued = 0;
     waitInit = true;
+    askedAt = now();
+    asks += 1;
     const extra = { reason: why };
     if (detail) extra.on = detail;
     report('resync', extra);
@@ -263,16 +278,13 @@
   }
 
   // The player is stuck (its clock stopped with frames ahead, or a seek never finished). It is not
-  // seeked: the PC starts it over from a key frame in a new MediaSource. Stuck again within two
-  // minutes (or right after a restart), it is refused and the PC steps down.
+  // seeked: the PC starts it over from a key frame in a new MediaSource, every time (a stuck player
+  // left alone is a frozen picture). The PC counts how often: again within two minutes, it steps
+  // down for a while. Never a refusal: the TV can play the format.
   function stuck(why) {
     const t = now();
     stuckSince = seekingSince = 0;
     lastProgress = t;
-    if (t - lastStuckAt >= STUCK_AGAIN_MS) stuckCount = 0;
-    stuckCount += 1;
-    lastStuckAt = t;
-    if (stuckCount > 1 || t - lastResyncAt < RESYNC_GAP_MS) { refuse('stuck'); return; }
     lastResyncAt = t;
     resync('stuck', why);
   }
@@ -289,8 +301,20 @@
   function control() {
     if (!el || !ms) return;
     const at = now();
-    // No start (no 'playing', a clock that never moved, or a MediaSource that never opened).
-    if (!started && !moved && at - createdAt >= START_MS) { refuse('stuck: did not start'); return; }
+    if (askedAt) {
+      // A fresh start was asked: this player is not judged again (that would ask again every check).
+      // The PC answers at once; no answer in a while, it is asked once more, and then this player
+      // gives up (the PC goes back to frames) rather than show a frozen picture for good.
+      if (at - askedAt >= START_MS) {
+        if (asks >= 2) { teardown(); report('error', { reason: 'no fresh start from the PC' }); }
+        else resync('no answer');
+      }
+      return;
+    }
+    // No start (no 'playing', a clock that never moved, or a MediaSource that never opened): the PC
+    // starts it over. Not a refusal: a slow start (the TV's one decoder just released by its own
+    // player) does not mean the TV cannot play the format.
+    if (!started && !moved && at - createdAt >= START_MS) { lastResyncAt = at; resync('stuck', 'start'); return; }
     if (!sb || !el.buffered.length) return;
     const ranges = el.buffered;
     const end = ranges.end(ranges.length - 1);
@@ -374,6 +398,7 @@
     if (!ms || info.reset || family(type) !== family(mime)) create(type);
     gen = g;
     waitInit = false;
+    askedAt = asks = 0;
     queue.push(data);
     queued += data.byteLength;
     pump();

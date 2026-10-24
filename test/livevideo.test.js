@@ -626,6 +626,51 @@ describe('rate control and the ladder', () => {
     enc.encoderFailed();
     assert.deepEqual(enc.encoderFailed(), { exhausted: true });
   });
+
+  test('a TV that lags during a 4K probe fails the probe; trouble after it never blocks the start step', () => {
+    const rc = createRateControl({ ladder: full, probeAfter: 20 });
+    const probe = drive(rc, 25, () => ({ lag: 0.4 }));
+    assert.deepEqual(probe.filter((c) => c.step !== undefined).map((c) => [full[c.step].name, c.cause]), [['2160p30', 'probe']]);
+    // The TV lags on every report (no stalls, no drops): the trial is over, 4K is dropped for good.
+    let down = null;
+    let s = 26;
+    for (; s < 42 && !down; s++) {
+      const change = rc.tick(s % 2 === 0 ? { tvFresh: true, lag: 2 } : { tvFresh: false });
+      if (change?.step !== undefined) down = change;
+    }
+    assert.deepEqual([full[down.step].name, down.cause], ['1080p30', 'probe-failed']);
+    // One dropped fragment soon after: the bitrate, not a block on 1080p30.
+    const drop = rc.tick({ tvFresh: false, drops: 1 });
+    assert.ok(drop && drop.step === undefined && drop.bitrate, JSON.stringify(drop));
+    const later = drive(rc, 200, () => ({ lag: 0.4 }), s + 1);
+    assert.ok(!later.some((c) => c.step !== undefined), `no step change: ${JSON.stringify(later.filter((c) => c.step !== undefined))}`);
+    assert.equal(rc.step.name, '1080p30', 'the failed probe is not tried again, not even as a step "up"');
+    // 1080p30 is not blocked: left for congestion, it comes back.
+    for (let i = 0; i < 10 && rc.step.name === '1080p30'; i++) rc.tick({ drops: 1 });
+    assert.equal(rc.step.name, '720p30');
+    for (let i = 0; i < 120 && rc.step.name !== '1080p30'; i++) rc.tick({});
+    assert.equal(rc.step.name, '1080p30');
+  });
+
+  test('a TV player that asks to start over again within 2 minutes: its step is held for 10 minutes, never blocked', () => {
+    let t = 0;
+    const rc = createRateControl({ ladder: tv, now: () => t });
+    assert.equal(rc.tick({ resyncs: 1, lag: 0.4 }), null, 'once: trouble, no step change');
+    t += 3 * 60_000;
+    drive(rc, 4, () => ({ lag: 0.4 }));
+    assert.equal(rc.tick({ resyncs: 1, lag: 0.4 }), null, 'again, 3 minutes later: no step change');
+    t += 60_000;
+    const change = rc.tick({ resyncs: 1, lag: 0.4 });
+    assert.deepEqual([tv[change.step].name, change.cause], ['720p30', 'error'], 'again within 2 minutes: a step down');
+    drive(rc, 60, () => ({ lag: 0.4 }));
+    assert.equal(rc.step.name, '720p30', 'held');
+    t += 10 * 60_000;
+    for (let i = 0; i < 30 && rc.step.name === '720p30'; i++) rc.tick({});
+    assert.equal(rc.step.name, '1080p30', 'tried again once the hold is over');
+    // Two at once (between two reports) count as again.
+    const both = createRateControl({ ladder: tv, now: () => t });
+    assert.equal(both.tick({ resyncs: 2, lag: 0.4 }).cause, 'error');
+  });
 });
 
 // ---------- the feature, against a fake browser (no Edge) ----------
@@ -766,7 +811,8 @@ describe('the feature (a fake browser, no Edge)', () => {
 
   test('the TV’s silence counts from its first init: a slow first frame is not "stopped reporting"', async () => {
     const edge = await fakeBrowser();
-    const { live } = liveFeature(edge, { statsGraceMs: 200, statsLateMs: 150, statsGoneMs: 300 });
+    // (noStreamMs: a capture this slow to send anything would be started again.)
+    const { live } = liveFeature(edge, { statsGraceMs: 200, statsLateMs: 150, statsGoneMs: 300, noStreamMs: 5000 });
     const tv = fakeTv();
     try {
       tv.handle = live.attach(tv.viewer, caps30);
@@ -837,6 +883,67 @@ describe('the feature (a fake browser, no Edge)', () => {
       for (let i = 0; i < 3; i++) page.ws.send(JSON.stringify({ t: 'error', where: 'video encoder', message: 'EncodingError' }));
       await until(() => configsOf(page).length === 3, 3000, 'the step down');
       assert.deepEqual([configsOf(page)[2].width, configsOf(page)[2].height], [1280, 720]);
+    } finally {
+      tv.stop();
+      await live.stop();
+      edge.close();
+    }
+  });
+
+  test('a capture that starts but sends no stream is started again once, then the TV goes back to frames (no strike)', async () => {
+    const edge = await fakeBrowser(); // lumenStart answers; the page never sends a config or a chunk
+    const { live, logs } = liveFeature(edge, { statsGraceMs: 200, statsLateMs: 150, statsGoneMs: 300, retryMs: [50] });
+    const tv = fakeTv();
+    try {
+      tv.handle = live.attach(tv.viewer, caps30);
+      await until(() => tv.fallbacks.length, 5000, 'the fallback');
+      assert.deepEqual(tv.fallbacks, ['live video could not start: the capture sent no video']);
+      assert.equal(edge.calls.starts, 2, 'started again once');
+      assert.deepEqual(tv.got, [], 'nothing reached the TV');
+      assert.ok(!logs.some((l) => /stopped reporting/.test(l.msg)), 'not "stopped reporting" (a strike)');
+    } finally {
+      tv.stop();
+      await live.stop();
+      edge.close();
+    }
+    // The capture started again does stream: the TV stays on live video.
+    const edge2 = await fakeBrowser();
+    const second = liveFeature(edge2, { statsGraceMs: 200, statsLateMs: 150, statsGoneMs: 300, retryMs: [50] });
+    const tv2 = fakeTv();
+    try {
+      tv2.handle = second.live.attach(tv2.viewer, caps30);
+      await until(() => edge2.pages.length === 2 && configsOf(edge2.page()).length, 5000, 'the capture started again');
+      streamFrom(edge2.page());
+      await until(() => tv2.got.some((m) => m.kind === 'media'), 5000, 'the stream');
+      await sleep(1200);
+      assert.deepEqual(tv2.fallbacks, []);
+    } finally {
+      tv2.stop();
+      await second.live.stop();
+      edge2.close();
+    }
+  });
+
+  test('a stuck TV player is started over at once, never blocked; again within 2 minutes, a step down', async () => {
+    const edge = await fakeBrowser();
+    const { live, logs } = liveFeature(edge);
+    const tv = fakeTv();
+    try {
+      tv.handle = live.attach(tv.viewer, caps30);
+      await until(() => edge.page() && configsOf(edge.page()).length, 5000, 'the capture config');
+      const page = edge.page();
+      streamFrom(page);
+      await until(() => tv.got.some((m) => m.kind === 'media'), 5000, 'the stream');
+      const resets = () => tv.got.filter((m) => m.kind === 'init' && m.info.reset).length;
+      const before = resets();
+      tv.handle.refused('stuck: did not start'); // a stuck player reported as a refusal: not a format refusal
+      assert.equal(resets(), before + 1, 'a fresh player at once');
+      await sleep(700); // a few of the TV's reports
+      assert.equal(configsOf(page).length, 1, 'one restart: no step change');
+      tv.handle.resync(); // stuck again
+      await until(() => configsOf(page).length === 2, 3000, 'the step down');
+      assert.deepEqual([configsOf(page)[1].width, configsOf(page)[1].height], [1280, 720]);
+      assert.equal(logs.find((l) => l.msg === 'live video step').data.cause, 'error', 'held for a while, not blocked');
     } finally {
       tv.stop();
       await live.stop();
