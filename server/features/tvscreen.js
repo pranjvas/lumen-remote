@@ -64,7 +64,7 @@ const MANUAL_GRACE_MS = 5000; // the automatic hand-off leaves the page alone th
 const PROBE_MS = 6000; // the HLS probe's budget: a slow or failing playlist plays in AVPlay
 const AD_HOLD_MS = 120000; // after an ad was seen on a page, its content may start without a new click this long
 const ENDED_REPEAT_MS = 10 * 60 * 1000; // the stream that just ended on the TV is not handed over again by itself
-const AD_SHORT_S = 60; // a plain-URL clip shorter than this next to a same-size player is an ad
+const AD_SHORT_S = 60; // a plain-URL clip shorter than this in front of the page's player is an ad (automatic hand-off)
 // A link the site refuses for good (a one-time link the page's player already used): the TV would
 // only get the same answer.
 const GONE_STATUSES = new Set([401, 403, 404, 410]);
@@ -864,16 +864,20 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   // players are what usually loads from other sites. Ads (an IMA/VAST pre-roll in the player, an ad
   // server's clip) are never the page's video: while one plays in front, the video waits for it.
   const PAGE_MEDIA_SCRIPT = `({
-    videos: [...document.querySelectorAll('video')].map((v) => ({
-      src: v.currentSrc || v.src || '', area: v.clientWidth * v.clientHeight, playing: !v.paused,
-      duration: isFinite(v.duration) && v.duration > 0 ? v.duration : null, loop: !!v.loop,
-      ad: v.title === 'Advertisement' || !!v.closest('.ima-ad-container,.vjs-ad-playing,.vjs-ad-loading,.jw-flag-ads,.ad-showing') || !!(v.parentElement && v.parentElement.querySelector('iframe[src*="imasdk.googleapis.com"]')),
-    })),
+    videos: [...document.querySelectorAll('video')].map((v) => {
+      const r = v.getBoundingClientRect();
+      return {
+        src: v.currentSrc || v.src || '', area: v.clientWidth * v.clientHeight, playing: !v.paused,
+        rect: { x: r.left, y: r.top, w: r.width, h: r.height },
+        duration: isFinite(v.duration) && v.duration > 0 ? v.duration : null, loop: !!v.loop,
+        ad: v.title === 'Advertisement' || !!v.closest('.ima-ad-container,.vjs-ad-playing,.vjs-ad-loading,.jw-flag-ads,.ad-showing') || !!(v.parentElement && v.parentElement.querySelector('iframe[src*="imasdk.googleapis.com"]')),
+      };
+    }),
     frames: [...document.querySelectorAll('iframe')].map((f) => ({ src: f.src || '', area: f.clientWidth * f.clientHeight })),
-    view: innerWidth * innerHeight,
+    view: innerWidth * innerHeight, vw: innerWidth, vh: innerHeight,
   })`;
   const kindOfUrl = (url) => (/\.m3u8/i.test(url) ? 'hls' : /\.mpd/i.test(url) ? 'dash' : 'file');
-  async function pickMedia(explicit) {
+  async function pickMedia(explicit, { auto = false } = {}) {
     const feature = b();
     const media = feature.media?.() ?? [];
     const pageUrl = pageUrlNow();
@@ -888,10 +892,27 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const mse = Math.max(0, ...all.filter((v) => /^blob:/.test(v.src)).map((v) => v.area));
     const minArea = Math.max(mse, AUTO_MIN_AREA * (found?.view || 0));
     const plain = (v) => /^https?:/.test(v.src);
-    // Ad-like: marked as an ad by its player, from an ad server, a short plain clip over a player of
-    // the same size (a pre-roll), or a looping preview that is not playing.
+    const box = (v) => (v.rect && v.rect.w > 0 && v.rect.h > 0 ? v.rect : null);
+    // The share of v's box that o's box covers (0 when either is unknown).
+    const covers = (o, v) => {
+      const p = box(v), q = box(o);
+      if (!p || !q) return 0;
+      const w = Math.min(p.x + p.w, q.x + q.w) - Math.max(p.x, q.x);
+      const h = Math.min(p.y + p.h, q.y + q.h) - Math.max(p.y, q.y);
+      return w > 0 && h > 0 ? (w * h) / (p.w * p.h) : 0;
+    };
+    const vw = found?.vw, vh = found?.vh;
+    const onScreen = (o) => { const q = box(o); return !q || !(vw > 0 && vh > 0) || (q.x < vw && q.y < vh && q.x + q.w > 0 && q.y + q.h > 0); };
+    // The player a short clip plays in front of (a pre-roll its player does not mark): a video at
+    // least about its size that is the page's MSE player (blob:, on screen) or lies under the clip.
+    // Clips side by side in a feed or a news page are none of these.
+    const playerBehind = (v, o) => o !== v && o.area > 0 && o.area >= 0.9 * v.area
+      && ((/^blob:/.test(o.src) && onScreen(o)) || covers(o, v) >= 0.5);
+    // Ad-like: marked as an ad by its player, from an ad server, a looping preview that is not
+    // playing, or (for the automatic hand-off only: an explicit request is not second-guessed by
+    // sizes) a short plain clip in front of the page's player.
     const adLike = (v) => v.ad === true || isAdUrl(v.src)
-      || (plain(v) && typeof v.duration === 'number' && v.duration < AD_SHORT_S && all.some((o) => o !== v && o.area > 0 && o.area >= 0.9 * v.area))
+      || (auto && plain(v) && typeof v.duration === 'number' && v.duration < AD_SHORT_S && all.some((o) => playerBehind(v, o)))
       || (v.loop === true && !v.playing);
     if (all.some((v) => v.playing && adLike(v) && v.area > 0 && v.area >= minArea)) return { kind: 'ad' };
     const videos = all.filter((v) => plain(v) && !adLike(v) && v.area >= minArea).sort((x, y) => (y.playing - x.playing) || (y.area - x.area));
@@ -979,6 +1000,12 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     const pageUrl = pageUrlNow();
     try {
       return await serialHandOff(async () => {
+        // "Convert" for a video being converted, or one whose full conversion is on the TV: nothing
+        // further to try, and the ffmpeg job feeding the TV (or starting) is left alone.
+        if (convert && explicit === undefined && on && current?.pick && current.stage !== 'drm'
+          && (current.converting || (current.stage === 'encode' && videoActive()))) {
+          throw new LumenError('FAILED', current.converting ? 'The video is being prepared for the TV already' : 'This video is already converted for the TV');
+        }
         // "Convert" for the video on the TV (a black picture, a refusal): that video, not a new pick
         // from the page (which may have an ad or a dead link by now).
         if (convert && explicit === undefined && on && current?.pick && !current.converting
@@ -1043,7 +1070,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       // An explicit link's own t= wins over where the page's player is.
       return playOnYoutube(yt, { fromPage: onPage && !(explicit && yt.t), onPage }, ctx);
     }
-    const pick = await pickMedia(explicit);
+    const pick = await pickMedia(explicit, { auto: !!ctx.auto });
     if (pick?.kind === 'ad') throw adWait();
     // The stream that just played to its end on the TV, picked again by itself: the page is back on
     // an ad or its own end screen, not a new video.

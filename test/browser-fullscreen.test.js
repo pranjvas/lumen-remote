@@ -102,8 +102,10 @@ for (const maxHeight of [1080, 2160]) {
         { timeout: 10000, message: 'a frame of the TV viewport on the phone' });
       const feature = stack.server.features.browser;
       // The page's video starts by itself, well after the page was opened (nobody clicked it): it stays
-      // on the page, and a click on its Full button later is no reason to hand it to the TV.
-      await sleep(Math.max(0, opened + 10500 - Date.now()));
+      // on the page, and a click on its Full button later is no reason to hand it to the TV. The
+      // input window counts from the browser's own last input (opening the page, stamped once Edge
+      // has started), not from when the test asked.
+      await sleep(Math.max(0, Math.max(opened, feature.lastInputAt?.() ?? 0) + 10500 - Date.now()));
       await feature.evaluate('go().then(() => true)');
       await sleep(3200); // the automatic hand-off sees it playing
       const plays = () => agent.screen.filter((m) => m.t === 'screen-play').length;

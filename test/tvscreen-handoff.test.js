@@ -32,7 +32,7 @@ async function mediaServer() {
       if (path === '/ts.m3u8' || path === '/alt.m3u8' || path === '/m/low.m3u8' || path === '/m/aac.m3u8') return playlist(res, media(['#EXTINF:4,', 'seg.ts']));
       if (path === '/fmp4.m3u8' || path === '/m/video.m3u8' || path === '/m/audio.m3u8') return playlist(res, media(['#EXT-X-MAP:URI="init.mp4"', '#EXTINF:4,', 'seg.m4s']));
       if (path === '/slow.m3u8') { setTimeout(() => playlist(res, media(['#EXTINF:4,', 'seg.ts'])), 2000); return undefined; }
-      if (path === '/ts-master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64001E,mp4a.40.2"\nts.m3u8\n');
+      if (path === '/ts-master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"\nts.m3u8\n');
       if (path === '/m/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="en",URI="audio.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="a"\nvideo.m3u8\n');
       if (path === '/drm/master.m3u8') return playlist(res, '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia.m3u8\n');
       if (path === '/drm/media.m3u8') return playlist(res, media(['#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,AA=="', '#EXT-X-MAP:URI="init.mp4"', '#EXTINF:6,', 'seg.m4s']));
@@ -309,29 +309,66 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
     assert.equal(playMsgs().at(-1).engine, 'hls');
     await env.stopPlayer();
 
-    // A 20 s plain clip over a player of the same size: an ad, even for Video → TV.
-    page = env.page = fakePage();
-    setPage(up('/watch/short-ad'), 'Short ad');
-    page.videos = [
-      { src: up('/ad-preroll.mp4'), area: 1280 * 600, playing: true, duration: 20 },
-      { src: 'blob:http://127.0.0.1/player', area: 1280 * 600, playing: false },
-    ];
+    // The automatic hand-off: a short plain clip someone started, on a page of its own.
+    const started = (path, key, videos) => {
+      page = env.page = fakePage();
+      setPage(up(path), key);
+      page.videos = videos;
+      page.key = key;
+      page.playing = true;
+      page.lastInput = Date.now();
+    };
+    const full = { x: 0, y: 0, w: 1280, h: 600 };
+    // A 20 s plain clip in front of the page's paused MSE player (a pre-roll its player does not
+    // mark), or over a plain-URL video it covers: an ad, its video waits.
     const before = playMsgs().length;
-    const ack = await b.send('tvscreen.playVideo', {}, { timeout: 15000 });
-    assert.equal(ack.ok, false);
-    assert.match(ack.error.message, /An ad is playing/);
-    assert.equal(playMsgs().length, before);
-    assert.equal(page.pauses, 0);
-
-    // A standalone 30 s clip is the page's video.
-    page = env.page = fakePage();
-    setPage(up('/watch/clip'), 'Clip');
-    page.videos = [{ src: up('/clip30.mp4'), area: 1280 * 600, playing: true, duration: 30 }];
-    const prior = playMsgs().length;
-    ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
-    await env.played(prior);
-    assert.match(playMsgs().at(-1).url, /\/clip30\.mp4$/);
+    for (const [path, videos] of [
+      ['/watch/short-ad', [
+        { src: up('/ad-preroll.mp4'), area: 1280 * 600, rect: full, playing: true, duration: 20 },
+        { src: 'blob:http://127.0.0.1/player', area: 1280 * 600, rect: full, playing: false },
+      ]],
+      ['/watch/over', [
+        { src: up('/ad-over.mp4'), area: 1280 * 600, rect: full, playing: true, duration: 15 },
+        { src: up('/film.mp4'), area: 1280 * 600, rect: full, playing: false, duration: 5400 },
+      ]],
+    ]) {
+      const notices = toasts(/An ad is playing/).length;
+      started(path, path.slice(7), videos);
+      await waitFor(() => toasts(/An ad is playing/).length > notices, { timeout: 8000, message: `the short clip on ${path} taken for an ad` });
+      assert.equal(playMsgs().length, before, `${path}: the ad is not handed over`);
+      assert.equal(page.pauses, 0, `${path}: the ad plays on`);
+    }
+    // Two same-size clips of a news feed, one under the other: no ads; the one started goes over.
+    started('/news/feed', 'feed', [
+      { src: up('/clip45.mp4'), area: 1280 * 600, rect: { x: 0, y: 40, w: 1280, h: 600 }, playing: true, duration: 45 },
+      { src: up('/clip30.mp4?next'), area: 1280 * 600, rect: { x: 0, y: 680, w: 1280, h: 600 }, playing: false, duration: 30 },
+    ]);
+    await waitFor(() => playMsgs().length > before, { timeout: 8000, message: 'the feed\'s clip handed over' });
+    assert.match(playMsgs().at(-1).url, /\/clip45\.mp4$/);
     await env.stopPlayer();
+
+    // Video → TV is never second-guessed by sizes: a short clip in front of an MSE player, two
+    // same-size clips of a page (positions unknown), and a standalone 30 s clip all go over.
+    for (const [path, videos, expected] of [
+      ['/watch/short-clip', [
+        { src: up('/short20.mp4'), area: 1280 * 600, playing: true, duration: 20 },
+        { src: 'blob:http://127.0.0.1/player', area: 1280 * 600, playing: false },
+      ], /\/short20\.mp4$/],
+      ['/news/today', [
+        { src: up('/news45.mp4'), area: 1280 * 600, playing: true, duration: 45 },
+        { src: up('/news30.mp4'), area: 1280 * 600, playing: false, duration: 30 },
+      ], /\/news45\.mp4$/],
+      ['/watch/clip', [{ src: up('/clip30.mp4'), area: 1280 * 600, playing: true, duration: 30 }], /\/clip30\.mp4$/],
+    ]) {
+      page = env.page = fakePage();
+      setPage(up(path), 'Clip');
+      page.videos = videos;
+      const prior = playMsgs().length;
+      ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
+      await env.played(prior);
+      assert.match(playMsgs().at(-1).url, expected, path);
+      await env.stopPlayer();
+    }
   });
 
   test('DASH, and an ad server\'s clip beside it: the page\'s .mpd goes to the copy stage (the relay does not rewrite manifests)', async () => {
@@ -685,24 +722,28 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
   });
 
   test('the trackpad brings Lumen\'s page back over the YouTube app it opened, not over other apps, and not on a sync', async () => {
-    const setForeground = (value) => {
-      stack.mock.setForeground(value.id);
-      stack.server.store.set('app.foreground', value, { src: 'live', via: 'test', ttlMs: 60000 });
+    // The app in front as Lumen knows it: the REST adapter's (its poll overwrites a value set by hand
+    // in the store). The mock TV switches apps, and a REST read of the app publishes it at once.
+    const setForeground = async (app) => {
+      stack.mock.setForeground(app.id);
+      await stack.server.adapters.rest.getApp(app.id);
+      await waitFor(() => stack.server.store.get('app.foreground')?.v?.id === app.id, { timeout: 5000, message: `${app.name} in front` });
     };
     setPage('https://www.youtube.com/watch?v=jNQXAC9IVRw', 'Me at the zoo - YouTube');
     ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
     const n = env.agentLaunches();
-    setForeground({ id: '3201907018807', name: 'Netflix' });
+    await setForeground({ id: '3201907018807', name: 'Netflix' });
     ok(await b.send('browser.pointer', { dx: 0.01 }));
     await sleep(300);
     assert.equal(env.agentLaunches(), n, 'another app the user opened stays in front');
-    setForeground(YOUTUBE_APP);
+    await setForeground(YOUTUBE_APP);
     ok(await b.send('browser.pointer', {}));
     await sleep(300);
     assert.equal(env.agentLaunches(), n, 'a pointer sync changes nothing on the TV');
+    assert.equal(stack.server.store.get('app.foreground')?.v?.id, YOUTUBE_APP.id, 'YouTube still in front for the next move');
     ok(await b.send('browser.pointer', { dx: 0.01 }));
     await waitFor(() => env.agentLaunches() === n + 1, { timeout: 5000, message: 'Lumen\'s page launched in front' });
-    setForeground(YOUTUBE_APP);
+    await setForeground(YOUTUBE_APP);
     ok(await b.send('browser.pointer', { dx: 0.01 }));
     await sleep(300);
     assert.equal(env.agentLaunches(), n + 1, 'at most once every 5 s');
@@ -908,6 +949,61 @@ describe('tvscreen: the conversion beside the keys, conversion jobs and the play
     fromAgent({ t: 'screen-video', state: 'error', error: 'that failed as well' });
     await waitFor(() => env.stopped.includes(encode), { timeout: 3000, message: 'the last stage\'s job stopped' });
     fromAgent({ t: 'screen-video', state: 'stopped' });
+  });
+
+  test('Convert (Yellow, the AI\'s convert: true) on a fully converted video, or one being converted, changes nothing: its job keeps feeding the TV', async () => {
+    const notices = (re) => env.toasts(re).length;
+    // A video the TV refuses, then shows wrongly as a copy: the full conversion plays.
+    setPage(up('/watch/encoded'), 'Encoded');
+    page.videos = [bigVideo(up('/ts.m3u8?encoded'))];
+    const prior = playMsgs().length;
+    ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
+    await env.played(prior);
+    let n = env.converts.length;
+    fromAgent({ t: 'screen-video', state: 'error', error: 'AVPlay refused' });
+    await waitFor(() => env.converts.length === n + 1 && playMsgs().at(-1).fromStart, { timeout: 5000, message: 'the copy' });
+    n = env.converts.length;
+    agent.sendScreenInput({ key: 'convert' }); // the copy shows black: Yellow
+    await waitFor(() => env.converts.length === n + 1 && env.tc.opts.at(-1).copy === false, { timeout: 5000, message: 'the full conversion' });
+    const encode = `job${env.converts.length}`;
+    await waitFor(() => playMsgs().at(-1).url.includes(`/x/${encode}/`) && tvVideo() === 'loading', { timeout: 3000, message: 'the full conversion on the TV' });
+    fromAgent({ t: 'screen-video', state: 'playing' });
+    await waitFor(() => tvVideo() === 'playing', { timeout: 3000, message: 'the conversion playing' });
+
+    const plays = playMsgs().length;
+    const converts = env.converts.length;
+    const holds = env.holds.length;
+    const already = notices(/already converted/);
+    agent.sendScreenInput({ key: 'convert' }); // Yellow again (the agent's hint shows it on every video)
+    await waitFor(() => notices(/already converted/) > already, { timeout: 3000, message: 'the notice on the TV' });
+    const ack = await b.send('tvscreen.playVideo', { convert: true }, { timeout: 15000 });
+    assert.equal(ack.ok, false);
+    assert.match(ack.error.message, /already converted/);
+    await sleep(600); // past the job grace
+    assert.ok(!env.stopped.includes(encode), 'the job feeding the TV is not stopped');
+    assert.ok(!env.holds.slice(holds).some(([id, on]) => id === encode && on === false), 'and still held');
+    assert.equal(env.converts.length, converts, 'nothing converted again');
+    assert.equal(playMsgs().length, plays, 'nothing new sent to the TV');
+    assert.equal(tvVideo(), 'playing');
+    await env.stopPlayer();
+    await waitFor(() => env.stopped.includes(encode), { timeout: 3000, message: 'stopped after the grace' });
+
+    // Yellow while the copy is being made: the copy plays when ready, nothing starts again.
+    env.tc.delay = 1500;
+    try {
+      page = env.page = fakePage();
+      const job = await playThenFail('/ts.m3u8?busy', 'Busy');
+      const c = env.converts.length;
+      const busy = notices(/being prepared/);
+      agent.sendScreenInput({ key: 'convert' });
+      await waitFor(() => notices(/being prepared/) > busy, { timeout: 3000, message: 'the notice on the TV' });
+      await waitFor(() => playMsgs().at(-1).url.includes(`/x/${job}/`), { timeout: 5000, message: 'the copy on the TV' });
+      assert.equal(env.converts.length, c, 'one conversion');
+      assert.ok(!env.stopped.includes(job), 'its job kept');
+    } finally {
+      env.tc.delay = 0;
+    }
+    await env.stopPlayer();
   });
 
   test('a stream that broke mid-film is converted from where it was; a copy that had played is made again once before the full conversion', async () => {
