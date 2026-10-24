@@ -4,7 +4,7 @@
 
 html, body {
   margin: 0;
-  height: 100%;
+  height: var(--app-h, 100%);
   background: var(--void);
   color: var(--ink);
   font-family: var(--font-ui);
@@ -14,6 +14,8 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
+
+html { overflow: hidden; }
 
 body {
   overflow: hidden;
@@ -126,7 +128,7 @@ img { display: block; }
   position: relative;
   z-index: 1;
   display: grid;
-  height: 100dvh;
+  height: var(--app-h, 100dvh); /* --app-h: boot-theme.js, the Home Screen app on iOS */
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   grid-template-areas: "top" "banners" "main" "ask" "nav";
