@@ -8,6 +8,11 @@ const HOLD_MS = 500;
 const BEAT_MS = 400;
 const active = new Set();
 
+/** Whether a key is being pressed or held right now (a reload would cut a hold short). */
+export function pressing() {
+  return active.size > 0;
+}
+
 function endAll() {
   for (const p of [...active]) p.cancel();
 }
