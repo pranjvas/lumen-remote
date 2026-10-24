@@ -1285,17 +1285,21 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (cdp !== page && cdp !== mainPage && cdp !== browser) return;
     log.warn('the browser closed unexpectedly');
     const gen = lifeGen;
+    // An incognito session ends with its Edge: no relaunch, and its page is not brought back (on the
+    // normal profile that would write it into the history incognito keeps out).
+    const private_ = incognito;
     // A death during the relaunch itself keeps the page that relaunch was to bring back.
-    crashUrl = !stopped && !wiping ? mainUrl ?? crashUrl : null;
+    crashUrl = !stopped && !wiping && !private_ ? mainUrl ?? crashUrl : null;
     // Said at once: the sweep after it can take seconds on a busy PC, and 'ready' would be a lie.
     if (!stopped) {
-      if (sinks.size || watchers.size) setSession('starting');
+      if ((sinks.size || watchers.size) && !private_) setSession('starting');
       else setSession('error', 'The browser closed unexpectedly');
     }
     teardown()
       .then(() => {
         if (gen !== lifeGen) return; // closed or cleared meanwhile: that said what the session is
         if (stopped) { setSession('off'); return; }
+        if (private_) { setSession('error', 'The browser closed unexpectedly'); return; }
         if (crashUrl) publish('url', crashUrl); // the phone's Retry and the TV's notice name the page
         if (starting) return; // already starting again (ensureRunning)
         if (sinks.size || watchers.size) scheduleRelaunch();
@@ -2061,8 +2065,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     const dir = incognitoDir;
     incognito = false;
     incognitoDir = null;
-    mediaSeen = [];
-    mediaRequests.clear();
+    tracker.reset();
     lastSnapshot = null;
     titleFromPage = null;
     lastUserInput = 0;
