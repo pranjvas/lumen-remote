@@ -16,6 +16,7 @@ const skip = !fs.existsSync(EDGE) && `headless Edge is not installed at ${EDGE}`
 
 // The player: a video (a canvas stream) with a red bar along its right edge, a blue one along its
 // bottom and a green centre; its Full button sits top left. In full screen it fills the viewport.
+// Its video starts by itself (go()), long after the page was opened.
 const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>Player</title><style>
 html,body{margin:0;background:#fff}
 #player{position:relative;width:640px;height:360px;background:#000}
@@ -25,11 +26,12 @@ html,body{margin:0;background:#fff}
 #bt{position:absolute;left:0;bottom:0;width:100%;height:12%;background:#00f}
 #c{position:absolute;left:44%;top:44%;width:12%;height:12%;background:#0f0}
 #fs{position:absolute;left:10px;top:10px;width:120px;height:60px}
-</style></head><body><div id="player"><video id="v" muted autoplay playsinline></video><div id="r"></div><div id="bt"></div><div id="c"></div><button id="fs">Full</button></div>
+</style></head><body><div id="player"><video id="v" muted playsinline></video><div id="r"></div><div id="bt"></div><div id="c"></div><button id="fs">Full</button></div>
 <script>
 const cv = document.createElement('canvas'); cv.width = 320; cv.height = 180; const g = cv.getContext('2d'); let n = 0;
 (function draw() { n++; g.fillStyle = '#333'; g.fillRect(0, 0, 320, 180); g.fillStyle = '#ccc'; g.fillRect((n * 3) % 300, 80, 20, 20); requestAnimationFrame(draw); })();
-v.srcObject = cv.captureStream(30); v.play().catch(() => {});
+v.srcObject = cv.captureStream(30); window.go = () => v.play();
+fetch('/v.m3u8').catch(() => {}); // a stream the page loaded: a hand-off would have something to hand over
 fs.onclick = () => player.requestFullscreen().catch((e) => { window.fsError = String(e); });
 </script></body></html>`;
 
@@ -80,6 +82,7 @@ for (const maxHeight of [1080, 2160]) {
     });
 
     test('the phone keeps getting the whole page, at the size it had, while the player is full screen', async () => {
+      const opened = Date.now();
       const ack = await b.send('browser.openOnTv', { url: `http://127.0.0.1:${web.address().port}/` }, { timeout: 40000 });
       assert.equal(ack.ok, true, JSON.stringify(ack.error));
       await waitFor(() => agent.screen.find((m) => m.t === 'screen-live-offer'), { timeout: 5000, message: 'the live offer' });
@@ -98,6 +101,13 @@ for (const maxHeight of [1080, 2160]) {
       const before = await waitFor(() => phone.of('browser.frame').filter((f) => f.w * TV_VIEWPORT.h === f.h * TV_VIEWPORT.w).at(-1),
         { timeout: 10000, message: 'a frame of the TV viewport on the phone' });
       const feature = stack.server.features.browser;
+      // The page's video starts by itself, well after the page was opened (nobody clicked it): it stays
+      // on the page, and a click on its Full button later is no reason to hand it to the TV.
+      await sleep(Math.max(0, opened + 10500 - Date.now()));
+      await feature.evaluate('go().then(() => true)');
+      await sleep(3200); // the automatic hand-off sees it playing
+      const plays = () => agent.screen.filter((m) => m.t === 'screen-play').length;
+      assert.equal(plays(), 0);
 
       // Full, clicked where the phone shows it (frame pixels).
       const click = { kind: 'click', x: Math.round((70 * before.w) / TV_VIEWPORT.w), y: Math.round((40 * before.h) / TV_VIEWPORT.h), fw: before.w, fh: before.h, button: 'left' };
@@ -116,6 +126,7 @@ for (const maxHeight of [1080, 2160]) {
       assert.ok(is(bottom, [0, 0, 255]), `the bottom edge is blue: ${bottom}`);
       assert.ok(is(centre, [0, 255, 0]), `the centre is green: ${centre}`);
 
+      assert.equal(plays(), 0, 'the Full click handed nothing to the TV');
       await feature.evaluate('document.exitFullscreen().then(() => true)');
     });
   });
