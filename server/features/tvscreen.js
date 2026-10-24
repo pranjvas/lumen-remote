@@ -297,15 +297,20 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     while (store.get('conn.agent')?.v !== 'online' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 300));
   }
 
-  /** Shows Lumen's browser on the TV, optionally opening `url` first. */
-  async function open({ url } = {}) {
+  /**
+   * Shows Lumen's browser on the TV, optionally opening `url` first. restore: true when Lumen itself
+   * puts the page back (tools/restart.ps1 -KeepTvPage): that page, or the home page, is nobody's input,
+   * so a video it starts by itself is not handed to the TV's player (autoHandOff).
+   */
+  async function open({ url, restore = false } = {}) {
     await ensureAgent();
     const adapter = a();
     const feature = b();
-    if (url) await feature.open(url);
+    const userInput = restore !== true;
+    if (url) await feature.open(url, { userInput });
     else {
       await feature.ensureRunning();
-      if (!store.get('browser.url')?.v) await feature.nav('home');
+      if (!store.get('browser.url')?.v) await feature.nav('home', { userInput });
     }
     await adapter.request('screen', { on: true });
     if (appId && rest) await rest.launch(appId).catch((err) => log.debug('agent bring-to-front failed', { message: err.message }));

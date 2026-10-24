@@ -623,7 +623,11 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     muxer?.stop();
     muxer = createMuxer({ emit: onMuxed, fragmentMs: settings.fragmentMs });
     if (!captureTarget) {
-      const target = await (await fetch(`http://127.0.0.1:${dt.port}/json/new?http://127.0.0.1:${port}/capture?t=${token}`, { method: 'PUT' })).json();
+      // Through the browser feature: new tabs on this PC are refused unless it opened them itself.
+      const captureUrl = `http://127.0.0.1:${port}/capture?t=${token}`;
+      const target = feature.openOwnTab
+        ? await feature.openOwnTab(captureUrl)
+        : await (await fetch(`http://127.0.0.1:${dt.port}/json/new?${captureUrl}`, { method: 'PUT' })).json();
       captureTarget = { id: target.id, cdp: await connectCdp(target.webSocketDebuggerUrl), devPort: dt.port };
     }
     await waitForPage();

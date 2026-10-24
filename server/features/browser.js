@@ -170,13 +170,16 @@ export function validateUrl(input, { allowLoopback = false } = {}) {
 
 // This PC's own services (Lumen, the browser's DevTools port, anything bound to localhost) are off-limits:
 // the Lumen browser is reachable from every Lumen client, including phones on the LAN. isLoopbackHost
-// (util/addr.js) knows every spelling (trailing dots, IPv4 inside IPv6, integer forms). Subresources
-// are refused by Network.setBlockedURLs with the patterns below (URLs as Edge writes them); pages and
-// frames, which that does not stop (a link, a redirect, location.replace, an iframe), are paused by the
-// Fetch domain and refused there (guardDocuments).
+// (util/addr.js) knows every spelling (trailing dots, IPv4 inside IPv6, integer forms). The Fetch
+// domain, enabled on the browser target itself, pauses every document request of every tab, window
+// and frame (a link, a redirect, location.replace, an iframe, a pop-up, a link opened in a new tab)
+// and every request whose URL looks like this PC (the patterns below, URLs as Edge writes them), from
+// a tab's very first request on; guardRequest refuses this PC's. The page's Network.setBlockedURLs
+// refuses the same subresources (and WebSockets, which Fetch does not see).
 const LOOPBACK_PATTERNS = ['*://localhost*', '*://*.localhost*', '*://127.*', '*://[::1]*', '*://0.0.0.0*', '*://[::]*',
   '*://[::ffff:7f*', '*://[::7f*', '*://[::ffff:0:0]*', '*://[64:ff9b::7f*'];
-const DOCUMENT_PATTERNS = [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }];
+const GUARD_PATTERNS = [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
+  ...LOOPBACK_PATTERNS.map((urlPattern) => ({ urlPattern, requestStage: 'Request' }))];
 // Child targets of the page (cross-site iframes, workers) start paused until they are set up.
 const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
 
@@ -727,6 +730,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let popup = null; // { id, cdp } a sized pop-up the page opened (a sign-in window)
   const popupConnections = new WeakSet(); // every pop-up's CDP connection, shown now or before
   let mainTargetId = null;
+  const refusedTabs = new Set(); // tabs and windows closed for asking for a page on this PC (guardRequest)
+  const ownTabs = new Set(); // addresses of Lumen's own tabs on this PC (live video's capture page), let through
   // Default execution contexts of the page's frames: its own, in-process iframes, and cross-site
   // iframes attached as child sessions. `${sessionId}:${contextId}` → { sessionId, contextId, frameId }.
   const frameContexts = new Map();
@@ -1135,6 +1140,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (popupCdp) publish('popup', false);
     mainPage = null;
     mainTargetId = null;
+    refusedTabs.clear();
+    ownTabs.clear();
     child = null;
     browser = null;
     browserPid = null;
@@ -1168,7 +1175,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (popup || !devPort || !page) return;
     const owner = page;
     const pcdp = await connectCdp(`ws://127.0.0.1:${devPort}/devtools/page/${targetId}`);
-    if (page !== owner || popup) { pcdp.close(); return; }
+    // Closed meanwhile by guardRequest (it asked for a page on this PC): never shown.
+    if (page !== owner || popup || refusedTabs.has(targetId)) { pcdp.close(); return; }
     popup = { id: targetId, cdp: pcdp };
     popupConnections.add(pcdp);
     pcdp.onClose(() => onConnectionLost(pcdp));
@@ -1179,19 +1187,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       pcdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
     });
     pcdp.on('Inspector.targetCrashed', () => onPopupCrashed(pcdp));
-    // This PC's pages are refused in the pop-up as in the page. Its first address was asked for before
-    // Lumen could attach, so a pop-up that shows one is closed.
+    // This PC's pages are refused in the pop-up as everywhere (guardRequest, from its first request on),
+    // and a pop-up that asks for one is closed. Should one show such a page anyway, it is closed too.
     const onThisPc = (address) => !allowLoopback && isLoopbackHost(hostOf(address));
-    const refuse = () => {
-      log.info('a pop-up for a page on this PC was closed');
-      browser?.send('Target.closeTarget', { targetId }).catch(() => {});
-      if (popup?.cdp === pcdp) closePopup();
-    };
+    const refuse = () => closeTab(targetId, 'a pop-up for a page on this PC was closed');
     pcdp.on('Page.frameNavigated', ({ frame }) => { if (!frame.parentId && onThisPc(frame.url)) refuse(); });
-    if (!allowLoopback) guardDocuments(pcdp);
     if (onThisPc(url)) { refuse(); return; }
     try {
-      if (!allowLoopback) await pcdp.send('Fetch.enable', { patterns: DOCUMENT_PATTERNS });
       if (blockedPatterns.length) {
         await pcdp.send('Network.enable');
         await pcdp.send('Network.setBlockedURLs', { urls: blockedPatterns });
@@ -1340,14 +1342,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   // A child target of the page attached itself paused (AUTO_ATTACH): a cross-site iframe gets the
-  // page's Network watch (its streams), block list and document guard, its frames' contexts and the
-  // same auto-attach for frames nested in it; then, and every other kind (workers) at once, it runs.
+  // page's Network watch (its streams) and block list, its frames' contexts and the same auto-attach
+  // for frames nested in it; then, and every other kind (workers) at once, it runs. (This PC's pages
+  // are refused in it by the browser-wide guard, guardRequest.)
   async function attachChild(cdp, { sessionId, targetInfo }) {
     try {
       if (targetInfo?.type !== 'iframe') return;
       await cdp.send('Network.enable', {}, sessionId);
       if (blockedPatterns.length) await cdp.send('Network.setBlockedURLs', { urls: blockedPatterns }, sessionId);
-      if (!allowLoopback) await cdp.send('Fetch.enable', { patterns: DOCUMENT_PATTERNS }, sessionId);
       await cdp.send('Runtime.enable', {}, sessionId);
       await cdp.send('Target.setAutoAttach', AUTO_ATTACH, sessionId);
     } catch (err) {
@@ -1357,16 +1359,35 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     }
   }
 
-  // Pages and frames on this PC are refused as they are asked for (a link, a redirect hop, a script's
-  // location change, an iframe): Network.setBlockedURLs stops only subresources. Every document
-  // request of the connection (and of its child sessions) pauses here first.
-  function guardDocuments(cdp) {
-    cdp.on('Fetch.requestPaused', ({ requestId, request }, sessionId) => {
-      const refused = isLoopbackHost(hostOf(request?.url));
-      if (refused) log.info('refused a page on this PC');
-      cdp.send(refused ? 'Fetch.failRequest' : 'Fetch.continueRequest', refused ? { requestId, errorReason: 'BlockedByClient' } : { requestId }, sessionId)
-        .catch((err) => log.debug('a paused request could not go on', { message: err.message }));
-    });
+  // ---------- this PC's pages ----------
+
+  // A request paused by the browser-wide guard (GUARD_PATTERNS, Fetch on the browser target): every
+  // document of every tab, window and frame, and whatever looks like this PC, from a tab's first
+  // request on (a pop-up's or a new tab's included: Target.targetCreated tells of those before their
+  // address is known, so no check there could stop it). This PC's addresses are refused, the rest goes
+  // on; Lumen's own tabs (openOwnTab) are let through. A tab or window whose own page is refused (a
+  // pop-up, a link opened in a new tab) is closed; the page itself shows Edge's error page.
+  function guardRequest(conn, { requestId, request, frameId, resourceType }) {
+    const url = request?.url;
+    const refused = isLoopbackHost(hostOf(url)) && !(resourceType === 'Document' && ownTabs.has(url));
+    conn.send(refused ? 'Fetch.failRequest' : 'Fetch.continueRequest', refused ? { requestId, errorReason: 'BlockedByClient' } : { requestId })
+      .catch((err) => log.debug('a paused request could not go on', { message: err.message }));
+    if (!refused) return;
+    // A subresource (a capture tab's favicon, say) is no news.
+    if (resourceType !== 'Document') { log.debug('refused a request to this PC', { type: resourceType ?? null }); return; }
+    const refusedHere = () => log.info('refused a page on this PC');
+    if (!frameId || frameId === mainTargetId) { refusedHere(); return; }
+    // A tab's id is its main frame's: a document refused in a frame of that id is the tab's own page.
+    conn.send('Target.getTargetInfo', { targetId: frameId })
+      .then(({ targetInfo }) => (targetInfo?.type === 'page' ? closeTab(frameId, 'a pop-up or new tab for a page on this PC was closed') : refusedHere()), refusedHere);
+  }
+
+  function closeTab(targetId, why) {
+    if (refusedTabs.has(targetId)) return;
+    refusedTabs.add(targetId);
+    log.info(why);
+    browser?.send('Target.closeTarget', { targetId }).catch(() => {});
+    if (popup?.id === targetId) closePopup();
   }
 
   // The page's renderer crashed (the connection stays open, so nothing else notices): calls waiting
@@ -1485,6 +1506,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     } catch (err) {
       log.debug('browser process id unknown', { message: err.message });
     }
+    if (!allowLoopback) {
+      // This PC's pages, in every tab, window and frame from here on (guardRequest). Fail closed: no
+      // Edge without it.
+      conn.on('Fetch.requestPaused', (params, sessionId) => { if (!sessionId) guardRequest(conn, params); });
+      await conn.send('Fetch.enable', { patterns: GUARD_PATTERNS }).catch((err) => {
+        throw new LumenError('UNAVAILABLE', `The browser could not keep pages on this PC out: ${err.message}`);
+      });
+    }
     const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' })).json();
     mainTargetId = target.id;
     // Pop-ups the page opens (sized windows, see PAGE_SCRIPT) are shown while they last.
@@ -1545,7 +1574,6 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     onPage('Page.javascriptDialogOpening', ({ type }) => {
       cdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
     });
-    if (!allowLoopback) guardDocuments(cdp);
 
     await cdp.send('Inspector.enable').catch((err) => log.debug('crash reports unavailable', { message: err.message }));
     await cdp.send('Page.enable');
@@ -1569,7 +1597,6 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       }
     });
     if (blockedPatterns.length) await cdp.send('Network.setBlockedURLs', { urls: blockedPatterns });
-    if (!allowLoopback) await cdp.send('Fetch.enable', { patterns: DOCUMENT_PATTERNS });
     // Cross-site iframes are targets of their own: attached (paused until set up, see attachChild) so
     // their streams are seen, their videos can be checked and paused, and the blocks apply in them too.
     await cdp.send('Target.setAutoAttach', AUTO_ATTACH);
@@ -1672,8 +1699,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return { value: { url } };
   }
 
-  async function nav(action) {
-    lastUserInput = Date.now();
+  // userInput: false for Lumen's own Home (the TV's page put back after a restart), as for open.
+  async function nav(action, { userInput = true } = {}) {
+    if (userInput) lastUserInput = Date.now();
     // Back (or Home) while a pop-up is on show closes the pop-up, as its window's close button would.
     if (popup && (action === 'back' || action === 'home')) {
       const { id } = popup;
@@ -1681,7 +1709,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       closePopup();
       return {};
     }
-    if (action === 'home') return open(homeUrl);
+    if (action === 'home') return open(homeUrl, { userInput });
     const cdp = requireReady();
     switch (action) {
       case 'reload':
@@ -1992,6 +2020,20 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   /** DevTools details of the running browser for a capture tab, or null when it is not ready. */
   const devtools = () => (ready && devPort && mainTargetId ? { port: devPort, targetId: mainTargetId, ws: browser } : null);
 
+  /**
+   * Opens one of Lumen's own pages on this PC (live video's capture page, its address carrying a
+   * secret token) in a tab of its own, which the guard on this PC's pages lets through (guardRequest).
+   * → /json/new's target.
+   */
+  async function openOwnTab(url) {
+    if (!ready || !devPort) throw new LumenError('UNAVAILABLE', 'The browser is not open');
+    const href = new URL(url).href;
+    ownTabs.add(href);
+    const res = await fetch(`http://127.0.0.1:${devPort}/json/new?${href}`, { method: 'PUT' });
+    if (!res.ok) throw new LumenError('FAILED', `The browser did not open a tab (${res.status})`);
+    return res.json();
+  }
+
   /** Device scale of the TV's viewport (its CSS size stays 1280×720). */
   function setTvScale(scale) {
     const next = clamp(Number(scale) || 1, 1, 3);
@@ -2083,6 +2125,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     applyProxy,
     addSink,
     devtools,
+    openOwnTab,
     setTvScale,
     fitContents,
     setSparseFrames,
