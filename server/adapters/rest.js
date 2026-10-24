@@ -5,6 +5,7 @@ import http from 'node:http';
 import { createQueue } from '../util/queue.js';
 import { LumenError } from '../errors.js';
 import { APPS } from '../catalog/apps.js';
+import { discoverLanAddress } from '../lan.js';
 
 const DEVICE_PATH = '/api/v2/';
 const DEVICE_TIMEOUT_MS = 6000;
@@ -24,8 +25,18 @@ const TIZEN_BY_YEAR = { 2016: '2.4', 2017: '3.0', 2018: '4.0', 2019: '5.0', 2020
 
 const flag = (v) => (v === 'true' || v === '1' || v === true ? true : v === 'false' || v === '0' || v === false ? false : undefined);
 
+// Which machine Developer mode lets in, as a category: the TV's developerIP itself is never kept.
+// 'this-pc' when it is this PC's address towards the TV, 'none' when unset, 'other' otherwise.
+export function developerHost(developerIP, pcAddress) {
+  if (typeof developerIP !== 'string') return undefined;
+  const ip = developerIP.trim();
+  if (!ip || ip === '0.0.0.0') return 'none';
+  if (!pcAddress) return undefined;
+  return ip === pcAddress ? 'this-pc' : 'other';
+}
+
 // Keeps only display-safe fields: no ids, DUID/UDN, MACs, SSID or IP addresses.
-export function normaliseDevice(d = {}) {
+export function normaliseDevice(d = {}, { pcAddress } = {}) {
   const yy = /^(\d{2})_/.exec(d.model ?? '')?.[1];
   const year = yy ? `20${yy}` : undefined;
   const tizen = d.OS === 'Tizen' && TIZEN_BY_YEAR[year];
@@ -40,14 +51,22 @@ export function normaliseDevice(d = {}) {
     country: d.countryCode,
     networkType: d.networkType,
     developerMode: flag(d.developerMode),
+    developerHost: developerHost(d.developerIP, pcAddress),
     frameTV: flag(d.FrameTVSupport),
     year,
   };
 }
 
-export function createRest({ config, data, log: rootLog, store }) {
+export function createRest({ config, data, log: rootLog, store, lan }) {
   const log = rootLog.child('rest');
   const { host } = config.tv;
+  // This PC's address towards the TV (the TV-facing listener's, else the route the OS picks), for
+  // device.developerHost. Looked up once; a failed lookup is retried on the next read.
+  let pcAddress = null;
+  async function thisPc() {
+    if (!pcAddress) pcAddress = lan?.address ?? (await discoverLanAddress(host).catch(() => null));
+    return pcAddress;
+  }
   const port = config.tv.ports.rest;
   const t = config.timing;
   const queue = createQueue({ concurrency: 1, minGapMs: 50 });
@@ -156,12 +175,12 @@ export function createRest({ config, data, log: rootLog, store }) {
     }
   }
 
-  function publishDevice(raw) {
-    device = normaliseDevice(raw);
+  function publishDevice(raw, pc) {
+    device = normaliseDevice(raw, { pcAddress: pc });
     const ttlMs = Math.max(60000, 3 * deviceInterval());
     for (const [key, value] of Object.entries(device)) {
       if (value === undefined) continue;
-      const derived = key === 'platform' || key === 'year';
+      const derived = key === 'platform' || key === 'year' || key === 'developerHost';
       store.set(`device.${key}`, value, { src: derived ? 'derived' : 'live', via: 'rest:/api/v2/', ttlMs });
     }
     if (typeof raw.wifiMac === 'string' && MAC.test(raw.wifiMac) && raw.wifiMac !== wakeMac) {
@@ -181,7 +200,7 @@ export function createRest({ config, data, log: rootLog, store }) {
         const raw = JSON.parse(res.body)?.device ?? {};
         reachable = true;
         setPower(raw.PowerState === 'on' ? 'on' : 'standby');
-        publishDevice(raw);
+        publishDevice(raw, typeof raw.developerIP === 'string' ? await thisPc() : null);
       }
     } catch (err) {
       onDeviceError(err);

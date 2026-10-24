@@ -69,6 +69,14 @@ const DEFAULTS = {
   dmrFetchDelayMs: 0,           // how long the renderer stays TRANSITIONING before it fetches
   seekLockMs: 200,              // a Seek within this time of the previous one answers 701
   dialAllowed: true,            // this PC is on the TV's allowed-device list (DIAL POST 401 otherwise)
+  // Developer mode (server/ai/skills/developer-mode.md), modelled on Samsung's published screens:
+  appsPanel: null,              // the REST app id that opens Apps (e.g. 'org.volt.apps'); null → 404, like other system ids
+  developerMode: undefined,     // '1' | '0'; undefined → the device fixture ('1')
+  developerIP: undefined,       // undefined → the device fixture
+  devIpAutoAdvance: true,       // a Host PC IP box jumps to the next one after three digits
+  devDigitsOpenIme: false,      // digits on Apps land in a text field (the TV keyboard opens) instead of the code
+  model: undefined,             // REST device.model override, e.g. '24_PONTUSM_UHD' for a 2024 TV
+  language: undefined,          // REST device.Language override; 'ar_*' / 'he_*' lay the IP boxes out right to left
 };
 
 // Picture values are per input × picture mode. TV|Standard starts at the live readings.
@@ -200,6 +208,8 @@ export async function startMockTv(options = {}) {
   const later = (fn, ms) => { const t = setTimeout(() => { timers.delete(t); fn(); }, ms); timers.add(t); return t; };
 
   const apps = new Map([...fixtureJson('rest/apps.json'), ...EXTRA_APPS].map((a) => [a.id, { ...a }]));
+  if (opts.appsPanel) apps.set(opts.appsPanel, { id: opts.appsPanel, name: 'Apps', running: false, version: '1.0.0', visible: false });
+  const deviceFixture = fixtureJson('rest/device.json').device;
   const state = {
     power: opts.power,
     volume: LIVE.getTVStates.volume,
@@ -219,6 +229,13 @@ export async function startMockTv(options = {}) {
     pointer: [],       // { cmd, x?, y?, accepted }
     ime: { open: false, type: null, text: '', limit: 0 },
     touch: false,
+    // Developer mode: the saved setting (what REST reports), the box while it is open
+    // ({ on, ip: [4 strings], row 0 On/Off · 1 IP boxes · 2 OK/Cancel, col, fresh }), the notice after OK.
+    dev: {
+      mode: opts.developerMode ?? deviceFixture.developerMode,
+      ip: opts.developerIP ?? deviceFixture.developerIP,
+      dialog: null, notice: false, code: '', opened: 0, saved: 0, cancelled: 0,
+    },
     avtransport: {
       uri: '', metadata: '', state: 'NO_MEDIA_PRESENT', status: 'OK', positionS: 0, durationS: 0, playingSince: null,
       image: false, playLocked: false, lastSeekAt: 0, generation: 0, stoppedReason: '', stoppedReasonData: '',
@@ -260,7 +277,74 @@ export async function startMockTv(options = {}) {
   function setForeground(id) {
     for (const app of apps.values()) app.visible = app.id === id;
     if (id && apps.has(id)) apps.get(id).running = true;
+    if (id !== opts.appsPanel) Object.assign(state.dev, { dialog: null, notice: false, code: '' });
     changed('foreground', id);
+  }
+
+  // ---------- Developer mode box (Apps → 1 2 3 4 5) ----------
+  // Layout from Samsung's figures (2016–2024): [On] [Off] · four Host PC IP boxes · [OK] [Cancel];
+  // focus opens on On; Down from On lands on the third box (the nearest below it).
+  const ipParts = (ip) => { const p = String(ip ?? '').split('.'); return p.length === 4 ? p : ['0', '0', '0', '0']; };
+  function devKey(key) {
+    const dev = state.dev;
+    const digit = /^KEY_(\d)$/.exec(key)?.[1];
+    if (!opts.appsPanel) return;
+    if (state.ime.open) {
+      if (key === 'KEY_RETURN') mock.ime.end(); // Back closes the TV keyboard first
+      return;
+    }
+    if (dev.notice) {
+      if (key === 'KEY_RETURN' || key === 'KEY_ENTER') dev.notice = false;
+      return;
+    }
+    const d = dev.dialog;
+    if (!d) {
+      if (!apps.get(opts.appsPanel)?.visible) return;
+      if (key === 'KEY_RETURN') { setForeground(null); return; }
+      if (digit === undefined) { dev.code = ''; return; }
+      if (opts.devDigitsOpenIme) { mock.ime.start('text'); return; }
+      dev.code = (dev.code + digit).slice(-5);
+      if (dev.code === '12345') {
+        dev.code = '';
+        dev.opened++;
+        dev.dialog = { on: dev.mode === '1', ip: ipParts(dev.ip), row: 0, col: 0, fresh: true };
+        events.emit('devDialog', 'open');
+      }
+      return;
+    }
+    if (key === 'KEY_RETURN') { dev.dialog = null; dev.cancelled++; events.emit('devDialog', 'cancel'); return; }
+    if (d.row === 0) {
+      if (key === 'KEY_LEFT') d.col = 0;
+      else if (key === 'KEY_RIGHT') d.col = 1;
+      else if (key === 'KEY_ENTER') d.on = d.col === 0;
+      else if (key === 'KEY_DOWN') Object.assign(d, d.on ? { row: 1, col: d.col === 0 ? 2 : 3, fresh: true } : { row: 2 });
+    } else if (d.row === 1) {
+      if (key === 'KEY_LEFT' && d.col > 0) Object.assign(d, { col: d.col - 1, fresh: true });
+      else if (key === 'KEY_RIGHT' && d.col < 3) Object.assign(d, { col: d.col + 1, fresh: true });
+      else if (key === 'KEY_UP') Object.assign(d, { row: 0, col: d.col >= 2 ? 1 : 0 });
+      else if (key === 'KEY_DOWN') Object.assign(d, { row: 2, col: d.col <= 1 ? 0 : 1 });
+      else if (digit !== undefined) {
+        // The first digit after the focus arrives replaces the box; a box holds three digits.
+        d.ip[d.col] = d.fresh ? digit : d.ip[d.col].length < 3 ? d.ip[d.col] + digit : d.ip[d.col];
+        d.fresh = false;
+        if (d.ip[d.col].length === 3 && opts.devIpAutoAdvance && d.col < 3) Object.assign(d, { col: d.col + 1, fresh: true });
+      }
+    } else {
+      if (key === 'KEY_LEFT') d.col = 0;
+      else if (key === 'KEY_RIGHT') d.col = 1;
+      else if (key === 'KEY_UP') Object.assign(d, d.on ? { row: 1, col: d.col === 0 ? 0 : 3, fresh: true } : { row: 0 });
+      else if (key === 'KEY_ENTER') {
+        dev.dialog = null;
+        if (d.col === 1) { dev.cancelled++; events.emit('devDialog', 'cancel'); return; }
+        dev.mode = d.on ? '1' : '0';
+        // Right-to-left menus show the boxes in reverse, so the first box typed is the last part.
+        const parts = /^(ar|he|iw)([_-]|$)/i.test(opts.language ?? '') ? [...d.ip].reverse() : d.ip;
+        if (d.on) dev.ip = parts.map((p) => String(Number(p || 0))).join('.');
+        dev.saved++;
+        dev.notice = true;
+        events.emit('devDialog', 'saved');
+      }
+    }
   }
 
   // ---------- REST (8001) ----------
@@ -277,6 +361,10 @@ export async function startMockTv(options = {}) {
       const info = structuredClone(device);
       info.device.PowerState = state.power;
       info.device.wifiMac = opts.wifiMac;
+      info.device.developerMode = state.dev.mode;
+      info.device.developerIP = state.dev.ip;
+      if (opts.model) info.device.model = opts.model;
+      if (opts.language) info.device.Language = opts.language;
       info.uri = `http://${HOST}:${ports.rest}/api/v2/`;
       return json(res, 200, info);
     }
@@ -422,6 +510,7 @@ export async function startMockTv(options = {}) {
     else if (key === 'KEY_VOLDOWN') changeAudio({ volume: Math.max(0, state.volume - 1), mute: false });
     else if (key === 'KEY_MUTE') changeAudio({ mute: !state.mute });
     else if (key === 'KEY_POWER') later(() => setPower('standby'), 20);
+    if (cmd === 'Click') devKey(key);
   }
 
   // ---------- DMR (9197): SOAP + GENA ----------
@@ -938,6 +1027,7 @@ export async function startMockTv(options = {}) {
       Object.assign(av, { uri: '', metadata: '', state: 'NO_MEDIA_PRESENT', status: 'OK', positionS: 0, durationS: 0, playingSince: null, image: false, playLocked: false });
       if (state.ime.open) state.ime = { open: false, type: null, text: '', limit: 0 };
       state.touch = false;
+      Object.assign(state.dev, { dialog: null, notice: false, code: '' });
     }
     events.emit('power', next);
   }

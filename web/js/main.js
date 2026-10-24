@@ -55,6 +55,7 @@ mountInstallHint(ctx);
 const nav = mountNav($('#nav'), ctx);
 
 const ask = createAsk(ctx);
+ctx.ask = ask; // other views start Ask runs too (Settings → Enable developer mode)
 const bar = ask.composer();
 bar.form.id = 'askbar';
 $('#askbar-slot').replaceWith(bar.form);

@@ -10,6 +10,7 @@ import { badge } from '../ui/badge.js';
 import { openSheet } from '../ui/sheet.js';
 import { toast, whisper } from '../ui/toast.js';
 import { bytes, prettySource, stamp, titleCase } from '../ui/format.js';
+import { RESTART_STEP, devModeStatus, startDeveloperMode } from './devmode.js';
 
 const GROUPS = [
   { id: 'picture', title: 'Picture', short: 'Picture' },
@@ -588,6 +589,7 @@ function connectionRows(ctx, { watch, on, own }) {
       }
     });
     rows.push(row);
+    if (key === 'conn.agent') rows.push(developerModeRow(ctx, { watch, on }));
   }
 
   const aiText = h('span', { class: 'row-text' });
@@ -605,6 +607,39 @@ function connectionRows(ctx, { watch, on, own }) {
   paintAi();
   rows.push(aiRow);
   return rows;
+}
+
+// Developer mode (the TV agent and Lumen Eyes need it): its state from REST, and a button that has
+// Ask Lumen turn it on with the built-in developer-mode TV skill (views/devmode.js).
+function developerModeRow(ctx, { watch, on }) {
+  const text = h('span', { class: 'row-text' });
+  const actions = h('div', { class: 'row-actions' });
+  const sub = h('span', { class: 'row-note devmode-note' });
+  const row = rowShell({ key: 'device.developerMode', label: 'Developer mode', hint: 'Needed for the TV agent and Lumen Eyes', type: 'readonly' },
+    h('div', { class: 'conn-control' }, text, actions), { sub });
+  const button = h('button', { class: 'btn sm primary', type: 'button' });
+  button.addEventListener('click', () => {
+    if (startDeveloperMode(ctx, (msg) => window.confirm(msg))) {
+      toast(`Lumen is turning on Developer mode. Follow it in Ask. ${RESTART_STEP}`, { level: 'info', timeout: 12000 });
+    }
+  });
+  const paint = () => {
+    const status = devModeStatus((key) => ctx.state.value(key, null), {
+      tv: ctx.state.value('conn.tv', null), remote: ctx.state.value('conn.remote', null), ai: ctx.ai,
+    });
+    fill(text, statusDot(status.dot), status.text);
+    button.textContent = status.action || '';
+    button.disabled = !!status.blocked;
+    button.title = status.blocked || 'Ask Lumen opens Apps, enters 1 2 3 4 5 and sets this PC as Host PC IP. No TV agent needed.';
+    // device.* is re-published on every REST poll: move the button only when it appears or goes,
+    // so a click in progress is never lost.
+    if (actions.contains(button) !== !!status.action) fill(actions, ...(status.action ? [button] : []));
+    sub.textContent = status.action ? (status.blocked ? `${status.blocked}. ` : '') + `Lumen does it with the remote keys. ${RESTART_STEP}` : '';
+    sub.hidden = !status.action;
+  };
+  watch(['device.developerMode', 'device.developerHost', 'conn.tv', 'conn.remote'], paint);
+  on('ai-status', paint);
+  return row;
 }
 
 export function backendName(b) {
