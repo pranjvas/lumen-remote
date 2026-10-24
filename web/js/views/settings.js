@@ -19,7 +19,7 @@ const GROUPS = [
   { id: 'input', title: 'Input & Source', short: 'Input' },
   { id: 'general', title: 'General', short: 'General', note: 'This firmware has no API for these. Tell Lumen what the TV shows once, and it keeps track.' },
   { id: 'network', title: 'Network', short: 'Network', note: 'Read from the TV by the Lumen agent.' },
-  { id: 'bluetooth', title: 'Bluetooth', short: 'Bluetooth', note: 'Read by Lumen Eyes (the native helper app on the TV) when you open Settings. Pair or remove devices in the TV menu (Settings → Connection).' },
+  { id: 'bluetooth', title: 'Bluetooth', short: 'Bluetooth', note: 'Through Lumen Eyes (the native helper app on the TV): pair new headphones, speakers or controllers, and connect ones paired before. Remove devices in the TV menu.' },
   { id: 'device', title: 'Device', short: 'Device' },
   { id: 'connection', title: 'Connection', short: 'Connection' },
   { id: 'phone', title: 'This phone', short: 'Phone', note: 'Put Lumen, or just its browser, on your Home Screen: one tap opens it full screen, like an app.' },
@@ -719,21 +719,257 @@ function networkRows(ctx, scope) {
   ];
 }
 
+/* ---------- Bluetooth: paired devices (Connect / Disconnect) and pairing new ones (Eyes 0.4.0+) ---------- */
+
+const BT_KIND = { AudioVideo: 'Audio', Peripheral: 'Remote or input device', Phone: 'Phone', Computer: 'Computer', Wearable: 'Wearable', Toy: 'Toy', Health: 'Health', Imaging: 'Camera or printer' };
+const BT_MINOR = {
+  AudioVideoHeadphones: 'Headphones', AudioVideoWearableHeadset: 'Headset', AudioVideoHandsFree: 'Hands-free', AudioVideoLoudspeaker: 'Speaker',
+  AudioVideoPortableAudio: 'Portable speaker', AudioVideoHifiAudioDevice: 'Hi-fi audio', AudioVideoCarAudio: 'Car audio', AudioVideoSetTopBox: 'Set-top box',
+  AudioVideoVideoDisplayLoudspeaker: 'Display and speaker', PeripheralKeyBoard: 'Keyboard', PeripheralPointingDevice: 'Mouse',
+  PeripheralComboKeyboardPointingDevice: 'Keyboard and mouse', PeripheralGamePad: 'Game pad', PeripheralJoystick: 'Joystick', PeripheralRemoteControl: 'Remote control',
+};
+// Where the TV's own menu pairs devices (same as BT_MENU in server/adapters/eyes.js).
+export const BT_MENU = {
+  audio: 'Settings → Sound → Sound Output → Bluetooth Speaker List',
+  other: 'Settings → General → External Device Manager → Input Device Manager → Bluetooth Device List',
+};
+
+const btLabel = (d) => BT_MINOR[d.minor] || BT_KIND[d.kind] || null;
+const btName = (d) => d.name || `Unnamed device${d.address ? ` (${d.address.slice(-5)})` : ''}`;
+const btMenuKind = (d) => (!d || d.kind === 'AudioVideo' || !d.kind ? 'audio' : 'other');
+// The TV's own remote is a Bluetooth device too; Lumen never offers to disconnect it.
+const isTvRemote = (d) => (d.kind === 'Peripheral' && /RemoteControl/.test(d.minor || '')) || /\bremote\b|smart control/i.test(d.name || '');
+// Lumen connects audio (A2DP) and input (HID) devices; Eyes before 0.4.0 sends no address.
+const btLinkable = (d) => Boolean(d.address) && !isTvRemote(d) && !['Phone', 'Computer', 'Imaging'].includes(d.kind);
+
+function btIcon(d) {
+  const minor = d.minor || '';
+  if (d.kind === 'AudioVideo') return icon('music', 'sm');
+  if (/KeyBoard/.test(minor)) return icon('keyboard', 'sm');
+  if (/Pointing/.test(minor)) return icon('mouse', 'sm');
+  if (/Remote|GamePad|Joystick/.test(minor)) return icon('remote', 'sm');
+  return icon('bluetooth', 'sm');
+}
+
+// Signal from RSSI: three bars, lit by strength (Eyes reports dBm; 0 / null = unknown).
+function btSignal(rssi) {
+  if (!Number.isFinite(rssi)) return null;
+  const bars = rssi >= -60 ? 3 : rssi >= -75 ? 2 : 1;
+  const word = ['', 'Weak', 'Good', 'Strong'][bars];
+  return h('span', { class: `bt-signal s${bars}`, title: `${word} signal (${rssi} dBm)`, 'aria-label': `${word} signal` }, h('i'), h('i'), h('i'));
+}
+
 function bluetoothRows(ctx, scope) {
-  const KIND = { AudioVideo: 'Audio', Peripheral: 'Remote or input device', Phone: 'Phone', Computer: 'Computer', Wearable: 'Wearable', Toy: 'Toy', Health: 'Health', Imaging: 'Camera or printer' };
   const adapter = infoRow(ctx, scope, 'bluetooth.state', 'Bluetooth', 'The TV’s adapter', (b) => [statusDot(b.powered ? 'good' : 'off'),
     b.powered === false ? 'Off' : 'On', b.name ? h('span', { class: 'muted', text: ` · ${b.name}` }) : null]);
   const list = h('div', { class: 'bt-devices' });
   const devices = h('div', { class: 'row row-readonly' },
-    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Paired devices' }), h('span', { class: 'hint', text: 'Connected ones first' })),
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Paired devices' }), h('span', { class: 'hint', text: 'Connect one paired before, or disconnect it' })),
     h('div', { class: 'row-control' }, list), h('div', { class: 'row-badge' }, badge('bluetooth.state', { compact: true })));
-  scope.watch(['bluetooth.state'], () => {
+  const busy = new Set(); // addresses with a Connect / Disconnect in flight (the list is rebuilt on every refresh)
+
+  function paint() {
     const b = ctx.state.value('bluetooth.state', null);
     const items = (b?.devices ?? []).slice().sort((x, y) => (y.connected - x.connected) || x.name.localeCompare(y.name));
-    fill(list, ...(items.length ? items.map((d) => h('div', { class: 'bt-device' },
-      statusDot(d.connected ? 'good' : 'off'), h('span', { text: d.name }),
-      h('span', { class: 'muted', text: ` · ${d.connected ? 'Connected' : 'Paired'}${KIND[d.kind] ? ` · ${KIND[d.kind]}` : ''}` })))
-      : [h('span', { class: 'muted', text: b ? 'No paired devices' : '—' })]));
+    fill(list, ...(items.length ? items.map((d) => {
+      const label = btLabel(d);
+      let action = null;
+      if (btLinkable(d)) {
+        const connect = !d.connected;
+        action = h('button', { class: `btn sm${connect ? '' : ' ghost'}${busy.has(d.address) ? ' is-busy' : ''}`, type: 'button', text: connect ? 'Connect' : 'Disconnect', dataset: { address: d.address } });
+        action.addEventListener('click', () => link(d, connect, action));
+      }
+      return h('div', { class: 'bt-device' },
+        statusDot(d.connected ? 'good' : 'off'),
+        h('span', { class: 'bt-device-text' }, h('span', { text: d.name }),
+          h('span', { class: 'muted', text: ` · ${d.connected ? 'Connected' : 'Paired'}${label ? ` · ${label}` : ''}` })),
+        action);
+    }) : [h('span', { class: 'muted', text: b ? 'No paired devices' : '—' })]));
+  }
+
+  async function link(d, connect, btn) {
+    if (busy.has(d.address)) return;
+    busy.add(d.address);
+    btn.classList.add('is-busy');
+    if (connect) toast(`Connecting ${d.name}… turn it on and keep it near the TV`, { level: 'info', timeout: 5000 });
+    const ack = await ctx.cmd(connect ? 'bluetooth.connect' : 'bluetooth.disconnect', { address: d.address }, { el: btn, timeoutMs: connect ? 45000 : 30000, silent: true });
+    busy.delete(d.address);
+    paint();
+    if (ack.ok) toast(connect ? `Connected ${d.name}` : `Disconnected ${d.name} (still paired)`, { level: 'ok' });
+    else openBtTrouble(ctx, { title: `${connect ? 'Connect' : 'Disconnect'} ${d.name}`, error: ack.error, device: d, verb: connect ? 'connect' : 'disconnect' });
+  }
+
+  scope.watch(['bluetooth.state'], paint);
+
+  const pair = h('button', { class: 'btn sm primary', type: 'button' }, icon('plus'), 'Pair new device');
+  pair.addEventListener('click', () => openPairSheet(ctx));
+  const add = h('div', { class: 'row row-readonly bt-add' },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Add a device' }), h('span', { class: 'hint', text: 'Headphones, speakers, keyboards, game pads' })),
+    h('div', { class: 'row-control' }, pair), h('div', { class: 'row-badge' }));
+  return [adapter, devices, add];
+}
+
+// "Or finish on the TV": the TV's own Bluetooth list (menu key, then the path) or Ask Lumen, who can
+// do it by sight. Used by the pairing sheet and when a connect fails.
+function btFallback(ctx, { sheet, device = null, verb = 'pair' } = {}) {
+  const kind = btMenuKind(device);
+  const pathText = h('span', { text: BT_MENU[kind] });
+  const open = h('button', { class: 'btn sm', type: 'button' }, icon('tvmenu'), 'Open on the TV');
+  open.addEventListener('click', async () => {
+    open.classList.add('is-busy');
+    const ack = await ctx.cmd('bluetooth.openTv', { kind }, { el: open, timeoutMs: 15000 });
+    open.classList.remove('is-busy');
+    if (!ack.ok) return;
+    pathText.textContent = ack.value?.menuPath || BT_MENU[kind];
+    toast(`On the TV: ${pathText.textContent}`, { level: 'info', timeout: 9000 });
   });
-  return [adapter, devices];
+  const name = device ? `"${btName(device)}"` : null;
+  const request = verb === 'pair'
+    ? `Pair ${name ? `the Bluetooth device ${name}` : 'a new Bluetooth device'} with the TV and connect it. It is in pairing mode now.`
+    : `${verb === 'connect' ? 'Connect' : 'Disconnect'} the Bluetooth device ${name} on the TV.`;
+  const ask = h('button', { class: 'btn sm ghost', type: 'button' }, icon('spark'), 'Ask Lumen to do it');
+  ask.addEventListener('click', () => {
+    sheet?.close();
+    if (ctx.ask?.submit) ctx.ask.submit(request);
+    else ctx.navigate('ask');
+  });
+  return h('div', { class: 'bt-fallback' },
+    h('p', { class: 'bt-fallback-lead', text: verb === 'pair' ? 'Not listed, or the TV says no? Finish on the TV:' : 'Or do it on the TV:' }),
+    h('p', { class: 'menu-path' }, icon('tvmenu', 'sm'), pathText),
+    h('div', { class: 'bt-fallback-actions' }, open, ask));
+}
+
+// The server ends a refusal with "Finish on the TV: <menu path>"; the sheets show that path in their own block.
+const btReason = (error) => String(error?.message || 'The TV did not answer').replace(/\s*Finish on the TV:.*$/, '');
+
+function openBtTrouble(ctx, { title, error, device, verb }) {
+  openSheet({
+    title,
+    className: 'bt-sheet',
+    build(body, sheet) {
+      body.append(h('p', { class: 'bt-error', role: 'alert' }, icon('alert', 'sm'), h('span', { text: btReason(error) })),
+        btFallback(ctx, { sheet, device, verb }));
+    },
+  });
+}
+
+function openPairSheet(ctx) {
+  const unwatch = [];
+  const busy = new Set(); // addresses being paired or connected
+  const errors = new Map(); // address → message from the last attempt
+  let scanError = null;
+  let ticker = null;
+  openSheet({
+    title: 'Pair a new device',
+    className: 'bt-sheet',
+    build(body, sheet) {
+      const status = h('div', { class: 'bt-status', role: 'status' });
+      const list = h('div', { class: 'bt-found', role: 'list', 'aria-label': 'Devices found' });
+      const again = h('button', { class: 'btn sm', type: 'button', hidden: true }, icon('refresh'), 'Scan again');
+      again.addEventListener('click', () => scanNow());
+      body.append(
+        h('p', { class: 'sheet-lead', text: 'Put the device in pairing mode (usually: hold its power or Bluetooth button until a light flashes) and keep it near the TV.' }),
+        status, list, h('div', { class: 'sheet-actions' }, again),
+        h('div', { class: 'sheet-foot' }, btFallback(ctx, { sheet })));
+
+      // The last scan's results stay in bluetooth.scan; until this sheet's own scan starts they are not shown.
+      let staleId = null;
+      const record = () => {
+        const scan = ctx.state.value('bluetooth.scan', null);
+        return scan && scan.id === staleId ? null : scan;
+      };
+
+      const sorted = (scan) => (scan?.devices ?? []).slice()
+        .sort((a, b) => (Number(b.connected) - Number(a.connected)) || ((b.rssi ?? -127) - (a.rssi ?? -127)) || btName(a).localeCompare(btName(b)));
+
+      // The list is rebuilt only when the scan record changes (a device found, paired or connected); the
+      // once-a-second countdown repaints the status line alone, so it never swaps a button under a tap.
+      function paint() {
+        paintStatus();
+        fill(list, ...sorted(record()).map((d) => foundRow(d, sheet)));
+      }
+
+      function paintStatus() {
+        const scan = record();
+        const scanning = scan?.state === 'scanning';
+        again.hidden = scanning;
+        const devices = sorted(scan);
+        if (scanError) {
+          fill(status, icon('alert', 'sm'), h('span', { text: scanError }));
+        } else if (scanning) {
+          const left = Math.max(0, Math.round(((scan.until ?? Date.now()) - Date.now()) / 1000));
+          fill(status, h('span', { class: 'spinner', 'aria-hidden': 'true' }),
+            h('span', { text: devices.length ? `Found ${devices.length} · still looking…` : 'Looking for devices…' }),
+            left ? h('span', { class: 'mono muted', text: ` ${left} s` }) : null);
+        } else if (scan?.state === 'error') {
+          fill(status, icon('alert', 'sm'), h('span', { text: btReason(scan.error) }));
+        } else if (scan) {
+          fill(status, h('span', { text: devices.length ? `Found ${devices.length} device${devices.length === 1 ? '' : 's'}` : 'No devices found. Is it in pairing mode?' }));
+        } else fill(status, h('span', { class: 'spinner', 'aria-hidden': 'true' }), h('span', { text: 'Starting…' }));
+        status.classList.toggle('is-error', Boolean(scanError) || scan?.state === 'error');
+      }
+
+      function foundRow(d, sheetApi) {
+        const label = btLabel(d);
+        const state = !d.connected && d.paired ? 'Paired' : null; // "Connected" shows on the right
+        let action;
+        if (d.connected) action = h('span', { class: 'bt-done' }, icon('check', 'sm'), 'Connected');
+        else {
+          const verb = d.paired ? 'connect' : 'pair';
+          action = h('button', { class: `btn sm primary${busy.has(d.address) ? ' is-busy' : ''}`, type: 'button', text: d.paired ? 'Connect' : 'Pair', dataset: { address: d.address } });
+          action.addEventListener('click', () => act(d, verb, sheetApi));
+        }
+        const error = errors.get(d.address);
+        return h('div', { class: 'bt-found-row', role: 'listitem', dataset: { address: d.address } },
+          h('span', { class: 'bt-kind' }, btIcon(d)),
+          h('span', { class: 'bt-found-text' },
+            h('b', { text: btName(d) }),
+            h('small', { text: [label, state].filter(Boolean).join(' · ') || 'Bluetooth device' }),
+            error ? h('small', { class: 'bt-row-error', text: error }) : null),
+          btSignal(d.rssi), action);
+      }
+
+      async function act(d, verb, sheetApi) {
+        if (busy.has(d.address)) return;
+        busy.add(d.address);
+        errors.delete(d.address);
+        paint();
+        if (verb === 'pair') toast('Pairing… if the TV asks to confirm, choose OK on the TV', { level: 'info', timeout: 8000 });
+        const ack = await ctx.cmd(verb === 'pair' ? 'bluetooth.pair' : 'bluetooth.connect', { address: d.address }, { timeoutMs: verb === 'pair' ? 100000 : 45000, silent: true });
+        busy.delete(d.address);
+        if (ack.ok) {
+          const v = ack.value || {};
+          const name = v.name || btName(d);
+          if (verb === 'pair' && v.connected) toast(`Paired and connected ${name}`, { level: 'ok' });
+          else if (verb === 'pair') toast(v.connectError ? `Paired ${name}, not connected: ${v.connectError}` : `Paired ${name}`, { level: v.connectError ? 'warn' : 'ok', timeout: 6000 });
+          else toast(`Connected ${name}`, { level: 'ok' });
+          if (v.connectError) errors.set(d.address, v.connectError);
+        } else {
+          errors.set(d.address, btReason(ack.error));
+          toast(ack.error?.message || 'The TV did not answer', { level: 'error', timeout: 6000 });
+        }
+        if (sheetApi.el.isConnected) paint();
+      }
+
+      async function scanNow() {
+        scanError = null;
+        errors.clear();
+        const last = ctx.state.value('bluetooth.scan', null);
+        staleId = last && last.state !== 'scanning' ? last.id : null; // a scan still running is joined
+        paint();
+        const ack = await ctx.cmd('bluetooth.scan', { secs: 20 }, { timeoutMs: 50000, silent: true });
+        if (!ack.ok) scanError = btReason(ack.error);
+        if (sheet.el.isConnected) paint();
+      }
+
+      unwatch.push(ctx.state.watch(['bluetooth.scan'], paint, { immediate: false }));
+      ticker = setInterval(() => { if (record()?.state === 'scanning') paintStatus(); }, 1000);
+      scanNow();
+    },
+    onClose() {
+      clearInterval(ticker);
+      unwatch.forEach((dispose) => dispose());
+      if (ctx.state.value('bluetooth.scan', null)?.state === 'scanning') ctx.cmd('bluetooth.stopScan', {}, { silent: true });
+    },
+  });
 }

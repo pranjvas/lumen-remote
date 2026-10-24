@@ -145,7 +145,7 @@ Things to know:
 
 ## 4. Lumen Eyes (`companion/eyes`)
 
-A windowless Tizen .NET app that captures the screen (through `libdisplay-capture-api`), reads Bluetooth and reports memory. The agent launches it with the PC's address; it connects to `ws://<pc>:8791/eyes`.
+A windowless Tizen .NET app that captures the screen (through `libdisplay-capture-api`), reads Bluetooth, scans for, pairs, connects and disconnects Bluetooth devices (0.4.0+, `Tizen.Network.Bluetooth`, public `bluetooth` privilege) and reports memory. The agent launches it with the PC's address; it connects to `ws://<pc>:8791/eyes`.
 
 1. **Bump the version** in both `companion/eyes/tizen-manifest.xml` and `const string Version` in `companion/eyes/Program.cs`.
 2. **Build and sign.** This runs `dotnet build -c Release` (Tizen.NET.Sdk from NuGet), re-signs with the `Q95T` profile, and produces `companion/build/LumenEyes.tpk`:

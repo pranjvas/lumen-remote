@@ -671,6 +671,47 @@ const TOOLS = [
     },
   },
   {
+    name: 'bluetooth',
+    description: 'The TV\'s Bluetooth (headphones, speakers, keyboards, game pads), through Lumen Eyes on the TV. list: paired devices and which are connected. scan: look for nearby devices in pairing mode (about 15 s; ask the user to put the device in pairing mode first). pair: pair a device found by scan (audio and input devices are connected too). connect / disconnect: a paired device. Give the device by address or name. open_tv_menu: when the TV refuses (UNAVAILABLE), open the TV\'s own menu, then finish there by sight (look_at_screen) along the returned menuPath.',
+    inputSchema: object({
+      action: { type: 'string', enum: ['list', 'scan', 'pair', 'connect', 'disconnect', 'open_tv_menu'] },
+      device: { type: 'string', minLength: 1, maxLength: 60, description: 'Device address (AA:BB:CC:DD:EE:FF) or name, for pair, connect and disconnect' },
+      audio: { type: 'boolean', description: 'open_tv_menu: true for headphones and speakers (Sound Output list), false for input devices' },
+    }, ['action']),
+    async run({ action, device, audio = true }, { hub, store }) {
+      const shown = (d) => ({ name: d.name ?? 'Unnamed device', address: d.address, kind: d.kind ?? null, paired: d.paired ?? d.bonded ?? false, connected: d.connected === true });
+      if (action === 'list') {
+        const state = await send(hub, { cmd: 'bluetooth.refresh' });
+        const devices = (state?.devices ?? []).map(shown);
+        return { ok: true, powered: state?.powered ?? null, devices, summary: devices.length ? devices.map((d) => `${d.name}${d.connected ? ' (connected)' : ''}`).join(', ') : 'No paired devices' };
+      }
+      if (action === 'scan') {
+        const found = await send(hub, { cmd: 'bluetooth.scan', secs: 15 });
+        const devices = (found?.devices ?? []).map(shown);
+        return { ok: true, devices, summary: devices.length ? `Found ${devices.map((d) => d.name).join(', ')}` : 'No devices in pairing mode were found' };
+      }
+      if (action === 'open_tv_menu') {
+        const r = await send(hub, { cmd: 'bluetooth.openTv', kind: audio ? 'audio' : 'other' });
+        return { ok: true, method: r?.method, menuPath: r?.menuPath, summary: `TV menu opened; go to ${r?.menuPath}` };
+      }
+      if (!device) fail('device is required for this action');
+      let address = /^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$/.test(device) ? device.toUpperCase() : null;
+      if (!address) {
+        const pool = [...(valueOf(store, 'bluetooth.scan')?.devices ?? []), ...(valueOf(store, 'bluetooth.state')?.devices ?? [])];
+        const want = norm(device);
+        const match = pool.find((d) => d.address && norm(d.name) === want) ?? pool.find((d) => d.address && norm(d.name).includes(want));
+        if (!match) fail(`No Bluetooth device called "${device}" is known; run scan (new devices) or list (paired ones) first`);
+        address = match.address;
+      }
+      const r = await send(hub, { cmd: `bluetooth.${action}`, address });
+      const name = r?.name ?? device;
+      const summary = action === 'disconnect' ? `Disconnected ${name}`
+        : action === 'pair' ? `Paired ${name}${r?.connected ? ' and connected it' : r?.connectError ? ` (not connected: ${r.connectError})` : ''}`
+          : `Connected ${name}`;
+      return { ok: true, ...r, summary };
+    },
+  },
+  {
     name: 'open_netflix',
     description: 'Open a specific title in the Netflix app. Give the official title id (the number in netflix.com/title/<id>) or a netflix.com title link. Find the id with web search first; never guess it. To open Netflix without a title use launch_app.',
     inputSchema: object({
