@@ -326,11 +326,18 @@ export function parseMessage(buf) {
  * the nearest whole AAC frame of the video's shift (a silent frame or two filled in, or a frame or two
  * left out), so lip sync stays within half a frame (±10.7 ms) and never drifts. A fresh player (a
  * reset init) starts on the stream's own timeline again. The same skip sheds lag: a TV that reports
- * itself well behind skips to the next key frame instead of seeking.
+ * itself well behind skips ahead to a key frame instead of seeking.
  */
-const LAG_SHED_SEC = 1.5; // a TV this far behind on two reports in a row skips ahead ...
+const LAG_SHED_SEC = 1.2; // a TV this far behind on two reports in a row skips ahead (seen 24 Oct: the
+// start's burst left 1.3-1.5 s for good; shed once, the lag stays at 0.5-0.7 s) ...
 const LAG_CALM_SEC = 1; // ... until it reports less than this
-const SHED_GAP_MS = 1000; // at most one skip per key interval
+// One skip sheds the whole excess: it passes over key frames until this close to the live edge
+// (a key frame that comes early, a bitrate change's, would end it having shed almost nothing: seen
+// 24 Oct, a steady 2 s through a skip every report). At most this much at once.
+const LAG_TARGET_SEC = 0.8;
+const SHED_MAX_SEC = 3;
+// After a skip, the TV plays down its buffer: no other skip until it has reported on this one.
+const SHED_SETTLE_MS = 2500;
 const AAC_FRAME = 1024;
 
 export function createFanout({ requestKey, now = () => Date.now(), limitBytes = () => 512 * 1024 }) {
@@ -449,7 +456,7 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
 
   return {
     add(viewer) {
-      const state = { needKey: true, paused: false, sentInitGen: -1, initAt: null, drops: 0, sentBytes: 0, lagHigh: 0, shedAt: 0, sheds: 0 };
+      const state = { needKey: true, paused: false, sentInitGen: -1, initAt: null, drops: 0, sentBytes: 0, lagHigh: 0, shedUntil: 0, settleUntil: 0, sheds: 0 };
       freshTimeline(state);
       viewers.set(viewer, state);
       sendInit(viewer, state, true);
@@ -488,8 +495,9 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
         if (state.paused) continue;
         if (state.sentInitGen !== gen) { if (init) sendInit(viewer, state); continue; }
         // Skipping to the next key frame: after a drop one is asked for; shedding lag waits for the
-        // stream's own (the skip is what sheds the lag).
+        // stream's own, the first at or past the skip's end (the skip is what sheds the lag).
         if (state.needKey && !m.key) { if (!state.shedding) askKey(); continue; }
+        if (state.shedding && m.key && m.video && m.video.time < state.shedUntil) continue;
         const { msg, commit } = viewerCopy(m, state, offsetsOf);
         // A fragment that starts with a key frame may go over the limit once the link has drained a
         // little; anything else is skipped while the link is backed up, and the viewer restarts from
@@ -510,8 +518,9 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
       }
     },
     /**
-     * The TV's reported lag (s, every 2 s). Well behind on two reports in a row, the viewer skips to
-     * the next key frame (rebased: no hole), once per report, until it is back under a second.
+     * The TV's reported lag (s, every 2 s). Well behind on two reports in a row, the viewer skips
+     * ahead to the first key frame that brings it back to LAG_TARGET_SEC (rebased: no hole); then
+     * the TV plays its buffer down, and is judged again from its next reports.
      * → true when a skip was started.
      */
     noteLag(viewer, lag) {
@@ -520,11 +529,15 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
       if (lag < LAG_CALM_SEC) { state.lagHigh = 0; return false; }
       if (lag <= LAG_SHED_SEC) return false;
       state.lagHigh += 1;
-      if (state.lagHigh < 2 || state.needKey || state.vEnd === null || now() - state.shedAt < SHED_GAP_MS) return false;
+      if (state.lagHigh < 2 || state.needKey || state.vEnd === null || now() < state.settleUntil) return false;
+      const shedSec = Math.min(SHED_MAX_SEC, lag - LAG_TARGET_SEC);
       state.needKey = true;
       state.rebase = true;
       state.shedding = true;
-      state.shedAt = now();
+      // On the stream's timeline: from the end of what this viewer has.
+      state.shedUntil = state.vEnd - state.vShift + shedSec * VIDEO_TIMESCALE;
+      state.settleUntil = now() + shedSec * 1000 + SHED_SETTLE_MS;
+      state.lagHigh = 0;
       state.sheds += 1;
       return true;
     },
@@ -561,9 +574,10 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
  * runtimeError }) → { bitrate?, step?, cause? } (changes only), { resync: true } (start the viewer's
  * player over), or { exhausted: true } when no step is left. Starts at startIndex (never at a probe
  * step); a probe step above is tried once after probeAfter quiet seconds and dropped at its first
- * trouble (a TV that lags on its reports included). The TV's signals are judged over its last
- * reports, not per tick: a tick without a report neither clears them nor counts as quiet. A format
- * the TV refused, a failed probe and a failing encoder block their step for good; a step left for
+ * trouble (a TV that lags on its reports included: lag counts on a probe step only). The TV's signals
+ * are judged over its last reports, not per tick: a tick without a report neither clears them nor
+ * counts as quiet. A format the TV refused, a failed probe and a failing encoder block their step
+ * for good; a step left for
  * dropped frames, repeated player errors or a TV player that asks to start over again within two
  * minutes (stuck, never started, failed while playing) is held for ten minutes and then tried again.
  */
@@ -618,7 +632,11 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
       ticks += 1;
       let entry = null;
       if (tvFresh) {
-        const lagging = typeof lag === 'number' && lag > TV_LAG_TROUBLE_SEC;
+        // Lag alone is latency, not trouble: the PC sheds it (a skip to a key frame) and a lower step
+        // does not lower it (seen 24 Oct: a steady 2 s from the start's burst stepped 1080p30 down to
+        // frames, with the TV decoding every frame). On a probe step it is: a TV that falls behind on
+        // 60 fps or 4K cannot keep up with it.
+        const lagging = !!probing && typeof lag === 'number' && lag > TV_LAG_TROUBLE_SEC;
         entry = { stall: stalls > 0 || jumps > 0 || resyncs > 0 || lagging, decode: dropRatio > 0.1 };
         tvHist = [...tvHist, entry].slice(-3);
         troubleHist = [...troubleHist, entry.stall || entry.decode].slice(-4);
@@ -1082,6 +1100,10 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     if (change.exhausted) {
       const list = viewer ? [viewers.get(viewer)].filter(Boolean) : [...viewers.values()];
       for (const v of list) fallBack(v, exhaustedReason);
+      // The next viewer starts on a fresh controller: this one is at its last step with its trouble
+      // still counted, and would send that viewer back to frames at its first bad report (seen 24 Oct:
+      // twice within half a second of playing).
+      rechooseNext = true;
       return true;
     }
     if (change.resync && viewer) fanout.resync(viewer);
@@ -1105,6 +1127,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   function restartWatch(v) {
     v.since = Date.now();
     v.lastStatsAt = null;
+    v.lastMediaStatsAt = null;
     v.prevTv = null;
     v.lagRun = 0;
     v.stallHist = [];
@@ -1168,9 +1191,13 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
       // reporting is starved or frozen: the stream gets lighter, and then it goes back to frames.
       const quietMs = Date.now() - (v.lastStatsAt ?? sent.initAt + settings.statsGraceMs);
       if (quietMs > settings.statsGoneMs) { log.warn('the TV stopped reporting on the live video', { quietMs }); fallBack(v, 'the TV stopped reporting'); continue; }
+      // Until the TV's first report with video buffered since this init, its page is building its
+      // player (or taking a new size) and reads slowly: a backed-up link then is the start, not
+      // congestion (seen 24 Oct: 5 → 2 Mbit/s in 3 s; its player reports before it has any video).
+      const settled = v.lastMediaStatsAt != null && v.lastMediaStatsAt >= sent.initAt;
       const signals = {
-        drops: sent.drops,
-        queueSec: viewer.buffered ? viewer.buffered() / Math.max(1, rate.bitrate / 8) : 0,
+        drops: settled ? sent.drops : 0,
+        queueSec: settled && viewer.buffered ? viewer.buffered() / Math.max(1, rate.bitrate / 8) : 0,
         statsLate: quietMs > settings.statsLateMs,
         tvFresh: !!tv,
         stalls,
@@ -1242,7 +1269,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     // ladder again.
     if (rechoose && page) stopCapture();
     viewers.set(viewer, { tvStats: null, prevTv: null, refused: false, refusedIndex: null, runtimeError: false, resyncs: 0, lagRun: 0, stallHist: [],
-      onFallback: viewer.onFallback, onRestart: viewer.onRestart, since: Date.now(), lastStatsAt: null });
+      onFallback: viewer.onFallback, onRestart: viewer.onRestart, since: Date.now(), lastStatsAt: null, lastMediaStatsAt: null });
     fanout.add(viewer);
     statsTimer ??= setInterval(controlTick, settings.controlMs);
     ensureCapture().catch(startFailed);
@@ -1260,6 +1287,7 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
         if (!v) return;
         v.tvStats = stats;
         v.lastStatsAt = Date.now();
+        if (num(stats?.lag) !== null) v.lastMediaStatsAt = v.lastStatsAt;
         // Well behind: this viewer skips ahead to a key frame (no seek on the TV).
         if (fanout.noteLag(viewer, stats?.lag)) log.debug('the TV is behind on the live video; skipping ahead', { lag: stats.lag });
       },

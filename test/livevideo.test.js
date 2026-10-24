@@ -407,28 +407,45 @@ describe('fan-out', () => {
     assert.ok(Math.abs(audio - (video * 48000) / 90000) <= 512, `audio ${audio} vs video ${(video * 48000) / 90000} samples`);
   });
 
-  test('a TV that lags skips ahead to the stream’s next key frame, without a seam, until it is close again', () => {
+  test('a TV that lags skips ahead, in one skip and without a seam, to the key frame that brings it back to 0.8 s', () => {
     const { fan, viewer, init, frag, fragments, tagOf, keys } = setup();
     init();
     const v = viewer();
     fan.add(v);
     frag(0, true);
     frag(1, false);
-    assert.equal(fan.noteLag(v, 2), false, 'one report is not enough');
-    assert.equal(fan.noteLag(v, 2.2), true, 'two in a row: a skip');
+    assert.equal(fan.noteLag(v, 1.6), false, 'one report is not enough');
+    assert.equal(fan.noteLag(v, 1.7), true, 'two in a row: a skip of 0.9 s');
     const asked = keys();
-    frag(2, false);
-    frag(3, false);
-    assert.equal(keys(), asked, 'no key frame asked for: the stream’s own is waited for');
-    frag(4, true);
-    frag(5, false);
+    for (let i = 2; i <= 9; i++) frag(i, i === 4 || i === 8);
+    assert.equal(keys(), asked, 'no key frame asked for: the stream’s own are waited for');
     const got = fragments(v);
-    assert.deepEqual(got.map(tagOf), ['F0', 'F1', 'F4', 'F5']);
+    // F4's key frame comes 0.34 s on: too soon (a bitrate change's would end a skip having shed
+    // nothing). F8's, 1.02 s on, is the first past the 0.9 s.
+    assert.deepEqual(got.map(tagOf), ['F0', 'F1', 'F8', 'F9']);
     assert.deepEqual([seams(got)[VIDEO_TRACK].gaps, seams(got)[AUDIO_TRACK].gaps], [0, 0]);
-    assert.equal(fan.shifts(v).video, -2 * 15360, 'the lag shed: 341 ms');
+    assert.equal(fan.shifts(v).video, -6 * 15360, 'the lag shed: 1.02 s');
     assert.equal(fan.takeStats(v).drops, 0, 'not counted as a drop');
+    // The TV plays its buffer down: its next reports still say behind, and are not a second skip.
+    assert.equal(fan.noteLag(v, 1.9), false);
+    assert.equal(fan.noteLag(v, 1.8), false, 'still playing down its buffer');
     assert.equal(fan.noteLag(v, 0.8), false);
     assert.equal(fan.noteLag(v, 1.6), false, 'close again: two reports needed once more');
+  });
+
+  test('a TV far behind sheds at most 3 s in one skip', () => {
+    const { fan, viewer, init, frag, fragments, tagOf } = setup();
+    init();
+    const v = viewer();
+    fan.add(v);
+    frag(0, true);
+    fan.noteLag(v, 9);
+    assert.equal(fan.noteLag(v, 9), true);
+    // Key frames every 6 fragments (1.02 s): F18's (3.07 s) is short of 3 s on from F0's end
+    // (3.17 s); F24's is the first past it.
+    for (let i = 1; i <= 25; i++) frag(i, i % 6 === 0);
+    const got = fragments(v).map(tagOf);
+    assert.deepEqual(got.slice(0, 2), ['F0', 'F24'], `got ${got.join(' ')}`);
   });
 
   test('pause holds everything; resume restarts from a fresh init and a key frame', () => {
@@ -649,6 +666,16 @@ describe('rate control and the ladder', () => {
     for (let i = 0; i < 10 && rc.step.name === '1080p30'; i++) rc.tick({ drops: 1 });
     assert.equal(rc.step.name, '720p30');
     for (let i = 0; i < 120 && rc.step.name !== '1080p30'; i++) rc.tick({});
+    assert.equal(rc.step.name, '1080p30');
+  });
+
+  test('a steady lag on a plain step costs nothing: no bitrate cut, no step down (the PC sheds it)', () => {
+    // Seen 24 Oct: 2 s behind from the start's burst, every frame decoded, and still stepped from
+    // 1080p30 down to frames in 25 s.
+    const rc = createRateControl({ ladder: tv });
+    const changes = drive(rc, 120, () => ({ lag: 2.1 }));
+    assert.ok(!changes.some((c) => c.step !== undefined || c.exhausted), JSON.stringify(changes));
+    assert.ok(changes.length && changes.every((c, i) => c.bitrate > (i ? changes[i - 1].bitrate : tv[0].bitrate.start)), 'the bitrate only climbs');
     assert.equal(rc.step.name, '1080p30');
   });
 
@@ -970,6 +997,67 @@ describe('the feature (a fake browser, no Edge)', () => {
       assert.equal(logs.find((l) => l.msg === 'live video step').data.cause, 'error', 'held for a while, not blocked');
     } finally {
       tv.stop();
+      await live.stop();
+      edge.close();
+    }
+  });
+
+  test('a backed-up link before the TV’s first report is its player starting: no bitrate cut until it has reported', async () => {
+    const edge = await fakeBrowser();
+    const { live } = liveFeature(edge, { statsGraceMs: 3000, statsLateMs: 3000, statsGoneMs: 6000 });
+    const tv = fakeTv();
+    tv.silent = true; // building its player: no reports yet
+    tv.viewer.buffered = () => 10e6; // and reading slowly: the link looks backed up
+    try {
+      tv.handle = live.attach(tv.viewer, caps30);
+      await until(() => edge.page() && configsOf(edge.page()).length, 5000, 'the capture config');
+      const page = edge.page();
+      streamFrom(page);
+      await until(() => tv.got.some((m) => m.kind === 'media'), 5000, 'the stream');
+      const cuts = () => page.got.filter((m) => m.t === 'bitrate' && m.bitrate < 5e6); // 1080p30 starts at 5 Mbit/s
+      await sleep(600); // 6 control ticks
+      assert.deepEqual(cuts(), [], 'no cut while the TV has not reported');
+      tv.handle.report({ lag: null, dropped: 0, decoded: 0, stalls: 0, jumps: 0 }); // its player, with no video yet
+      await sleep(400);
+      assert.deepEqual(cuts(), [], 'nor after a report with nothing buffered');
+      tv.handle.report({ lag: 0.4, dropped: 0, decoded: 30, stalls: 0, jumps: 0 }); // its player is up
+      await until(() => cuts().length, 3000, 'a bitrate cut once the TV has reported');
+    } finally {
+      tv.stop();
+      await live.stop();
+      edge.close();
+    }
+  });
+
+  test('after the last step fails, the next viewer starts on a fresh controller, at 1080p30', async () => {
+    const edge = await fakeBrowser();
+    const { live } = liveFeature(edge);
+    const tv = fakeTv();
+    tv.silent = true; // reports below
+    const tv2 = fakeTv();
+    let timer = null;
+    try {
+      tv.handle = live.attach(tv.viewer, caps30);
+      await until(() => edge.page() && configsOf(edge.page()).length, 5000, 'the capture config');
+      const page = edge.page();
+      streamFrom(page);
+      await until(() => tv.got.some((m) => m.kind === 'media'), 5000, 'the stream');
+      // A TV that drops 40% of its frames whatever the step: 720p30, 540p30, then back to frames.
+      let decoded = 0;
+      let dropped = 0;
+      timer = setInterval(() => { decoded += 30; dropped += 20; tv.handle.report({ lag: 0.4, dropped, decoded, stalls: 0, jumps: 0 }); }, 200);
+      await until(() => tv.fallbacks.length, 8000, 'the fallback');
+      clearInterval(timer);
+      assert.deepEqual(tv.fallbacks, ['The TV could not play the live video']);
+      assert.deepEqual(configsOf(page).map((c) => c.height), [1080, 720, 540]);
+      tv.handle.detach();
+      tv2.handle = live.attach(tv2.viewer, caps30);
+      await until(() => edge.pages.length > 1 && configsOf(edge.page()).length, 5000, 'a new capture');
+      assert.equal(configsOf(edge.page())[0].height, 1080, 'at the top again, not at the step that failed');
+    } finally {
+      clearInterval(timer);
+      tv.stop();
+      tv2.stop();
       await live.stop();
       edge.close();
     }

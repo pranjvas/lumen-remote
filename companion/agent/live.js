@@ -1,8 +1,8 @@
 // Lumen Agent: live video of Lumen's browser. The PC captures its browser page with its sound,
 // encodes it (H.264 or HEVC + AAC) and sends fragmented MP4 over the agent socket: an init message
 // ('LVI') then media fragments ('LVM'), each tagged with a stream generation. This plays them through
-// MSE on a <video> under the pointer, kept near the live edge (small drift: a slightly faster rate;
-// larger lag is shed by the PC, which skips media and keeps the timeline seamless), trims old buffer,
+// MSE on a <video> under the pointer, at normal speed always (the PC sheds lag: it skips media and
+// keeps the timeline seamless), trims old buffer,
 // and reports to the PC every 2 s so it can adapt the bitrate and resolution. A player that gets
 // stuck, never starts or fails after it has played is never seeked: the PC starts it over (a new
 // MediaSource), and when that happens again soon it steps down for a while (not for good: none of
@@ -16,14 +16,9 @@
   // it would run dry between fragments and stall. This TV's decoder lands every seek on the key frame
   // before the target (a key frame comes every second), and a seek flushes the hardware pipeline,
   // which can get this page killed within seconds: so the player seeks once, at its start, onto a key
-  // frame it has seen arrive, and never again. Small drift is caught up by playing slightly faster.
-  const SOFT_LAG = 0.9; // above this the rate goes up a little
-  const CALM_LAG = 0.45; // back to normal speed below this
-  const CATCH_UP_LAG = 1.5; // the faster rate only below this: further behind, the PC sheds the lag
-  const CATCH_UP_RATE = 1.1;
-  // Each rate change makes this TV's hardware player hiccup; with the lag hovering at a threshold the
-  // rate flipped every 500 ms tick (seen 24 Oct: stalls, restarts and step-downs). At most one change per dwell.
-  const RATE_DWELL_MS = 4000;
+  // frame it has seen arrive, and never again. Its speed is never changed either: at 1.1x this TV drops
+  // frames, and the change back to 1x froze its picture for good (seen 24 Oct, DevTools: the clock
+  // stopped at once with 7 s buffered ahead, until the player was started over).
   const KEEP_BEHIND = 4; // seconds of played video kept in the buffer
   const TRIM_EVERY = 10; // control ticks (500 ms) between buffer trims: remove() is not cheap here
   const MAX_QUEUE_BYTES = 8 * 1024 * 1024; // appends waiting beyond this: start over from a key frame
@@ -66,7 +61,6 @@
   let moved = false; // the clock has moved since this player started
   let stuckSince = 0; // a stall began (the clock stopped with frames ahead)
   let seekingSince = 0;
-  let lastRateAt = 0;
   let farSince = 0;
   let outSince = 0;
   let askedAt = 0; // a fresh start was asked of the PC: nothing is judged until its init comes
@@ -276,12 +270,6 @@
     return null;
   }
 
-  function setRate(to, t, lag) {
-    lastRateAt = now();
-    el.playbackRate = to;
-    note('live-rate', { to: to, t: r2(t), lag: r2(lag) });
-  }
-
   // The player is stuck (its clock stopped with frames ahead, or a seek never finished). It is not
   // seeked: the PC starts it over from a key frame in a new MediaSource, every time (a stuck player
   // left alone is a frozen picture). The PC counts how often: again within two minutes, it steps
@@ -342,10 +330,6 @@
       return;
     }
     seekingSince = 0;
-    let rate = el.playbackRate;
-    if (lag > SOFT_LAG && lag < CATCH_UP_LAG) rate = CATCH_UP_RATE;
-    else if (lag < CALM_LAG || lag >= CATCH_UP_LAG) rate = 1;
-    if (rate !== el.playbackRate && now() - lastRateAt >= RATE_DWELL_MS) setRate(rate, t, lag);
     if (el.paused) el.play().catch(noop);
     if (t !== lastTime) {
       if (lastTime >= 0) {

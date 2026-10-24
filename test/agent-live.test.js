@@ -128,7 +128,7 @@ test('a full buffer drops the backlog and asks for a fresh start', async () => {
   assert.ok(!sent.some((m) => m.state === 'refused'));
 });
 
-test('playback starts on a key frame, catches up gently, and never seeks to catch up', async () => {
+test('playback starts on a key frame, never changes speed, and never seeks to catch up', async () => {
   const { live, sent, ms, ranges, video, tick, classes, clock, writes, notes, setTime } = setup();
   live.data(init(1));
   ms().open();
@@ -145,24 +145,19 @@ test('playback starts on a key frame, catches up gently, and never seeks to catc
   assert.equal(sent.find((m) => m.state === 'playing').w, 1920);
   clock.now += 500;
   setTime(5.5);
-  ranges[0][1] = 6.6; // 1.1 s behind: a little faster, no seek
+  ranges[0][1] = 6.6; // 1.1 s behind: no faster rate (this TV drops frames at 1.1x, and froze on the change back), no seek
   tick(500);
   assert.equal(video.currentTime, 5.5);
-  assert.ok(video.playbackRate > 1);
-  assert.deepEqual({ ...notes.filter((n) => n.kind === 'live-rate').at(-1).data }, { to: 1.1, t: 5.5, lag: 1.1 }, 'rate changes go to the black box');
+  assert.equal(video.playbackRate, 1);
   live.data(keyAt(1, 9.1));
   await flush();
-  clock.now += 500;
-  setTime(5.55);
-  ranges[0][1] = 9.7; // far behind half a second later: the rate stays (one change per dwell)
-  tick(500);
-  assert.ok(video.playbackRate > 1, 'no second rate change within the dwell');
   clock.now += 4000;
   setTime(5.6);
-  ranges[0][1] = 9.7; // 4.1 s behind: no seek (the PC sheds the lag), and back to normal speed
+  ranges[0][1] = 9.7; // 4.1 s behind: no seek either (the PC sheds the lag)
   tick(500);
   assert.equal(video.currentTime, 5.6);
   assert.equal(video.playbackRate, 1);
+  assert.ok(!notes.some((n) => n.kind === 'live-rate'), 'no rate change, ever');
   for (let i = 0; i < 18; i++) { clock.now += 500; setTime(video.currentTime + 0.5); ranges[0][1] += 0.5; tick(500); }
   assert.equal(writes.length, 1, 'no seek after the start, however long it lags');
   assert.ok(!sent.some((m) => m.state === 'resync' || m.state === 'refused'));
