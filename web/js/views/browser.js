@@ -825,11 +825,11 @@ export function mountBrowser(root, ctx) {
       if (!padLive()) return;
       if (nativeTv()) {
         if (nativeFrame) { cancelAnimationFrame(nativeFrame); flushNative(); }
-        // The click lands where the phone shows the pointer, whatever the TV pointer did.
+        // A tap clicks where the TV's pointer is, as the Mouse view does: moving it to the phone's
+        // estimate first made it jump to another spot on the TV before clicking.
         clearTimeout(nativeSync);
         alignRun += 1;
-        sendPointer({ x: ptr.x, y: ptr.y, action: 'click', button, native: true });
-        nativeSync = setTimeout(alignTv, 300);
+        ctx.cmd('pointer.click', { button: button === 'right' ? 'right' : 'left' });
         pad.classList.remove('is-tap');
         void pad.offsetWidth;
         pad.classList.add('is-tap');
