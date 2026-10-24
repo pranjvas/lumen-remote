@@ -44,7 +44,9 @@ export function ffmpegArgs({ input, headers = {}, proxyUrl = null, outDir, copyV
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-i', input,
     '-map', '0:v:0?', '-map', '0:a:0?',
-    ...(copyVideo ? ['-c:v', 'copy'] : ['-c:v', encoder, ...(encoder === 'libx264' ? ['-preset', 'veryfast', '-crf', '21'] : ['-b:v', '8M']),
+    // A copied H.264 stream gets a level that fits its size: sites label 1080p as level 3.0, which
+    // desktop decoders ignore but the TV's sizes itself by (sound, black picture).
+    ...(copyVideo ? ['-c:v', 'copy', '-bsf:v', 'h264_metadata=level=auto'] : ['-c:v', encoder, ...(encoder === 'libx264' ? ['-preset', 'veryfast', '-crf', '21'] : ['-b:v', '8M']),
       '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p', '-g', '96', '-sc_threshold', '0']),
     ...(copyAudio ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000']),
     '-f', 'hls', '-hls_time', '4', '-hls_list_size', '0', '-hls_playlist_type', 'event',
