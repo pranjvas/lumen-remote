@@ -136,6 +136,13 @@ export function createLogger({
   const fileMin = levelOf(level, LEVELS.info);
   const consoleMin = levelOf(consoleLevel, fileMin);
   const sink = dir ? createFileSink(dir, { maxBytes, keep }) : null;
+  // setFilter: every finished line (file and console alike; the console is stdout.log when Lumen runs
+  // hidden) passes through it last. Incognito uses it (features/incognito.js).
+  let filter = null;
+  const finish = (line) => {
+    if (!filter) return line;
+    try { return filter(line); } catch { return line.replace(/^(\S+ \S+\s+(?:\[[^\]]*\] )?).*$/, '$1[line dropped]'); }
+  };
 
   function write(lvl, tag, msg, obj) {
     const rank = LEVELS[lvl];
@@ -144,9 +151,9 @@ export function createLogger({
     if (!toFile && !toTerm) return;
     const now = new Date();
     const head = `${lvl.toUpperCase().padEnd(5)}${tag ? ` [${tag}]` : ''} ${redactString(msg instanceof Error ? msg.message : msg)}`;
-    if (toFile) sink.write(`${now.toISOString()} ${head}${formatExtra(obj, rank >= LEVELS.error)}\n`);
+    if (toFile) sink.write(`${finish(`${now.toISOString()} ${head}${formatExtra(obj, rank >= LEVELS.error)}`)}\n`);
     if (toTerm) {
-      const line = `${now.toTimeString().slice(0, 8)} ${head}${formatExtra(obj, false)}`;
+      const line = finish(`${now.toTimeString().slice(0, 8)} ${head}${formatExtra(obj, false)}`);
       (rank >= LEVELS.warn ? console.error : console.log)(line);
     }
   }
@@ -161,5 +168,11 @@ export function createLogger({
     };
   }
 
-  return { ...make(null), close: () => sink?.close(), reopen: () => sink?.reopen() };
+  return {
+    ...make(null),
+    close: () => sink?.close(),
+    reopen: () => sink?.reopen(),
+    /** fn(line) → the line to write, for every line of this logger and its children; null removes it. */
+    setFilter: (fn) => { filter = typeof fn === 'function' ? fn : null; },
+  };
 }

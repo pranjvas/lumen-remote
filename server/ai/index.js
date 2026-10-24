@@ -73,9 +73,13 @@ export function createAi({ config, data, log, store, hub, adapters, browser, lan
   } catch (err) {
     logger.warn('chat threads not restored', { error: err.message });
   }
+  // Exchanges made while the browser is incognito (they can quote its pages) stay in memory for the
+  // chat and are never written; they go when incognito ends (forgetPrivate).
+  const incognito = () => browser?.()?.incognito?.() === true;
   function saveThreads() {
     try {
-      data?.writeJson?.(THREADS_FILE, Object.fromEntries(threads));
+      const kept = [...threads].map(([id, entry]) => [id, { ...entry, turns: entry.turns.filter((turn) => !turn.private) }]);
+      data?.writeJson?.(THREADS_FILE, Object.fromEntries(kept.filter(([, entry]) => entry.turns.length)));
     } catch (err) {
       logger.warn('chat threads not saved', { error: err.message });
     }
@@ -151,6 +155,7 @@ export function createAi({ config, data, log, store, hub, adapters, browser, lan
     };
     const request = typeof text === 'string' ? text.trim() : '';
     let backendName = status().backend;
+    const privateRun = incognito();
 
     const finish = (outcome) => {
       if (outcome.ok) {
@@ -179,6 +184,7 @@ export function createAi({ config, data, log, store, hub, adapters, browser, lan
           user: clip(request, 500),
           did: toolDigest(outcome.tools),
           reply: clip(outcome.ok ? outcome.text || 'Done.' : `(failed) ${outcome.error?.message ?? ''}`, 800),
+          ...((privateRun || incognito()) && { private: true }),
         });
       }
       return { ok: outcome.ok, text: outcome.text, error: outcome.error };
@@ -217,6 +223,17 @@ export function createAi({ config, data, log, store, hub, adapters, browser, lan
     ask,
     cancel,
     forget: (thread) => { threads.delete(thread); saveThreads(); },
+    /** Incognito ended: the exchanges made during it are forgotten. → how many went. */
+    forgetPrivate() {
+      let count = 0;
+      for (const [id, entry] of [...threads]) {
+        const turns = entry.turns.filter((turn) => !turn.private);
+        count += entry.turns.length - turns.length;
+        if (!turns.length) threads.delete(id);
+        else entry.turns = turns;
+      }
+      return count;
+    },
     skills: toolContext.skills,
     status: settledStatus,
     mcpHandler: createMcpHandler({ getToken: mcpToken, toolContext, log: log.child('mcp') }),

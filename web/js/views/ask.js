@@ -109,7 +109,8 @@ export function createAsk(ctx) {
   function save() {
     chat.runs = chat.runs.slice(-MAX_RUNS);
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(chat));
+      // Requests made while the browser is incognito stay on screen but are never stored.
+      localStorage.setItem(STORE_KEY, JSON.stringify({ ...chat, runs: chat.runs.filter((run) => !run.private) }));
     } catch { /* storage full: the chat still works for this session */ }
   }
 
@@ -249,7 +250,7 @@ export function createAsk(ctx) {
     const clean = String(text || '').trim();
     if (!clean) return;
     ctx.navigate('ask');
-    const record = { id: makeId(), text: clean, at: Date.now(), steps: [], done: false };
+    const record = { id: makeId(), text: clean, at: Date.now(), steps: [], done: false, ...(ctx.state.value('browser.incognito', false) === true && { private: true }) };
     chat.runs.push(record);
     save();
     append(record);
