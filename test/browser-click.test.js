@@ -121,9 +121,18 @@ describe('browser clicks land on the element under the pointer', { skip }, () =>
   });
   after(async () => {
     clearInterval(keepAlive);
-    await stack?.stop();
     mainSrv?.close();
     frameSrv?.close();
+    try {
+      await stack?.stop();
+    } catch (err) {
+      // On a PC at full load Lumen's Edge can hold its profile (in the data dir) for longer than the
+      // helper's ~5 s of retries after it was told to exit: the server has stopped, only the temp dir is
+      // left, so it is removed a little later instead of failing the suite.
+      if (err.code !== 'EBUSY' && err.code !== 'EPERM') throw err;
+      await sleep(5000);
+      try { fs.rmSync(stack.dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); } catch { /* a leftover temp dir is harmless */ }
+    }
   });
 
   test('a click at frame coordinates clicks the button, the checkbox and the link', async () => {
