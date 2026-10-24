@@ -6,8 +6,14 @@
 // browser page (no Edge needed).
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import http from 'node:http';
-import { startStack, waitFor } from './helpers.js';
+import os from 'node:os';
+import nodePath from 'node:path';
+import { PassThrough } from 'node:stream';
+import { createTranscoder } from '../server/features/transcode.js';
+import { createTestLog, startStack, waitFor } from './helpers.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const AGENT_APP = 'lumenrmt01.LumenAgent';
@@ -328,6 +334,79 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
     ok(await b.send('browser.pointer', { dx: 0.01 }));
     await sleep(300);
     assert.equal(agentLaunches(), n + 1, 'at most once every 5 s');
+  });
+
+  test('a converted video paused on the TV outlives the reaper; once the player stops or the screen closes, it goes after the idle time', async () => {
+    // The real transcoder with a stand-in ffmpeg: a finished copy (ENDLIST), as a short film's copy is
+    // long before the film ends. A paused AVPlay fetches nothing, so only the hold keeps it.
+    const dataDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'lumen-hold-'));
+    const spawn = (file, args) => {
+      const child = new EventEmitter();
+      child.stderr = new PassThrough();
+      let gone = false;
+      child.kill = () => {
+        if (!gone) { gone = true; setTimeout(() => { child.stderr.end(); child.emit('exit', null, 'SIGKILL'); }, 5); }
+        return true;
+      };
+      const outDir = nodePath.dirname(args.at(-1));
+      setTimeout(() => {
+        fs.writeFileSync(nodePath.join(outDir, 'seg_00000.ts'), 'x');
+        fs.writeFileSync(nodePath.join(outDir, 'index.m3u8'), '#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg_00000.ts\n#EXT-X-ENDLIST\n');
+      }, 20);
+      return child;
+    };
+    const tc = createTranscoder({ config: { dataDir }, log: createTestLog(), seams: { ffmpeg: 'fake-ffmpeg', spawn, unusedMs: 150 } });
+    const fakeTc = stack.server.features.transcode;
+    stack.server.features.transcode = tc;
+    const source = up('/ts.m3u8?converted-held');
+    const jobOf = (url) => /\/relay\/x\/([0-9a-f]{16})\/index\.m3u8$/.exec(url)?.[1] ?? null;
+    try {
+      setPage(up('/watch/held'), 'A film');
+      page.videos = [bigVideo(source)];
+      ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
+      fromAgent({ t: 'screen-video', state: 'error', error: 'AVPlay refused' });
+      await waitFor(() => jobOf(playMsgs().at(-1).url), { timeout: 8000, what: 'the converted copy on the TV' });
+      const play = playMsgs().at(-1);
+      const id = jobOf(play.url);
+      assert.equal(play.fromStart, true);
+
+      // Paused on the TV for longer than the idle time: still there, and the TV gets its files back.
+      fromAgent({ t: 'screen-video', state: 'paused' });
+      await waitFor(() => tvVideo() === 'paused', { timeout: 3000, what: 'the player paused' });
+      await sleep(300);
+      tc.reap();
+      assert.equal(tc.existing(source)?.id, id, 'the paused video\'s job is held');
+      assert.equal((await fetch(play.url)).status, 200, 'resuming finds the playlist');
+
+      // Back on the TV: released, with the whole idle time to find it again (Yellow).
+      fromAgent({ t: 'screen-video', state: 'stopped' });
+      await waitFor(() => tvVideo() === 'stopped', { timeout: 3000, what: 'the player stopped' });
+      tc.reap();
+      assert.equal(tc.existing(source)?.id, id, 'a released job gets the idle time first');
+      const n = playMsgs().length;
+      ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
+      await waitFor(() => playMsgs().length > n, { timeout: 8000, what: 'the converted copy again' });
+      assert.equal(jobOf(playMsgs().at(-1).url), id, 'Yellow plays the same converted copy');
+      fromAgent({ t: 'screen-video', state: 'playing' });
+      await waitFor(() => tvVideo() === 'playing', { timeout: 3000, what: 'the player playing' });
+      await sleep(300);
+      tc.reap();
+      assert.equal(tc.existing(source)?.id, id, 'held again while it plays');
+
+      // The screen closed: released, then reaped after the idle time.
+      ok(await b.send('tvscreen.close', {}, { timeout: 10000 }));
+      tc.reap();
+      assert.equal(tc.existing(source)?.id, id);
+      await sleep(300);
+      tc.reap();
+      assert.equal(tc.existing(source), null, 'reaped once nothing holds it');
+      assert.equal((await fetch(play.url)).status, 404);
+    } finally {
+      stack.server.features.transcode = fakeTc;
+      await tc.stop();
+      fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      ok(await b.send('tvscreen.open', {}, { timeout: 15000 }));
+    }
   });
 
   test('the TV player\'s state is cleared on close and when the agent goes away: the next video goes over by itself', async () => {

@@ -410,7 +410,8 @@ export function createTranscoder({ config, log: rootLog, seams = {} }) {
     return fs.existsSync(p) ? p : null;
   }
 
-  /** The TV is playing job `id` (on) or no longer (off): a held job is never reaped. → false for an unknown job. */
+  /** The TV is playing job `id` (on) or no longer (off): a held job is never reaped. tvscreen holds
+   *  the converted video its player has in front (loading, playing, paused). → false for an unknown job. */
   function hold(id, on = true) {
     const job = jobs.get(id);
     if (!job) return false;

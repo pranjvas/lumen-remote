@@ -108,10 +108,26 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   let live = null; // { handle, playing, paused }
   let liveWanted = config.liveVideo?.enabled === true;
   let lastJpeg = null;
+  let heldJob = null; // the conversion job held for the TV's player (transcode hold())
 
   const setState = (value) => store.set('tvscreen.on', value, { src: 'derived', via: 'tvscreen' });
-  const setVideo = (value) => store.set('tvscreen.video', value, { src: 'derived', via: 'tvscreen' });
   const videoActive = () => TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v);
+  // The converted video the TV's player has in front (loading, playing, paused) is held, so the
+  // transcoder's reaper never takes it: a paused AVPlay on a finished playlist fetches nothing for
+  // as long as it stays paused. Released once the player stops, fails or goes, or the screen closes:
+  // the job then gets the reaper's whole idle time (Back then Yellow finds it again).
+  function syncHold() {
+    const want = (on && videoActive() && current?.job) || null;
+    if (want === heldJob) return;
+    const tc = transcoder();
+    if (heldJob) tc?.hold?.(heldJob, false);
+    if (want) tc?.hold?.(want, true);
+    heldJob = want;
+  }
+  const setVideo = (value) => {
+    store.set('tvscreen.video', value, { src: 'derived', via: 'tvscreen' });
+    syncHold();
+  };
   const cancelled = () => Object.assign(new LumenError('FAILED', 'The browser screen was closed'), { cancelled: true });
   // An automatic hand-off stops quietly once the screen was closed (or closed and opened again).
   const checkLive = (ctx) => { if (ctx?.auto && (ctx.gen !== generation || !on)) throw cancelled(); };
@@ -616,6 +632,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       return false;
     }
     if (current.job) tc.stopJob(current.job);
+    current.job = null;
     current.stage = next;
     toast(next === 'copy' ? 'Preparing the video for the TV…' : 'Converting the video for the TV…');
     try {
