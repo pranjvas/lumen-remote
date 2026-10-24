@@ -112,16 +112,17 @@ export function testConfig(mock, dataDir, overrides = {}) {
 
 /**
  * Starts the mock TV and the real server (`server/app.js`) wired to it.
- * `opts.mock` → mock options, `opts.config` → extra server overrides, `opts.seed` → makeDataDir options.
+ * `opts.mock` → mock options, `opts.config` → extra server overrides, `opts.seed` → makeDataDir options,
+ * `opts.seams` → startServer seams (e.g. { aiBackends } for a scripted Ask Lumen).
  */
-export async function startStack({ mock: mockOptions, config, seed } = {}) {
+export async function startStack({ mock: mockOptions, config, seed, seams } = {}) {
   const mock = await startMockTv(mockOptions);
   const data = makeDataDir({ remoteToken: mock.tokens.remote, ipcToken: mock.tokens.ipc, ...seed });
   const clients = [];
   let server;
   try {
     const { startServer } = await import('../server/app.js');
-    server = await startServer(testConfig(mock, data.dir, config));
+    server = await startServer(testConfig(mock, data.dir, config), seams);
   } catch (err) {
     await mock.stop();
     data.cleanup();

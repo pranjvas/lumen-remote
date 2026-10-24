@@ -322,7 +322,10 @@ export function createAsk(ctx) {
 
   // ---- app skills: what Lumen knows about each app (built in or learned by the AI) ----
 
-  const FLOW_LABEL = { open: 'Open', search: 'Search', type: 'Type', pickResult: 'Pick result', play: 'Play' };
+  const FLOW_LABEL = {
+    open: 'Open', search: 'Search', type: 'Type', pickResult: 'Pick result', play: 'Play',
+    code: 'Code', switchOn: 'Switch on', hostIp: 'Host PC IP', hostIpKeyboard: 'Host PC IP (keyboard)', confirm: 'OK', cancel: 'Back out',
+  };
   const skillsList = h('div', { class: 'skills-list' });
   const skillsCount = h('span', { class: 'skills-count' });
   const skillsPanel = h('details', { class: 'skills-panel' },
@@ -337,18 +340,22 @@ export function createAsk(ctx) {
     skillsCount.textContent = String(skills.length);
     fill(skillsList, ...skills.map((s) => h('button', { class: 'skill-card', type: 'button', onClick: () => showSkill(s.slug) },
       h('span', { class: 'skill-app', text: s.app }),
-      h('span', { class: `skill-source is-${s.source}`, text: s.source === 'learned' ? 'Learned' : 'Built in' }),
+      h('span', { class: `skill-source is-${s.source}`, text: s.source === 'learned' ? 'Learned' : s.scope === 'tv' ? 'TV · built in' : 'Built in' }),
       h('span', { class: 'skill-flows', text: s.flows.length ? s.flows.map((f) => FLOW_LABEL[f] || f).join(' · ') : 'Notes only' }),
       s.verified ? h('span', { class: 'skill-verified', text: `Verified ${s.verified}` }) : null)));
   }
 
   function describeStep(step) {
-    if (step.launch) return 'Open the app';
+    if (step.launch) return step.note ? `Open ${step.note}` : 'Open the app';
     if (step.wait !== undefined) return `Wait ${(step.wait / 1000).toFixed(1)} s`;
     if (step.keys) return `Press ${step.keys.map((k) => k.replace(/^KEY_/, '').toLowerCase()).join(', ')}`;
     if (step.ifColdStart) return `If the app was closed: ${step.ifColdStart.map(describeStep).join('; ')}`;
     if (step.typeGrid) return 'Type the title on the app\u2019s own keyboard';
+    if (step.typeText?.var === 'pcAddress') return 'Type this PC\u2019s address with the TV keyboard';
     if (step.typeText) return 'Type the title with the TV keyboard';
+    if (step.typeDigits) return 'Type this PC\u2019s address into the number boxes, one box at a time';
+    if (step.waitIme) return step.waitIme.open ? 'Check that the TV keyboard opened' : 'Check that no TV keyboard is open';
+    if (step.ifIme) return `If the TV keyboard is open: ${step.ifIme.map(describeStep).join('; ')}`;
     if (step.exitGrid) return 'Move from the keyboard to the results';
     if (step.look) return 'Look at the screen';
     return JSON.stringify(step);

@@ -649,6 +649,14 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       return { value: features.ai?.skills?.remove(slug) === true };
     },
 
+    // A fresh REST read of the TV (power, model year, language, Developer mode and whether its host
+    // is this PC); the same display-safe fields as device.* (never the developer IP itself).
+    'device.refresh': async () => {
+      const { value } = await call('rest', 'getDevice');
+      const { power, reachable, year, platform, modelName, language, developerMode, developerHost } = value ?? {};
+      return { value: { power, reachable, year, platform, modelName, language, developerMode, developerHost } };
+    },
+
     // Whether an app is running / visible (REST), for skills that behave differently on a cold start.
     'app.status': async ({ appId }) => {
       text(appId, 'appId', { max: 64, pattern: APP_ID });

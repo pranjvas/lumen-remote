@@ -9,6 +9,7 @@ import { createApiBackend } from './api-backend.js';
 import { createMcpHandler } from './mcp.js';
 import { createSkills } from './skills.js';
 import { createTitles } from '../features/titles.js';
+import { discoverLanAddress } from '../lan.js';
 
 const MAX_CONCURRENT = 2;
 const MAX_TEXT = 1000;
@@ -45,13 +46,16 @@ export function withHistory(turns, request) {
 }
 
 // backends: { api?, agentSdk? } replaces the real ones (tests).
-export function createAi({ config, data, log, store, hub, adapters, browser, backends }) {
+export function createAi({ config, data, log, store, hub, adapters, browser, lan, backends }) {
   const logger = log.child('ai');
   const toolContext = {
     hub, store, eyes: adapters?.eyes, browser: browser ?? (() => null),
     titles: createTitles({ log }),
     skills: createSkills({ dataDir: config.dataDir ?? data?.dir, log }),
     catalog: { settings: SETTINGS, keys: KEYS, apps: APPS, isAllowedKey },
+    // This PC's address towards the TV (Developer mode's Host PC IP): the TV-facing listener's
+    // address, else the route the OS picks for the TV (no packet is sent).
+    pcAddress: async () => lan?.address ?? (config.tv?.host ? await discoverLanAddress(config.tv.host) : null),
   };
   const api = backends?.api ?? createApiBackend({ config, log });
   const agentSdk = backends?.agentSdk ?? createAgentSdkBackend({ config, log, dataDir: config.dataDir ?? data.dir });

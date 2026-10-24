@@ -63,7 +63,7 @@ Tested on a Samsung **QA55Q95T** (2020, Tizen 5.5). Other Tizen TVs from 2016 on
 
 1. **Same network:** the TV and the PC on the same LAN. Give the TV a fixed address (DHCP reservation) if you can.
 2. **Find its address:** Settings → General → Network → Network status → IP settings.
-3. **Developer mode** (only for the TV agent and Lumen Eyes): open **Apps**, type `1 2 3 4 5` on the remote, turn **Developer mode** on, enter **this PC's IP** as the host, then restart the TV (hold power until it restarts).
+3. **Developer mode** (only for the TV agent and Lumen Eyes): open **Apps**, type `1 2 3 4 5` on the remote, turn **Developer mode** on, enter **this PC's IP** as the host, then restart the TV (hold power until it restarts). On 2024 and later TVs, type the code in Apps → **App Settings**. Once Lumen is running and paired, **Settings → Connection → Enable developer mode** does the keys for you through Ask Lumen (no TV agent needed); you still restart the TV.
 
 ### B2. Configure and start Lumen
 

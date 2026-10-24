@@ -3,7 +3,7 @@
 // checked semantically; actions go through hub.handle so the hub's safety rules and read-back
 // apply exactly as they do for a browser command.
 import { matchUrl, parseCastUrl } from '../features/cast.js';
-import { gridPath, runFlow } from './skills.js';
+import { RUNTIME_VARS, gridPath, runFlow } from './skills.js';
 
 // The synthetic hub client for AI-issued commands; acks go nowhere (handle() returns them).
 const AI_CLIENT = Object.freeze({ id: 'lumen-ai', ai: true, send() {} });
@@ -74,12 +74,14 @@ async function send(hub, cmd) {
 }
 
 // The TV-side actions a skill flow needs, through the same hub commands as the remote.
-function flowIo({ hub, eyes, signal, sleepFn = sleep }) {
+function flowIo({ hub, store, eyes, signal, sleepFn = sleep }) {
   return {
     key: (key) => send(hub, { cmd: 'key', key }),
     launch: (appId) => send(hub, { cmd: 'app.launch', appId }),
     isRunning: async (appId) => (await send(hub, { cmd: 'app.status', appId }))?.running === true,
     typeText: (text, submit) => send(hub, { cmd: 'text.send', text, submit }),
+    // The TV keyboard, as the remote channel reports it (ms.remote.imeStart / imeEnd).
+    imeOpen: () => store?.get?.('ime')?.v?.open === true,
     sleep: sleepFn,
     aborted: () => signal?.aborted === true,
     async look() {
@@ -248,6 +250,37 @@ function castSummary(session, fallback) {
     case 'page': return 'Opened in the TV browser';
     default: return fallback;
   }
+}
+
+// ---------- Developer mode (server/ai/skills/developer-mode.md) ----------
+
+const DEV_SKILL = 'developer-mode';
+// Arabic and Hebrew TVs show the Host PC IP boxes right to left (Moonlight-Tizen's install guide).
+const RTL_LANGUAGE = /^(ar|he|iw)([_-]|$)/i;
+const DEV_SETTLE_MS = 1500;
+export const DEV_RESTART_STEP = 'Restart the TV so it takes effect: hold the Power button on the TV remote for about 2 seconds until the TV turns off, wait a few seconds, then turn it on again. If Developer mode is still off after that, unplug the TV for 10 seconds and plug it back in.';
+const DIALOG_LOOK = 'a "Developer mode" box (Developer mode: On / Off buttons, Host PC IP in four boxes, OK / Cancel)';
+
+// A fresh REST read of the TV (hub device.refresh); {} when the TV did not answer.
+async function readDevice(hub) {
+  try {
+    return (await send(hub, { cmd: 'device.refresh' })) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+async function thisPcAddress(ctx) {
+  let address = null;
+  try {
+    address = await ctx.pcAddress?.();
+  } catch {
+    address = null;
+  }
+  if (typeof address !== 'string' || !RUNTIME_VARS.pcAddress.test(address)) {
+    fail('Lumen cannot tell this PC\'s address on the TV\'s network, so it cannot fill in Host PC IP', 'UNAVAILABLE');
+  }
+  return address;
 }
 
 // ---------- schema validation (the subset the definitions below use) ----------
@@ -510,6 +543,130 @@ const TOOLS = [
       return {
         ok: true, closed: names, freedMb: r?.freedMb ?? null, availableMb: r?.after?.availableMb ?? null,
         summary: names.length ? `Closed ${names.join(', ')}` : 'No apps were running in the background',
+      };
+    },
+  },
+  {
+    name: 'enable_developer_mode',
+    description: 'Turn on the TV\'s Developer mode with this PC as Host PC IP (the TV agent and Lumen Eyes need it), with the built-in developer-mode TV skill. It works without the TV agent or Lumen Eyes: a fixed key sequence over the remote channel, checked with what the TV reports itself (the app launch, the TV keyboard state, Developer mode over REST). It runs in two calls. The first opens Apps and enters 1 2 3 4 5; Lumen cannot see whether the Developer mode box appeared, so unless the result has a picture of the screen, ask the user one short question: is that box on the TV? If yes, call again with dialogOpen: true (Lumen switches it On, types this PC\'s address, presses OK and checks); if no, call with cancel: true. Each result\'s `next` says what to do; when the user must open Apps (or App Settings on 2024+ TVs) themselves, ask them to, then call with appsOpen: true. Afterwards always tell the user plainly to restart the TV (the result\'s `restart`). probe: true only opens the box and closes it with Back (nothing changes).',
+    inputSchema: object({
+      appsOpen: { type: 'boolean', description: 'The user has opened Apps (on 2024+ TVs: Apps, then App Settings at the bottom) on the TV, so Lumen does not open it' },
+      dialogOpen: { type: 'boolean', description: 'The Developer mode box is on the TV (the user said so, or you saw it): switch it On, enter this PC as Host PC IP, press OK' },
+      cancel: { type: 'boolean', description: 'Close the Developer mode box with Back without changing anything' },
+      probe: { type: 'boolean', description: 'Only check the path: open Apps, enter 1 2 3 4 5, then close the box with Back; nothing is changed' },
+      ipEntry: { type: 'string', enum: ['digits', 'keyboard'], description: 'How Host PC IP is typed: number keys into its four boxes (default; every documented model) or the TV keyboard (only if pressing OK on the field opens a keyboard)' },
+      force: { type: 'boolean', description: 'Run even though the TV already reports Developer mode on for this PC' },
+    }),
+    async run(args, ctx) {
+      const { hub, store, skills } = ctx;
+      const skill = skills?.get(DEV_SKILL);
+      if (!skill || skill.scope !== 'tv') fail('The developer-mode skill is missing', 'UNAVAILABLE');
+      if (valueOf(store, 'conn.tv') !== 'on') fail('The TV is off or not reachable; turn it on first', 'TV_OFF');
+      if (valueOf(store, 'conn.remote') !== 'paired') fail('The remote channel is not paired, so Lumen cannot press keys on the TV. Pair it first (Settings → Connection → Remote channel)', 'NOT_PAIRED');
+      const io = flowIo(ctx);
+      const state = {};
+      const steps = [];
+      const run = async (flow, vars) => {
+        const out = await runFlow(skill, flow, io, { vars }, state);
+        steps.push(...out.steps);
+        return out;
+      };
+      // A failed check inside the box: Back closes it without saving.
+      const stopped = async (err, what) => {
+        if (err?.code !== 'CHECK_FAILED') throw err;
+        try {
+          await run('cancel');
+        } catch {
+          // the report below still says what happened
+        }
+        return { ok: false, steps, error: { code: 'CHECK_FAILED', message: `${err.message}. Lumen pressed Back and stopped; ${what}` } };
+      };
+
+      if (args.cancel) {
+        await run('cancel');
+        return { ok: true, changed: false, steps, summary: 'Closed the Developer mode box with Back; nothing was changed.' };
+      }
+
+      const before = await readDevice(hub);
+
+      if (args.dialogOpen) {
+        const pc = await thisPcAddress(ctx);
+        // The four boxes run right to left in RTL menus; one text field takes the address as written.
+        const typed = args.ipEntry !== 'keyboard' && RTL_LANGUAGE.test(before.language ?? '') ? pc.split('.').reverse().join('.') : pc;
+        try {
+          await run('switchOn');
+          await run(args.ipEntry === 'keyboard' ? 'hostIpKeyboard' : 'hostIp', { pcAddress: typed });
+        } catch (err) {
+          return stopped(err, 'nothing was saved.');
+        }
+        await run('confirm');
+        await (ctx.sleepFn ?? sleep)(DEV_SETTLE_MS);
+        const after = await readDevice(hub);
+        const confirmed = after.developerMode === true && after.developerHost === 'this-pc';
+        const wrongHost = after.developerMode === true && after.developerHost === 'other' && before.developerHost !== 'other';
+        return {
+          ok: true, changed: true, pcAddress: pc, confirmedByTv: confirmed, needsRestart: true, restart: DEV_RESTART_STEP, steps,
+          next: 'Tell the user plainly what changed and how to restart the TV (the restart text), in your own short words.',
+          ...(wrongHost && { warning: 'The TV reports a Host PC IP that is not this PC: the boxes may not have taken the digits. Check the box on the TV before restarting.' }),
+          summary: `${confirmed
+            ? `Developer mode is set On with this PC (${pc}) as Host PC IP; the TV confirms it.`
+            : `Lumen switched Developer mode On, entered this PC (${pc}) as Host PC IP and pressed OK. The TV only reports it after a restart.`} ${DEV_RESTART_STEP}`,
+        };
+      }
+
+      if (!args.probe && !args.force && before.developerMode === true && before.developerHost === 'this-pc') {
+        return { ok: true, already: true, changed: false, steps, summary: 'Developer mode is already on with this PC as Host PC IP. Nothing was changed.' };
+      }
+      // `summary` is for the user (it shows in Ask); `next` tells the model what to do.
+      const OPEN_APPS_NEXT = 'Ask the user to press Home on the TV remote and select Apps, and to tell you when Apps is open; then call enable_developer_mode with appsOpen: true.';
+      const year = Number(before.year) || null;
+      if (!args.appsOpen && year >= 2024) {
+        return {
+          ok: true, changed: false, needsUser: 'openAppSettings', steps,
+          summary: `On ${year} TVs the code goes into Apps → App Settings, which Lumen cannot reach without seeing the screen. Open Apps on the TV, scroll to the bottom and select App Settings.`,
+          next: 'Ask the user to open Apps → App Settings on the TV and to tell you when it is open; then call enable_developer_mode with appsOpen: true.',
+        };
+      }
+      if (!args.appsOpen) {
+        const front = foregroundApp(store)?.id;
+        try {
+          await run('open');
+        } catch (err) {
+          if (!['UNAVAILABLE', 'NOT_FOUND', 'FAILED'].includes(err?.code)) throw err;
+          return {
+            ok: true, changed: false, needsUser: 'openApps', steps, next: OPEN_APPS_NEXT,
+            summary: `This TV did not open Apps for Lumen (${err.message}). Open Apps on the TV: press Home, then select Apps.`,
+          };
+        }
+        if (front && front !== state.launched?.id) {
+          const still = await send(hub, { cmd: 'app.status', appId: front }).catch(() => null);
+          if (still?.visible === true) {
+            return {
+              ok: true, changed: false, needsUser: 'openApps', steps, next: OPEN_APPS_NEXT,
+              summary: `Apps did not come to the front (${foregroundApp(store)?.name ?? 'an app'} is still on screen), so Lumen did not type the code. Open Apps on the TV: press Home, then select Apps.`,
+            };
+          }
+        }
+      }
+      try {
+        await run('code');
+      } catch (err) {
+        return stopped(err, 'nothing was changed.');
+      }
+      const image = await io.look(); // only with Lumen Eyes; never needed
+      if (args.probe) {
+        await run('cancel');
+        return {
+          ok: true, changed: false, probe: true, steps, ...(image && { image }),
+          summary: `Opened Apps, entered 1 2 3 4 5, then pressed Back. ${DIALOG_LOOK[0].toUpperCase()}${DIALOG_LOOK.slice(1)} should have shown and closed again; nothing was changed.`,
+        };
+      }
+      return {
+        ok: true, changed: false, stage: 'dialog', needsUser: image ? null : 'confirmDialog', steps, ...(image && { image }),
+        summary: 'Opened Apps and entered 1 2 3 4 5. The Developer mode box should be on the TV now.',
+        next: image
+          ? `Check the picture for ${DIALOG_LOOK}. If it is there, call enable_developer_mode with dialogOpen: true; if not, call it with cancel: true.`
+          : `Lumen cannot see the screen. Ask the user one short question: is ${DIALOG_LOOK} on the TV now? If yes, call enable_developer_mode with dialogOpen: true; if not, call it with cancel: true.`,
       };
     },
   },
@@ -907,7 +1064,11 @@ const TOOLS = [
       if (!app) return { ok: true, skills: skills.list(), summary: `${skills.list().length} app skills` };
       const skill = skills.get(app);
       if (!skill) return { ok: true, found: false, summary: `No skill for ${app} yet; work by sight and save one with save_app_skill` };
-      return { ok: true, found: true, skill: { slug: skill.slug, app: skill.app, appIds: skill.appIds, summary: skill.summary, notes: skill.notes, flows: skill.flows, source: skill.source, updated: skill.updated }, summary: `${skill.app} skill (${Object.keys(skill.flows).join(', ') || 'notes only'})` };
+      return {
+        ok: true, found: true,
+        skill: { slug: skill.slug, app: skill.app, scope: skill.scope, ...(skill.runWith && { runWith: skill.runWith }), appIds: skill.appIds, summary: skill.summary, notes: skill.notes, flows: skill.flows, source: skill.source, updated: skill.updated },
+        summary: `${skill.app} ${skill.scope === 'tv' ? 'TV ' : ''}skill (${Object.keys(skill.flows).join(', ') || 'notes only'})${skill.runWith ? `; run it with ${skill.runWith}` : ''}`,
+      };
     },
   },
   {
@@ -923,6 +1084,7 @@ const TOOLS = [
       if (!skills) fail('Skills are not available', 'UNAVAILABLE');
       const skill = skills.get(app);
       if (!skill) fail(`No skill for ${app}`, 'NOT_FOUND');
+      if (skill.scope === 'tv') fail(`${skill.app} is a TV skill; run it with ${skill.runWith ?? 'its own tool'}`, 'INVALID');
       if (!skill.flows[flow]) fail(`${skill.app} has no "${flow}" flow (it has ${Object.keys(skill.flows).join(', ') || 'none'})`, 'NOT_FOUND');
       const io = flowIo(ctx);
       const out = await runFlow(skill, flow, io, { text: text ? cleanSearchText(text) : '' }, {});
