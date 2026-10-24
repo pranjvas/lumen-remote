@@ -915,12 +915,18 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     'ai.ask': aiAsk,
     'ai.cancel': aiCancel,
 
-    'browser.open': async ({ url }) => feature('browser', 'open', webUrl(url, 'url', !!config.browser?.allowLoopback)),
+    // restore: true for Lumen's own reopen of a page (tools/restart.ps1 -KeepTvPage): it does not
+    // count as someone's input, so a video the page starts by itself stays on the page.
+    'browser.open': async ({ url, restore }) => {
+      if (restore !== undefined) boolean(restore, 'restore');
+      return feature('browser', 'open', webUrl(url, 'url', !!config.browser?.allowLoopback), { userInput: restore !== true });
+    },
     'browser.nav': async ({ action }) => feature('browser', 'nav', oneOf(action, 'action', ['back', 'forward', 'reload', 'stop', 'home'])),
-    'browser.input': async (cmd) => feature('browser', 'input', browserInput(cmd)),
+    'browser.input': async (cmd, client) => feature('browser', 'input', browserInput(cmd), client),
     // The trackpad pointer (Browser view): one position for the page and, while it shows there, the TV.
     'browser.pointer': async (cmd) => feature('tvscreen', 'pointer', browserPointer(cmd)),
-    'browser.viewport': async ({ w, h }) => feature('browser', 'setViewport', number(w, 'w', 1, 16384), number(h, 'h', 1, 16384)),
+    // Per client: when the client whose size the page has leaves, the page takes the size of one still watching.
+    'browser.viewport': async ({ w, h }, client) => feature('browser', 'setViewport', number(w, 'w', 1, 16384), number(h, 'h', 1, 16384), client),
     'browser.ack': async ({ seq }, client) => {
       integer(seq, 'seq', 0, Number.MAX_SAFE_INTEGER);
       features.browser?.ack?.(client, seq);
@@ -939,10 +945,13 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     },
     // "On TV": Lumen's own browser shown full screen on the TV (the TV's built-in browser stays
     // available as browser.openInTvBrowser).
-    'browser.openOnTv': async ({ url }) => {
+    // restore: true when Lumen itself puts the page back (tools/restart.ps1 -KeepTvPage), so the page's
+    // autoplaying video is not taken for one someone started (tvscreen's automatic hand-off).
+    'browser.openOnTv': async ({ url, restore }) => {
       requireTvOn();
+      if (restore !== undefined) boolean(restore, 'restore');
       const target = url === undefined ? valueOf('browser.url') : webUrl(url, 'url', !!config.browser?.allowLoopback);
-      return feature('tvscreen', 'open', { url: target === valueOf('browser.url') ? undefined : target });
+      return feature('tvscreen', 'open', { url: target === valueOf('browser.url') ? undefined : target, restore: restore === true });
     },
     'browser.openInTvBrowser': openOnTv,
     'tvscreen.open': async ({ url }) => {

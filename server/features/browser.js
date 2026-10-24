@@ -9,6 +9,9 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { LumenError } from '../errors.js';
+import { isLoopbackHost } from '../util/addr.js';
+
+export { isLoopbackHost };
 
 const PROFILE_DIR = 'browser-profile';
 const HOME_URL = 'https://duckduckgo.com/';
@@ -142,6 +145,20 @@ const TOUCH_TARGET_SCRIPT = `(x, y, r) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 const isBlank = (entry) => !entry || entry.url === 'about:blank';
+/** The site of an address, for the log (page addresses are browsing history). */
+const hostOf = (url) => { try { return new URL(url).hostname || null; } catch { return null; } };
+// A page that stops answering (a renderer that crashed or hangs) must not hold up whoever asked:
+// evaluations and input give up after these.
+const EVAL_TIMEOUT_MS = 5000;
+const INPUT_TIMEOUT_MS = 4000;
+function timed(work, ms, message) {
+  let timer;
+  return Promise.race([work, new Promise((_, reject) => { timer = setTimeout(() => reject(new LumenError('UNAVAILABLE', message)), ms); })])
+    .finally(() => clearTimeout(timer));
+}
+// Leaves full screen if anything is in it. The top document is enough: for a player in a frame (a
+// cross-site one too) its fullscreenElement is that iframe, and exitFullscreen needs no user gesture.
+const EXIT_FULLSCREEN_SCRIPT = '(() => { if (!document.fullscreenElement) return false; document.exitFullscreen().catch(() => {}); return true; })()';
 
 export function validateUrl(input, { allowLoopback = false } = {}) {
   const raw = typeof input === 'string' ? input.trim() : '';
@@ -157,13 +174,19 @@ export function validateUrl(input, { allowLoopback = false } = {}) {
 }
 
 // This PC's own services (Lumen, the browser's DevTools port, anything bound to localhost) are off-limits:
-// the Lumen browser is reachable from every Lumen client, including phones on the LAN.
-export function isLoopbackHost(hostname) {
-  const host = String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '');
-  return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '::' || host === '0.0.0.0'
-    || /^127\./.test(host) || /^::ffff:127\./.test(host) || /^0x7f/.test(host) || /^2130706433$/.test(host);
-}
-const LOOPBACK_PATTERNS = ['*://localhost*', '*://*.localhost*', '*://127.*', '*://[::1]*', '*://0.0.0.0*', '*://[::]*'];
+// the Lumen browser is reachable from every Lumen client, including phones on the LAN. isLoopbackHost
+// (util/addr.js) knows every spelling (trailing dots, IPv4 inside IPv6, integer forms). The Fetch
+// domain, enabled on the browser target itself, pauses every document request of every tab, window
+// and frame (a link, a redirect, location.replace, an iframe, a pop-up, a link opened in a new tab)
+// and every request whose URL looks like this PC (the patterns below, URLs as Edge writes them), from
+// a tab's very first request on; guardRequest refuses this PC's. The page's Network.setBlockedURLs
+// refuses the same subresources (and WebSockets, which Fetch does not see).
+const LOOPBACK_PATTERNS = ['*://localhost*', '*://*.localhost*', '*://127.*', '*://[::1]*', '*://0.0.0.0*', '*://[::]*',
+  '*://[::ffff:7f*', '*://[::7f*', '*://[::ffff:0:0]*', '*://[64:ff9b::7f*'];
+const GUARD_PATTERNS = [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
+  ...LOOPBACK_PATTERNS.map((urlPattern) => ({ urlPattern, requestStage: 'Request' }))];
+// Child targets of the page (cross-site iframes, workers) start paused until they are set up.
+const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
 
 // Ctrl/Meta shortcuts the page may receive; the rest (Ctrl+W, Ctrl+T, Ctrl+N, ...) are browser-level
 // accelerators that would close or replace the shared tab.
@@ -308,6 +331,242 @@ export function mediaKind(mime, url) {
   return null;
 }
 
+// ---------- the streams a page loaded (media()) ----------
+
+const MEDIA_KEEP = 20; // entries kept, newest first (master playlists are never pushed out)
+const MEDIA_REQUESTS_MAX = 500;
+const EARLY_EXTRA_MAX = 200;
+const RENDITIONS_MAX = 200;
+const PLAYLIST_CHARS = 256 * 1024; // what is read of a playlist's body
+const PLAYLIST_FETCH_MAX = 4 * 1024 * 1024; // a body this big is not asked for at all
+const HLS_DIRECTIVE = /^_HLS_(msn|part|skip)$/;
+
+/** A playlist address without LL-HLS delivery directives (_HLS_msn, _HLS_part, _HLS_skip): the playlist itself. */
+export function playlistKey(raw) {
+  const s = String(raw ?? '');
+  const q = s.indexOf('?');
+  if (q < 0) return s;
+  const hash = s.indexOf('#', q);
+  const parts = s.slice(q + 1, hash < 0 ? undefined : hash).split('&');
+  const kept = parts.filter((part) => !HLS_DIRECTIVE.test(part.split('=')[0]));
+  if (kept.length === parts.length) return s;
+  return s.slice(0, q) + (kept.length ? `?${kept.join('&')}` : '') + (hash < 0 ? '' : s.slice(hash));
+}
+
+/** The request headers a stream is fetched again with: { cookie, referer, origin, userAgent } (names in any case). */
+export function mediaHeaders(headers = {}) {
+  const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+  return { cookie: lower.cookie ?? null, referer: lower.referer ?? null, origin: lower.origin ?? null, userAgent: lower['user-agent'] ?? null };
+}
+
+const AUDIO_SEGMENT = /\.(aac|mp3|ac3|ec3|eac3|m4a)$/i;
+const SUBTITLE_SEGMENT = /\.(vtt|webvtt)$/i;
+function playlistAttrs(text) {
+  const out = {};
+  const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
+  for (let m = re.exec(text); m; m = re.exec(text)) out[m[1]] = m[2].startsWith('"') ? m[2].slice(1, -1) : m[2];
+  return out;
+}
+
+/**
+ * What an HLS playlist is, from its text, every URI resolved against `baseUrl` (the response's own URL):
+ * { role: 'master', variants: [{ url, bandwidth, height, codecs }], renditions: [{ url, type: 'audio' | 'subtitles' }] },
+ * { role: 'media', audioOnly } (audioOnly: every segment is packed audio), { role: 'subtitles' } (WebVTT
+ * segments), or null when the text is not a playlist.
+ */
+export function classifyPlaylist(text, baseUrl) {
+  const lines = String(text ?? '').replace(/^﻿/, '').split(/\r?\n/).map((line) => line.trim());
+  if (!lines[0]?.startsWith('#EXTM3U')) return null;
+  const resolve = (uri) => { try { return new URL(uri, baseUrl).href; } catch { return null; } };
+  const variants = [];
+  const renditions = [];
+  const segments = [];
+  let streamInf = null;
+  for (const line of lines.slice(1)) {
+    if (!line) continue;
+    if (line.startsWith('#EXT-X-STREAM-INF:')) { streamInf = playlistAttrs(line.slice('#EXT-X-STREAM-INF:'.length)); continue; }
+    if (line.startsWith('#EXT-X-MEDIA:')) {
+      const a = playlistAttrs(line.slice('#EXT-X-MEDIA:'.length));
+      const type = a.TYPE === 'AUDIO' ? 'audio' : a.TYPE === 'SUBTITLES' ? 'subtitles' : null;
+      const url = type && a.URI ? resolve(a.URI) : null;
+      if (url) renditions.push({ url, type });
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    if (streamInf) {
+      const url = resolve(line);
+      if (url) {
+        variants.push({
+          url, bandwidth: Number(streamInf.BANDWIDTH) || null,
+          height: Number(/x(\d+)$/i.exec(streamInf.RESOLUTION ?? '')?.[1]) || null, codecs: streamInf.CODECS ?? null,
+        });
+      }
+      streamInf = null;
+      continue;
+    }
+    segments.push(line.split(/[?#]/)[0]);
+  }
+  if (variants.length) return { role: 'master', variants, renditions };
+  if (segments.length && segments.every((s) => SUBTITLE_SEGMENT.test(s))) return { role: 'subtitles' };
+  return { role: 'media', audioOnly: segments.length > 0 && segments.every((s) => AUDIO_SEGMENT.test(s)) };
+}
+
+// The Host (HTTP/1) or :authority (HTTP/2+) a request's extra headers name is the request's own: after
+// a redirect, a late one can belong to the hop before (another site's cookie).
+function sameHost(url, headers) {
+  const authority = Object.entries(headers ?? {}).find(([k]) => /^(host|:authority)$/i.test(k))?.[1];
+  if (!authority) return true;
+  try { return new URL(url).host === String(authority).toLowerCase(); } catch { return true; }
+}
+
+/**
+ * The video streams a page loaded (HLS/DASH manifests, whole files), newest first, from the page's
+ * Network events and those of its cross-site iframes (sessionId), with the request headers that fetched
+ * them (cookie, referer) so the TV can be handed the same stream. Event order varies: the extra
+ * headers (the only source of the Cookie header) can come before the request, after the response or
+ * after the load finished. HLS playlists are read (readBody) to tell a master from a variant, an audio
+ * rendition or subtitles. `gen` counts documents and same-document navigations (an SPA's next video):
+ * entries of the current one are `current`.
+ *
+ * isMainDocument(p, sessionId): whether a requestWillBeSent starts a new page (the list starts over).
+ */
+export function createMediaTracker({ keep = MEDIA_KEEP, readBody = null, onChange = () => {}, isMainDocument = () => false } = {}) {
+  let seen = [];
+  const requests = new Map(); // `${sessionId}:${requestId}` → { url, type, frameId, headers, entry, responseUrl, bodyRead }
+  const earlyExtra = new Map(); // the same key → extra headers that came before their request
+  const renditions = new Map(); // playlist address → 'audio' | 'subtitles', from the master playlists seen
+  let gen = 0;
+  const keyOf = (requestId, sessionId) => `${sessionId ?? ''}:${requestId}`;
+  const listed = (url) => seen.find((m) => m.url === url) ?? null;
+
+  function reset() {
+    seen = [];
+    requests.clear();
+    earlyExtra.clear();
+    renditions.clear();
+    gen += 1;
+  }
+
+  function markRendition(entry) {
+    const type = renditions.get(entry.url);
+    if (type === 'audio') entry.audio = true;
+    else if (type === 'subtitles') entry.role = 'subtitles';
+  }
+
+  function remember(entry) {
+    const old = listed(entry.url);
+    // A playlist reload replaces its entry: what its first body said carries over.
+    if (old) for (const k of ['role', 'audioOnly', 'variants', 'renditions', 'audio']) if (old[k] !== undefined && entry[k] === undefined) entry[k] = old[k];
+    markRendition(entry);
+    const list = [entry, ...seen.filter((m) => m !== old)];
+    // The oldest go first, never a master playlist: LL-HLS reloads would push it out within seconds.
+    while (list.length > keep) {
+      let i = list.length - 1;
+      while (i > 0 && list[i].role === 'master') i -= 1;
+      if (i === 0) break;
+      list.splice(i, 1);
+    }
+    seen = list.slice(0, keep * 2);
+  }
+
+  function classified(entry, result) {
+    if (!result) return;
+    const subtitles = renditions.get(entry.url) === 'subtitles';
+    entry.role = subtitles ? 'subtitles' : result.role;
+    if (result.role === 'media') entry.audioOnly = result.audioOnly;
+    if (result.role !== 'master') return;
+    entry.variants = result.variants;
+    entry.renditions = result.renditions;
+    if (!seen.includes(entry)) return; // the page has moved on
+    for (const r of result.renditions) {
+      if (renditions.size >= RENDITIONS_MAX) renditions.delete(renditions.keys().next().value);
+      renditions.set(playlistKey(r.url), r.type);
+    }
+    for (const m of seen) markRendition(m);
+  }
+
+  function readPlaylist(record, requestId, sessionId) {
+    record.bodyRead = true;
+    const { entry } = record;
+    Promise.resolve()
+      .then(() => readBody(requestId, sessionId))
+      .then((res) => {
+        if (!res || typeof res.body !== 'string') return;
+        const text = (res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body).slice(0, PLAYLIST_CHARS);
+        classified(listed(entry.url) ?? entry, classifyPlaylist(text, record.responseUrl ?? entry.url));
+      })
+      .catch(() => {}); // gone with its page, or evicted from Edge's buffer: the role stays unknown
+  }
+
+  return {
+    requestWillBeSent(p, sessionId) {
+      const key = keyOf(p.requestId, sessionId);
+      const early = earlyExtra.get(key);
+      earlyExtra.delete(key);
+      if (isMainDocument(p, sessionId)) reset();
+      if (requests.size >= MEDIA_REQUESTS_MAX) requests.clear();
+      const record = { url: p.request.url, type: p.type, frameId: p.frameId ?? null, headers: { ...p.request.headers }, entry: null };
+      if (early && sameHost(record.url, early)) Object.assign(record.headers, early);
+      requests.set(key, record);
+    },
+    extraInfo(p, sessionId) {
+      const key = keyOf(p.requestId, sessionId);
+      const r = requests.get(key);
+      if (!r || !sameHost(r.url, p.headers)) {
+        // Before its request (or its redirect hop): kept until requestWillBeSent comes.
+        if (earlyExtra.size >= EARLY_EXTRA_MAX) earlyExtra.delete(earlyExtra.keys().next().value);
+        earlyExtra.set(key, { ...p.headers });
+        return;
+      }
+      Object.assign(r.headers, p.headers);
+      // The entry is the one media() lists: a cookie that came late reaches it too.
+      if (r.entry) r.entry.headers = mediaHeaders(r.headers);
+    },
+    responseReceived(p, sessionId) {
+      const r = requests.get(keyOf(p.requestId, sessionId));
+      const kind = mediaKind(p.response.mimeType, p.response.url);
+      if (!kind || !r || p.response.status >= 400) return null;
+      const entry = {
+        url: kind === 'hls' ? playlistKey(p.response.url) : p.response.url, kind, mime: p.response.mimeType, at: Date.now(),
+        frameId: r.frameId, gen, headers: mediaHeaders(r.headers),
+      };
+      r.entry = entry;
+      r.responseUrl = p.response.url;
+      remember(entry);
+      onChange(seen.length);
+      return entry;
+    },
+    loadingFinished(p, sessionId) {
+      const key = keyOf(p.requestId, sessionId);
+      const r = requests.get(key);
+      if (!r) return;
+      // Kept while it has an entry (late extra headers still reach it); the size cap and the next page bound the map.
+      if (!r.entry) { requests.delete(key); return; }
+      const shown = listed(r.entry.url) ?? r.entry;
+      if (r.entry.kind !== 'hls' || !readBody || r.bodyRead || shown.role) return;
+      if (p.encodedDataLength > PLAYLIST_FETCH_MAX) { r.bodyRead = true; return; }
+      readPlaylist(r, p.requestId, sessionId);
+    },
+    /** → the request's record (for the ad-redirect check), forgotten. */
+    loadingFailed(p, sessionId) {
+      const key = keyOf(p.requestId, sessionId);
+      const r = requests.get(key) ?? null;
+      requests.delete(key);
+      return r;
+    },
+    /** A same-document navigation of the page (an SPA's next video): what was listed is no longer current. */
+    nextGeneration() { gen += 1; },
+    reset,
+    get size() { return seen.length; },
+    /** Copies of the entries, newest first; `current`: loaded since the page's latest navigation. */
+    list: () => seen.map((m) => ({
+      ...m, headers: { ...m.headers }, current: m.gen === gen,
+      ...(m.variants && { variants: m.variants.map((v) => ({ ...v })) }),
+      ...(m.renditions && { renditions: m.renditions.map((v) => ({ ...v })) }),
+    })),
+  };
+}
+
 // Width and height from a JPEG's start-of-frame marker, or null when it cannot be found.
 export function jpegSize(buffer) {
   let i = 2;
@@ -367,7 +626,9 @@ function freePort() {
   });
 }
 
-// Minimal DevTools client over Node's WebSocket: send(method, params) → result, on(method, fn), onClose(fn).
+// Minimal DevTools client over Node's WebSocket: send(method, params, sessionId?) → result,
+// on(method, fn(params, sessionId)), onClose(fn), failPending(message). A sessionId addresses (and
+// marks events of) a child target attached in flat mode: a cross-site iframe of the page.
 function connectCdp(url) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
@@ -380,14 +641,16 @@ function connectCdp(url) {
       pending.clear();
     };
     ws.addEventListener('open', () => resolve({
-      send(method, params = {}) {
+      send(method, params = {}, sessionId = undefined) {
         if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new LumenError('UNAVAILABLE', 'The browser is not open'));
         const id = next++;
-        ws.send(JSON.stringify({ id, method, params }));
+        ws.send(JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params }));
         return new Promise((res, rej) => pending.set(id, { res, rej, method }));
       },
       on(method, fn) { handlers.set(method, [...(handlers.get(method) ?? []), fn]); },
       onClose(fn) { closers.add(fn); },
+      /** Rejects every call still waiting for an answer (a crashed page never answers them). */
+      failPending(message) { fail(message); },
       close() { ws.close(); },
     }));
     ws.addEventListener('error', () => reject(new Error(`DevTools connection to ${url} failed`)));
@@ -403,7 +666,7 @@ function connectCdp(url) {
         if (msg.error) rej(new Error(`${method}: ${msg.error.message}`));
         else res(msg.result);
       } else if (msg.method) {
-        for (const fn of handlers.get(msg.method) ?? []) fn(msg.params);
+        for (const fn of handlers.get(msg.method) ?? []) fn(msg.params, msg.sessionId);
       }
     });
   });
@@ -443,11 +706,21 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // is attached the viewport is the TV's 16:9 and phones see a scaled copy.
   const sinks = new Set();
   let requestedViewport = null;
-  // Video streams the page loaded (HLS/DASH manifests, whole files), newest first, with the request
-  // headers that fetched them (cookies, referer) so the TV can be handed the same stream.
-  let mediaSeen = [];
-  const mediaRequests = new Map(); // requestId → { url, type, headers }
-  const MEDIA_KEEP = 20;
+  // The viewport each Browser-view client asked for (client → { w, h, at }): when the one whose size
+  // the page has leaves, the page goes back to the newest request of a client still watching. Kept
+  // while a client is away (a hidden tab comes back without asking again); weak, so gone clients go.
+  const viewportRequests = new WeakMap();
+  let viewportSeq = 0; // orders the requests (and the input that makes a client's the newest)
+  const allowLoopback = !!config.browser?.allowLoopback;
+  // Subresource patterns refused in the page and its frames: this PC's own addresses, plus any the
+  // config adds (browser.blockedUrls).
+  const blockedPatterns = [...(allowLoopback ? [] : LOOPBACK_PATTERNS), ...(Array.isArray(settings.blockedUrls) ? settings.blockedUrls.map(String) : [])];
+  // Video streams the page and its frames loaded (createMediaTracker), fed by the page's Network events.
+  const tracker = createMediaTracker({
+    readBody: (requestId, sessionId) => (mainPage ?? page)?.send('Network.getResponseBody', { requestId }, sessionId),
+    onChange: (count) => publish('media', count),
+    isMainDocument: (p, sessionId) => !sessionId && p.type === 'Document' && p.frameId === mainFrameId,
+  });
   const { edgePath } = settings;
   const homeUrl = settings.homeUrl ?? HOME_URL; // Home, and the TV's page after Clear history (tests use a loopback one)
   const profileDir = path.join(config.dataDir, PROFILE_DIR);
@@ -465,15 +738,39 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   let popup = null; // { id, cdp } a sized pop-up the page opened (a sign-in window)
   const popupConnections = new WeakSet(); // every pop-up's CDP connection, shown now or before
   let mainTargetId = null;
-  const frameContexts = new Set(); // default execution contexts of the page's frames (its own and in-process iframes)
+  const refusedTabs = new Set(); // tabs and windows closed for asking for a page on this PC (guardRequest)
+  const ownTabs = new Set(); // addresses of Lumen's own tabs on this PC (live video's capture page), let through
+  // Default execution contexts of the page's frames: its own, in-process iframes, and cross-site
+  // iframes attached as child sessions. `${sessionId}:${contextId}` → { sessionId, contextId, frameId }.
+  const frameContexts = new Map();
   let lastUserInput = 0;
   let mainFrameId = null;
   let titleFromPage = null; // the current document's title as reported by PAGE_SCRIPT
+  // The page's own address (never a pop-up's), kept in memory only: what a VPN switch, a Clear history
+  // that keeps history, and a relaunch after Edge died reopen.
+  let mainUrl = null;
   let ready = false;
   let starting = null; // the in-flight launch, so concurrent opens share it
   let wiping = null; // clear history closing Edge and deleting profile files; launches wait for it
+  let closing = null; // a teardown closing Edge; launches wait for it (its stray sweep would kill them)
+  let lastSpawnAt = 0; // when the newest Edge was spawned (a close's sweep spares what started after)
   let stopped = false;
   const pressed = new Set(); // mouse buttons currently held
+  // Edge dying on its own (not closed by Lumen): it is started again on the page it showed while
+  // someone watches, backing off, and given up after RELAUNCH_LIMIT deaths in RELAUNCH_WINDOW_MS.
+  const RELAUNCH_DELAYS_MS = Array.isArray(settings.relaunchDelaysMs) && settings.relaunchDelaysMs.length ? settings.relaunchDelaysMs : [1000, 5000, 15000];
+  const RELAUNCH_LIMIT = 3;
+  const RELAUNCH_WINDOW_MS = 10 * 60_000;
+  const crashTimes = [];
+  let crashUrl = null; // the page to bring back when Edge starts again after it died
+  let relaunchTimer = null;
+  let lifeGen = 0; // bumped by every close (user, idle, VPN switch, Clear history, stop)
+  // The page's renderer crashing (Edge itself lives on): the page is loaded again, up to
+  // PAGE_CRASH_LIMIT times in PAGE_CRASH_WINDOW_MS.
+  const PAGE_CRASH_LIMIT = 2;
+  const PAGE_CRASH_WINDOW_MS = 60_000;
+  const pageCrashes = [];
+  let pageCrashed = false; // a crash is being handled (two reports of it come)
 
   // Frames: `latest` waits for the next fan-out slot, `lastFrame` is what viewers currently show.
   let seq = 0;
@@ -502,6 +799,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
 
   function clearPage() {
+    mainUrl = null;
     publish('url', null);
     publish('title', null);
     publish('loading', false);
@@ -513,9 +811,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (!cdp) return;
     try {
       const { currentIndex, entries } = await cdp.send('Page.getNavigationHistory');
-      if (cdp !== page) return;
       const current = entries[currentIndex];
       const url = isBlank(current) ? null : current.url;
+      if (cdp === mainPage || (cdp === page && !mainPage)) mainUrl = url;
+      if (cdp !== page) return;
       publish('url', url);
       // The page script's title wins once it has reported; the history title can lag behind it.
       if (titleFromPage === null) publish('title', url ? (current.title || new URL(url).hostname) : null);
@@ -725,10 +1024,25 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     idleTimer.unref();
   }
 
+  // The newest viewport request of a client still on the Browser view, or null.
+  function latestRequest() {
+    let best = null;
+    for (const client of watchers.keys()) {
+      const r = viewportRequests.get(client);
+      if (r && (!best || r.at > best.at)) best = r;
+    }
+    return best;
+  }
+
   function viewers(set) {
     const hadWatchers = watchers.size > 0;
     const next = new Set(set);
-    for (const client of watchers.keys()) if (!next.has(client)) watchers.delete(client);
+    let left = false;
+    for (const client of watchers.keys()) {
+      if (next.has(client)) continue;
+      watchers.delete(client);
+      left = true;
+    }
     for (const client of next) {
       if (watchers.has(client)) continue;
       watchers.set(client, { outstanding: [], lastSeq: 0 });
@@ -738,7 +1052,15 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       clearIdle();
       unpark();
     } else armIdle();
-    if (sparseFrames && (watchers.size > 0) !== hadWatchers) applyMetrics(); // a phone needs every frame again
+    // The client whose size the page had has left: the page takes the size of the one still watching.
+    let resized = false;
+    const wanted = left && !sinks.size ? latestRequest() : null;
+    if (wanted && (wanted.w !== viewport.w || wanted.h !== viewport.h)) {
+      viewport = { w: wanted.w, h: wanted.h };
+      requestedViewport = { ...viewport };
+      resized = true;
+    }
+    if (resized || (sparseFrames && (watchers.size > 0) !== hadWatchers)) applyMetrics(); // a phone needs every frame again
   }
 
   // ---------- Edge process ----------
@@ -778,15 +1100,19 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // as the fallback (as tools/screenshot.mjs does).
   // msedge.exe processes started with Lumen's profile directory (strays from an earlier run, or
   // helpers that outlived Browser.close). Windows only; elsewhere this is a no-op.
-  function killStrays() {
+  // `before` (ms): only processes started before then, so the sweep after a close cannot kill an Edge
+  // that a launch started meanwhile.
+  function killStrays({ before = null } = {}) {
     if (process.platform !== 'win32') return Promise.resolve();
     const pattern = `*${profileDir}*`.replace(/'/g, "''");
-    const script = `Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object { $_.CommandLine -like '${pattern}' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    const age = Number.isFinite(before) ? ` -and $_.CreationDate -lt [DateTimeOffset]::FromUnixTimeMilliseconds(${Math.round(before)}).LocalDateTime` : '';
+    const script = `Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object { $_.CommandLine -like '${pattern}'${age} } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
     return new Promise((resolve) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
       { windowsHide: true, timeout: 15000 }, () => resolve()));
   }
 
   async function closeEdge({ proc, conn, port, pid }) {
+    const closeStarted = Date.now();
     if (conn) {
       await Promise.race([conn.send('Browser.close').catch(() => {}), sleep(BROWSER_CLOSE_MS)]);
       conn.close();
@@ -797,7 +1123,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       log.warn('Edge did not close on request; killing it', { pid });
       for (const target of new Set([pid, proc.pid].filter(Boolean))) if (isAlive(target)) await taskkill(target);
     }
-    await killStrays(); // crashpad/utility helpers can outlive the browser process
+    // Crashpad/utility helpers can outlive the browser process (some start during the shutdown itself).
+    // Scoped only when a launch spawned a new Edge meanwhile: its processes are not this one's.
+    await killStrays({ before: lastSpawnAt > closeStarted ? lastSpawnAt : null });
   }
 
   // Edge is never left running after this: killOnExit covers a crash of Lumen itself.
@@ -816,8 +1144,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     const cdp = mainPage ?? page;
     const popupCdp = popup?.cdp ?? null;
     popup = null;
+    // Said now: the next Edge's first pop-up must be news (tvscreen pauses live video on it).
+    if (popupCdp) publish('popup', false);
     mainPage = null;
     mainTargetId = null;
+    refusedTabs.clear();
+    ownTabs.clear();
     child = null;
     browser = null;
     browserPid = null;
@@ -826,10 +1158,19 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     devPort = null;
     mainFrameId = null;
     titleFromPage = null;
+    pageCrashed = false;
+    frameContexts.clear();
     for (const watcher of watchers.values()) Object.assign(watcher, { outstanding: [], lastSeq: 0 });
     cdp?.close();
     if (session.proc) {
-      await closeEdge(session);
+      // Set before the first await: a launch asked for meanwhile waits for it (ensureRunning).
+      const done = closeEdge(session);
+      closing = done;
+      try {
+        await done;
+      } finally {
+        if (closing === done) closing = null;
+      }
       process.off('exit', killOnExit);
     }
     clearPage();
@@ -842,7 +1183,8 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (popup || !devPort || !page) return;
     const owner = page;
     const pcdp = await connectCdp(`ws://127.0.0.1:${devPort}/devtools/page/${targetId}`);
-    if (page !== owner || popup) { pcdp.close(); return; }
+    // Closed meanwhile by guardRequest (it asked for a page on this PC): never shown.
+    if (page !== owner || popup || refusedTabs.has(targetId)) { pcdp.close(); return; }
     popup = { id: targetId, cdp: pcdp };
     popupConnections.add(pcdp);
     pcdp.onClose(() => onConnectionLost(pcdp));
@@ -852,7 +1194,19 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     pcdp.on('Page.javascriptDialogOpening', ({ type }) => {
       pcdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
     });
+    pcdp.on('Inspector.targetCrashed', () => onPopupCrashed(pcdp));
+    // This PC's pages are refused in the pop-up as everywhere (guardRequest, from its first request on),
+    // and a pop-up that asks for one is closed. Should one show such a page anyway, it is closed too.
+    const onThisPc = (address) => !allowLoopback && isLoopbackHost(hostOf(address));
+    const refuse = () => closeTab(targetId, 'a pop-up for a page on this PC was closed');
+    pcdp.on('Page.frameNavigated', ({ frame }) => { if (!frame.parentId && onThisPc(frame.url)) refuse(); });
+    if (onThisPc(url)) { refuse(); return; }
     try {
+      if (blockedPatterns.length) {
+        await pcdp.send('Network.enable');
+        await pcdp.send('Network.setBlockedURLs', { urls: blockedPatterns });
+      }
+      await pcdp.send('Inspector.enable').catch(() => {});
       await pcdp.send('Page.enable');
       await pcdp.send('Emulation.setFocusEmulationEnabled', { enabled: true });
       const { userAgent } = await pcdp.send('Browser.getVersion');
@@ -890,14 +1244,72 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     log.info('pop-up closed; back to the page');
   }
 
-  // Either CDP connection dropping while in use means Edge died or was closed from outside.
+  // The pop-up's renderer crashed: it is closed, and whatever waited on it is let go.
+  function onPopupCrashed(pcdp) {
+    if (!popup || popup.cdp !== pcdp) return;
+    log.warn('the pop-up window crashed');
+    browser?.send('Target.closeTarget', { targetId: popup.id }).catch(() => {});
+    pcdp.failPending('The sign-in window crashed');
+    closePopup();
+  }
+
+  // Either CDP connection dropping while in use means Edge died or was closed from outside. While
+  // someone watches (a phone on the Browser view, the TV) Edge starts again on the page it showed;
+  // otherwise the next use does (ensureRunning reopens the page).
   function onConnectionLost(cdp) {
     if (popup && cdp === popup.cdp) { closePopup(); return; }
     if (cdp !== page && cdp !== mainPage && cdp !== browser) return;
     log.warn('the browser closed unexpectedly');
+    const gen = lifeGen;
+    // A death during the relaunch itself keeps the page that relaunch was to bring back.
+    crashUrl = !stopped && !wiping ? mainUrl ?? crashUrl : null;
+    // Said at once: the sweep after it can take seconds on a busy PC, and 'ready' would be a lie.
+    if (!stopped) {
+      if (sinks.size || watchers.size) setSession('starting');
+      else setSession('error', 'The browser closed unexpectedly');
+    }
     teardown()
-      .then(() => setSession(stopped ? 'off' : 'error', stopped ? null : 'The browser closed unexpectedly'))
+      .then(() => {
+        if (gen !== lifeGen) return; // closed or cleared meanwhile: that said what the session is
+        if (stopped) { setSession('off'); return; }
+        if (crashUrl) publish('url', crashUrl); // the phone's Retry and the TV's notice name the page
+        if (starting) return; // already starting again (ensureRunning)
+        if (sinks.size || watchers.size) scheduleRelaunch();
+        else setSession('error', 'The browser closed unexpectedly');
+      })
       .catch((err) => log.warn('cleanup after browser exit failed', err));
+  }
+
+  // Edge starts again after RELAUNCH_DELAYS_MS[n]; RELAUNCH_LIMIT deaths in RELAUNCH_WINDOW_MS and
+  // it stays closed, with the reason, until someone opens a page.
+  function scheduleRelaunch(lastError = null) {
+    clearTimeout(relaunchTimer);
+    relaunchTimer = null;
+    if (stopped) return;
+    if (!sinks.size && !watchers.size) {
+      setSession('error', lastError?.message ?? 'The browser closed unexpectedly');
+      return;
+    }
+    const now = Date.now();
+    while (crashTimes.length && now - crashTimes[0] > RELAUNCH_WINDOW_MS) crashTimes.shift();
+    if (crashTimes.length >= RELAUNCH_LIMIT) {
+      log.warn('the browser keeps closing; not starting it again', { times: crashTimes.length });
+      setSession('error', lastError instanceof LumenError ? lastError.message : 'The browser keeps closing');
+      return;
+    }
+    const delay = RELAUNCH_DELAYS_MS[Math.min(crashTimes.length, RELAUNCH_DELAYS_MS.length - 1)];
+    crashTimes.push(now);
+    setSession('starting');
+    const gen = lifeGen;
+    log.info('starting the browser again', { inMs: delay, attempt: crashTimes.length });
+    relaunchTimer = setTimeout(() => {
+      relaunchTimer = null;
+      if (stopped || gen !== lifeGen) return;
+      // Nobody watches any more (the TV left meanwhile): the next use starts it, on the same page.
+      if (!sinks.size && !watchers.size) { setSession('error', 'The browser closed unexpectedly'); return; }
+      ensureRunning().catch((err) => { if (gen === lifeGen) scheduleRelaunch(err); });
+    }, delay);
+    relaunchTimer.unref?.();
   }
 
   // The screen is the viewport too: headless Edge otherwise reports a tiny screen (89×66), and video
@@ -931,6 +1343,105 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   }
   const applyMetrics = () => restartScreencast({ resize: true });
 
+  // ---------- the page's frames, documents and crashes ----------
+
+  function dropContexts(sessionId) {
+    for (const [key, ctx] of frameContexts) if (ctx.sessionId === sessionId) frameContexts.delete(key);
+  }
+
+  // A child target of the page attached itself paused (AUTO_ATTACH): a cross-site iframe gets the
+  // page's Network watch (its streams) and block list, its frames' contexts and the same auto-attach
+  // for frames nested in it; then, and every other kind (workers) at once, it runs. (This PC's pages
+  // are refused in it by the browser-wide guard, guardRequest.)
+  async function attachChild(cdp, { sessionId, targetInfo }) {
+    try {
+      if (targetInfo?.type !== 'iframe') return;
+      await cdp.send('Network.enable', {}, sessionId);
+      if (blockedPatterns.length) await cdp.send('Network.setBlockedURLs', { urls: blockedPatterns }, sessionId);
+      await cdp.send('Runtime.enable', {}, sessionId);
+      await cdp.send('Target.setAutoAttach', AUTO_ATTACH, sessionId);
+    } catch (err) {
+      log.debug('an embedded frame could not be set up', { message: err.message });
+    } finally {
+      cdp.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+    }
+  }
+
+  // ---------- this PC's pages ----------
+
+  // A request paused by the browser-wide guard (GUARD_PATTERNS, Fetch on the browser target): every
+  // document of every tab, window and frame, and whatever looks like this PC, from a tab's first
+  // request on (a pop-up's or a new tab's included: Target.targetCreated tells of those before their
+  // address is known, so no check there could stop it). This PC's addresses are refused, the rest goes
+  // on; Lumen's own tabs (openOwnTab) are let through. A tab or window whose own page is refused (a
+  // pop-up, a link opened in a new tab) is closed; the page itself shows Edge's error page.
+  function guardRequest(conn, { requestId, request, frameId, resourceType }) {
+    const url = request?.url;
+    const refused = isLoopbackHost(hostOf(url)) && !(resourceType === 'Document' && ownTabs.has(url));
+    conn.send(refused ? 'Fetch.failRequest' : 'Fetch.continueRequest', refused ? { requestId, errorReason: 'BlockedByClient' } : { requestId })
+      .catch((err) => log.debug('a paused request could not go on', { message: err.message }));
+    if (!refused) return;
+    // A subresource (a capture tab's favicon, say) is no news.
+    if (resourceType !== 'Document') { log.debug('refused a request to this PC', { type: resourceType ?? null }); return; }
+    const refusedHere = () => log.info('refused a page on this PC');
+    if (!frameId || frameId === mainTargetId) { refusedHere(); return; }
+    // A tab's id is its main frame's: a document refused in a frame of that id is the tab's own page.
+    conn.send('Target.getTargetInfo', { targetId: frameId })
+      .then(({ targetInfo }) => (targetInfo?.type === 'page' ? closeTab(frameId, 'a pop-up or new tab for a page on this PC was closed') : refusedHere()), refusedHere);
+  }
+
+  function closeTab(targetId, why) {
+    if (refusedTabs.has(targetId)) return;
+    refusedTabs.add(targetId);
+    log.info(why);
+    browser?.send('Target.closeTarget', { targetId }).catch(() => {});
+    if (popup?.id === targetId) closePopup();
+  }
+
+  // The page's renderer crashed (the connection stays open, so nothing else notices): calls waiting
+  // on it are let go, a pop-up on show goes, and the page loads again; after PAGE_CRASH_LIMIT crashes
+  // in PAGE_CRASH_WINDOW_MS it is left, with the session in error, until a page is opened (open works
+  // on the crashed tab). browser.crashed = { at, count }: count is the crashes in that window.
+  function onPageCrashed(cdp) {
+    if (!ready || !cdp || pageCrashed || cdp !== (mainPage ?? page)) return;
+    pageCrashed = true;
+    log.warn('the page crashed');
+    cdp.failPending('The page crashed');
+    pressed.clear();
+    if (popup) {
+      browser?.send('Target.closeTarget', { targetId: popup.id }).catch(() => {});
+      closePopup();
+    }
+    const now = Date.now();
+    while (pageCrashes.length && now - pageCrashes[0] > PAGE_CRASH_WINDOW_MS) pageCrashes.shift();
+    const before = pageCrashes.length;
+    pageCrashes.push(now);
+    publish('crashed', { at: now, count: before + 1 });
+    if (before >= PAGE_CRASH_LIMIT) {
+      log.warn('the page keeps crashing; leaving it', { count: before + 1 });
+      setSession('error', 'The page keeps crashing');
+      return;
+    }
+    const url = mainUrl ?? homeUrl;
+    publish('loading', true);
+    cdp.send('Page.navigate', { url })
+      .then(() => restartScreencast())
+      .catch((err) => log.debug('reload after the crash failed', { message: err.message }));
+  }
+
+  // The page Edge showed when it died, loaded in the new one.
+  async function reopenPage(cdp, raw) {
+    let url;
+    try { url = validateUrl(raw, { allowLoopback }); } catch { return; }
+    log.info('the page is back after the browser closed', { host: hostOf(url) });
+    mainUrl = url;
+    publish('loading', true);
+    publish('url', url);
+    // A slow site keeps loading on its own: the launch (that live video and the TV wait for) does not wait for it.
+    const res = await timed(cdp.send('Page.navigate', { url }), 15000, 'still loading').catch((err) => ({ errorText: err.message }));
+    if (res?.errorText) log.debug('navigation failed', { errorText: res.errorText });
+  }
+
   async function waitForDevtools(port, spawnFailed) {
     const deadline = Date.now() + START_TIMEOUT_MS;
     while (Date.now() < deadline) {
@@ -957,6 +1468,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     await killStrays(); // an Edge left behind by an earlier Lumen would keep the profile locked
     const port = await freePort();
     fs.mkdirSync(profileDir, { recursive: true });
+    lastSpawnAt = Date.now();
     const proc = spawn(edgePath, [
       '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`,
       // The largest viewport, so no later size (the TV's 1280×720 after a phone's 358×411) is bigger
@@ -969,7 +1481,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       // video page opened on the TV should start (and be handed to the TV) as it would in a desktop browser.
       '--autoplay-policy=no-user-gesture-required',
       // A locked or sleeping desktop must not make the page "hidden" (Windows occlusion tracking).
-      '--disable-features=CalculateNativeWinOcclusion', '--disable-backgrounding-occluded-windows',
+      // No back/forward cache either: Back must load the page again, so the streams it plays are
+      // sniffed afresh (a restored page kept the next page's list) and one-time links are not reused.
+      // One --disable-features switch only: Chromium honours the last one alone.
+      '--disable-features=CalculateNativeWinOcclusion,BackForwardCache', '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
       ...(proxyUrl ? [
         `--proxy-server=${proxyUrl}`,
@@ -999,6 +1514,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     } catch (err) {
       log.debug('browser process id unknown', { message: err.message });
     }
+    if (!allowLoopback) {
+      // This PC's pages, in every tab, window and frame from here on (guardRequest). Fail closed: no
+      // Edge without it.
+      conn.on('Fetch.requestPaused', (params, sessionId) => { if (!sessionId) guardRequest(conn, params); });
+      await conn.send('Fetch.enable', { patterns: GUARD_PATTERNS }).catch((err) => {
+        throw new LumenError('UNAVAILABLE', `The browser could not keep pages on this PC out: ${err.message}`);
+      });
+    }
     const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' })).json();
     mainTargetId = target.id;
     // Pop-ups the page opens (sized windows, see PAGE_SCRIPT) are shown while they last.
@@ -1008,77 +1531,83 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       }
     });
     conn.on('Target.targetDestroyed', ({ targetId }) => { if (popup?.id === targetId) closePopup(); });
+    // A renderer crash, the page's or a pop-up's (Inspector.targetCrashed on their own connections says it too).
+    conn.on('Target.targetCrashed', ({ targetId }) => {
+      if (targetId === mainTargetId) onPageCrashed(mainPage ?? page);
+      else if (popup?.id === targetId) onPopupCrashed(popup.cdp);
+    });
     await conn.send('Target.setDiscoverTargets', { discover: true }).catch((err) => log.debug('pop-up discovery unavailable', { message: err.message }));
     const cdp = await connectCdp(target.webSocketDebuggerUrl);
     cdp.onClose(() => onConnectionLost(cdp));
-    cdp.on('Page.screencastFrame', (params) => onScreencastFrame(params, cdp));
-    cdp.on('Page.frameStartedLoading', ({ frameId }) => { if (frameId === mainFrameId) publish('loading', true); });
-    cdp.on('Page.frameStoppedLoading', ({ frameId }) => {
+    // The page's own events carry no sessionId; those of its cross-site iframes (child sessions) do.
+    const onPage = (method, fn) => cdp.on(method, (params, sessionId) => { if (!sessionId) fn(params); });
+    onPage('Page.screencastFrame', (params) => onScreencastFrame(params, cdp));
+    onPage('Page.frameStartedLoading', ({ frameId }) => { if (frameId === mainFrameId) publish('loading', true); });
+    onPage('Page.frameStoppedLoading', ({ frameId }) => {
       if (frameId !== mainFrameId) return;
       publish('loading', false);
       refreshHistory(cdp);
     });
-    cdp.on('Page.frameNavigated', ({ frame }) => {
+    onPage('Page.frameNavigated', ({ frame }) => {
       if (frame.parentId) return;
       titleFromPage = null; // a new document; its script reports the title once it is parsed
+      pageCrashed = false; // and a crash from now on is a new one
       refreshHistory(cdp);
     });
-    cdp.on('Runtime.bindingCalled', ({ name, payload }) => {
+    onPage('Runtime.bindingCalled', ({ name, payload }) => {
       if (name !== TITLE_BINDING || cdp !== page || payload === CAPTURE_TITLE) return;
       titleFromPage = payload || null;
       if (payload) publish('title', payload);
       else refreshHistory(cdp); // no <title>: the history supplies the hostname
     });
-    cdp.on('Page.navigatedWithinDocument', ({ frameId }) => { if (frameId === mainFrameId) refreshHistory(cdp); });
-    cdp.on('Page.loadEventFired', () => refreshHistory(cdp));
+    onPage('Page.navigatedWithinDocument', ({ frameId }) => {
+      if (frameId !== mainFrameId) return;
+      tracker.nextGeneration(); // a single-page site's next page: the streams listed so far were the last one's
+      refreshHistory(cdp);
+    });
+    onPage('Page.loadEventFired', () => refreshHistory(cdp));
+    onPage('Inspector.targetCrashed', () => onPageCrashed(cdp));
     // Every frame's own context, so a check can look inside embedded players (Dailymotion's player is
-    // an iframe filling the page).
+    // an iframe filling the page), cross-site ones included (their sessions).
     frameContexts.clear();
-    cdp.on('Runtime.executionContextCreated', ({ context }) => { if (context.auxData?.isDefault) frameContexts.add(context.id); });
-    cdp.on('Runtime.executionContextDestroyed', ({ executionContextId }) => frameContexts.delete(executionContextId));
-    cdp.on('Runtime.executionContextsCleared', () => frameContexts.clear());
+    cdp.on('Runtime.executionContextCreated', ({ context }, sessionId) => {
+      if (!context.auxData?.isDefault) return;
+      frameContexts.set(`${sessionId ?? ''}:${context.id}`, { sessionId: sessionId ?? null, contextId: context.id, frameId: context.auxData.frameId ?? null });
+    });
+    cdp.on('Runtime.executionContextDestroyed', ({ executionContextId }, sessionId) => frameContexts.delete(`${sessionId ?? ''}:${executionContextId}`));
+    cdp.on('Runtime.executionContextsCleared', (params, sessionId) => dropContexts(sessionId ?? null));
+    cdp.on('Target.attachedToTarget', (params) => { attachChild(cdp, params); });
+    cdp.on('Target.detachedFromTarget', ({ sessionId }) => { if (sessionId) dropContexts(sessionId); });
     // Dialogs would block the page: alerts and beforeunload are accepted, confirms and prompts cancelled.
-    cdp.on('Page.javascriptDialogOpening', ({ type }) => {
+    onPage('Page.javascriptDialogOpening', ({ type }) => {
       cdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
     });
 
+    await cdp.send('Inspector.enable').catch((err) => log.debug('crash reports unavailable', { message: err.message }));
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable'); // bindingCalled needs the domain on
     await cdp.send('Network.enable');
-    mediaSeen = [];
-    mediaRequests.clear();
-    cdp.on('Network.requestWillBeSent', (p) => {
-      if (p.type === 'Document' && p.frameId === mainFrameId) mediaSeen = [];
-      if (mediaRequests.size > 500) mediaRequests.clear();
-      mediaRequests.set(p.requestId, { url: p.request.url, type: p.type, frameId: p.frameId, headers: { ...p.request.headers } });
-    });
-    cdp.on('Network.requestWillBeSentExtraInfo', (p) => {
-      const r = mediaRequests.get(p.requestId);
-      if (r) r.headers = { ...r.headers, ...p.headers };
-    });
-    cdp.on('Network.responseReceived', (p) => {
-      const r = mediaRequests.get(p.requestId);
-      const kind = mediaKind(p.response.mimeType, p.response.url);
-      if (!kind || !r || p.response.status >= 400) return;
-      const lower = Object.fromEntries(Object.entries(r.headers).map(([k, v]) => [k.toLowerCase(), v]));
-      const entry = { url: p.response.url, kind, mime: p.response.mimeType, at: Date.now(),
-        headers: { cookie: lower.cookie ?? null, referer: lower.referer ?? null, origin: lower.origin ?? null, userAgent: lower['user-agent'] ?? null } };
-      mediaSeen = [entry, ...mediaSeen.filter((m) => m.url !== entry.url)].slice(0, MEDIA_KEEP);
-      publish('media', mediaSeen.length);
-    });
-    cdp.on('Network.loadingFinished', (p) => mediaRequests.delete(p.requestId));
-    cdp.on('Network.loadingFailed', (p) => {
-      const r = mediaRequests.get(p.requestId);
-      mediaRequests.delete(p.requestId);
+    tracker.reset();
+    cdp.on('Network.requestWillBeSent', (p, sessionId) => tracker.requestWillBeSent(p, sessionId));
+    cdp.on('Network.requestWillBeSentExtraInfo', (p, sessionId) => tracker.extraInfo(p, sessionId));
+    cdp.on('Network.responseReceived', (p, sessionId) => tracker.responseReceived(p, sessionId));
+    cdp.on('Network.loadingFinished', (p, sessionId) => tracker.loadingFinished(p, sessionId));
+    cdp.on('Network.loadingFailed', (p, sessionId) => {
+      const r = tracker.loadingFailed(p, sessionId);
+      if (sessionId) return; // an ad redirect is the page's own navigation
       // A blocked ad redirect in the main frame: go to the page the ad points at instead.
       const dest = r?.type === 'Document' && r.frameId === mainFrameId && !p.canceled ? adDestination(r.url) : null;
       if (dest && cdp === page) {
-        log.info('ad redirect blocked; opening its destination', { host: new URL(dest).hostname });
+        log.info('ad redirect blocked; opening its destination', { host: hostOf(dest) });
+        mainUrl = dest;
         publish('url', dest);
         cdp.send('Page.navigate', { url: dest }).catch(() => {});
       }
     });
-    if (!config.browser?.allowLoopback) await cdp.send('Network.setBlockedURLs', { urls: LOOPBACK_PATTERNS });
+    if (blockedPatterns.length) await cdp.send('Network.setBlockedURLs', { urls: blockedPatterns });
+    // Cross-site iframes are targets of their own: attached (paused until set up, see attachChild) so
+    // their streams are seen, their videos can be checked and paused, and the blocks apply in them too.
+    await cdp.send('Target.setAutoAttach', AUTO_ATTACH);
     mainFrameId = (await cdp.send('Page.getFrameTree')).frameTree.frame.id;
     await cdp.send('Runtime.addBinding', { name: TITLE_BINDING });
     await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: PAGE_SCRIPT });
@@ -1090,14 +1619,20 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     await cdp.send('Page.startScreencast', screencastParams());
     page = cdp;
     ready = true;
+    // Edge died with a page on show: that page, before anyone (live video's capture, the TV) sees the blank tab.
+    const reopen = crashUrl;
+    crashUrl = null;
     setSession('ready');
     log.info('browser started', { port, pid: browserPid, viewport, vpn: !!proxyUrl });
+    if (reopen) await reopenPage(cdp, reopen);
     if (!watchers.size) armIdle();
   }
 
   function ensureRunning() {
-    // Clear history is deleting the profile's files: Edge starts again once they are gone.
-    if (wiping) return wiping.catch(() => {}).then(() => ensureRunning());
+    // Clear history is deleting the profile's files, or a close is still taking Edge down (its sweep
+    // for stray processes would kill a new one): Edge starts again once that is done.
+    const busy = wiping ?? closing;
+    if (busy) return busy.catch(() => {}).then(() => ensureRunning());
     if (ready && page) return Promise.resolve();
     starting ??= launch()
       .catch(async (err) => {
@@ -1119,30 +1654,52 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return starting;
   }
 
+  // Lumen closing Edge (the user, the idle timer, a VPN switch, Clear history, stop): no relaunch
+  // follows, and no page is brought back.
   async function close() {
+    lifeGen += 1;
+    clearTimeout(relaunchTimer);
+    relaunchTimer = null;
+    crashUrl = null;
     if (!child && !page && !starting) {
       if (store.get('browser.session')?.v !== 'off') setSession('off');
       return {};
     }
     if (starting) await starting.catch(() => {});
     await teardown();
-    setSession('off');
+    // A launch asked for while Edge was closing (live video's capture retry) is already under way.
+    if (!starting) setSession('off');
     log.info('browser closed');
     return {};
   }
 
+  // A page opened after the page crashed for good (the session in error, Edge itself fine) works.
+  function revive() {
+    pageCrashed = false;
+    if (ready && store.get('browser.session')?.v === 'error') setSession('ready');
+  }
+
   // ---------- commands ----------
 
-  async function open(input) {
-    const url = validateUrl(input, { allowLoopback: !!config.browser?.allowLoopback });
+  /**
+   * Opens `input` in the page. userInput: false for Lumen's own reopens (a VPN switch, Clear history,
+   * a restart restoring the page): only a page someone opened counts as their input, which lets the
+   * TV take over the video that page starts (tvscreen's automatic hand-off).
+   */
+  async function open(input, { userInput = true } = {}) {
+    const url = validateUrl(input, { allowLoopback });
     // A new address goes to the page itself: a pop-up on show is closed first.
     if (popup) {
       await browser?.send('Target.closeTarget', { targetId: popup.id }).catch(() => {});
       closePopup();
     }
-    lastUserInput = Date.now();
+    crashUrl = null; // this page, not the one a relaunch would have brought back
     await ensureRunning();
+    // After Edge is up: a cold start must not use up the time a video started by this has to start in.
+    if (userInput) lastUserInput = Date.now();
     const cdp = requireReady();
+    revive();
+    mainUrl = url;
     publish('loading', true);
     publish('url', url);
     const { errorText } = await cdp.send('Page.navigate', { url });
@@ -1150,8 +1707,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return { value: { url } };
   }
 
-  async function nav(action) {
-    lastUserInput = Date.now();
+  // userInput: false for Lumen's own Home (the TV's page put back after a restart), as for open.
+  async function nav(action, { userInput = true } = {}) {
+    if (userInput) lastUserInput = Date.now();
     // Back (or Home) while a pop-up is on show closes the pop-up, as its window's close button would.
     if (popup && (action === 'back' || action === 'home')) {
       const { id } = popup;
@@ -1159,10 +1717,11 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       closePopup();
       return {};
     }
-    if (action === 'home') return open(homeUrl);
+    if (action === 'home') return open(homeUrl, { userInput });
     const cdp = requireReady();
     switch (action) {
       case 'reload':
+        revive();
         await cdp.send('Page.reload');
         break;
       case 'stop':
@@ -1171,6 +1730,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
         break;
       case 'back':
       case 'forward': {
+        // Back while a player is full screen leaves full screen, as Escape would (the TV's remote has
+        // no Escape): the video page and its position stay. A synthetic Escape would reach the page's
+        // own key handlers.
+        if (action === 'back') {
+          const exited = await timed(cdp.send('Runtime.evaluate', { expression: EXIT_FULLSCREEN_SCRIPT, returnByValue: true, silent: true }), EVAL_TIMEOUT_MS, 'The page did not answer')
+            .then((r) => r?.result?.value === true, () => false);
+          if (exited) return { value: { exitedFullscreen: true } };
+        }
         const { currentIndex, entries } = await cdp.send('Page.getNavigationHistory');
         const index = currentIndex + (action === 'back' ? -1 : 1);
         const entry = entries[index];
@@ -1200,7 +1767,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   function mouse(cdp, type, event, extra = {}, at = toViewport(event)) {
     const buttons = [...pressed].reduce((bits, name) => bits | BUTTON_BITS[name], 0);
-    return cdp.send('Input.dispatchMouseEvent', { type, ...at, modifiers: modifierBits(event.modifiers), buttons, ...extra })
+    return timed(cdp.send('Input.dispatchMouseEvent', { type, ...at, modifiers: modifierBits(event.modifiers), buttons, ...extra }), INPUT_TIMEOUT_MS, 'The page did not answer')
       .catch((err) => {
         // A pop-up that closed itself in answer to this click (a sign-in window's Continue) took it.
         if (popupConnections.has(cdp) && popup?.cdp !== cdp) return undefined;
@@ -1215,9 +1782,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   async function touchTarget(cdp, at, radius) {
     if (!(radius > 0)) return at;
     try {
-      const { result } = await cdp.send('Runtime.evaluate', {
+      const { result } = await timed(cdp.send('Runtime.evaluate', {
         expression: `(${TOUCH_TARGET_SCRIPT})(${at.x}, ${at.y}, ${Math.round(radius)})`, returnByValue: true, silent: true,
-      });
+      }), EVAL_TIMEOUT_MS, 'The page did not answer');
       const v = result?.value;
       return v && Number.isFinite(v.x) && Number.isFinite(v.y)
         ? { x: clamp(Math.round(v.x), 0, viewport.w), y: clamp(Math.round(v.y), 0, viewport.h) }
@@ -1239,15 +1806,22 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       key: shifted ? described.key.toUpperCase() : described.key, code: described.code,
       windowsVirtualKeyCode: described.keyCode, nativeVirtualKeyCode: described.keyCode, modifiers: bits,
     };
-    await cdp.send('Input.dispatchKeyEvent', typed
+    const send = (params) => timed(cdp.send('Input.dispatchKeyEvent', params), INPUT_TIMEOUT_MS, 'The page did not answer');
+    await send(typed
       ? { ...base, type: 'keyDown', text: shifted ? described.text.toUpperCase() : described.text, unmodifiedText: described.text }
       : { ...base, type: 'rawKeyDown' });
-    await cdp.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+    await send({ ...base, type: 'keyUp' });
   }
 
-  async function input(event) {
+  // `client`: the Browser-view client it came from (hub browser.input): the device in use, whose
+  // viewport counts as the newest request.
+  async function input(event, client = null) {
     const deliberate = event.kind !== 'move' && event.kind !== 'wheel';
-    if (deliberate) lastUserInput = Date.now();
+    if (deliberate) {
+      lastUserInput = Date.now();
+      const request = client && typeof client === 'object' ? viewportRequests.get(client) : null;
+      if (request) request.at = ++viewportSeq;
+    }
     const cdp = requireReady();
     inputSeen(deliberate);
     const button = BUTTON_BITS[event.button] ? event.button : 'left';
@@ -1280,7 +1854,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
         await pressKey(cdp, event);
         break;
       case 'text':
-        await cdp.send('Input.insertText', { text: String(event.text ?? '') });
+        await timed(cdp.send('Input.insertText', { text: String(event.text ?? '') }), INPUT_TIMEOUT_MS, 'The page did not answer');
         break;
       default:
         throw new LumenError('INVALID', `Unknown input kind ${String(event.kind).slice(0, 20)}`);
@@ -1288,8 +1862,11 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return {};
   }
 
-  async function setViewport(w, h) {
+  // `client`: the Browser-view client asking (hub browser.viewport); its size is the page's again
+  // when a client that asked after it leaves.
+  async function setViewport(w, h, client = null) {
     requestedViewport = clampViewport(w, h);
+    if (client && typeof client === 'object') viewportRequests.set(client, { ...requestedViewport, at: ++viewportSeq });
     if (sinks.size) return { value: { ...viewport } }; // the TV's viewport holds while it watches
     const next = clampViewport(w, h);
     const changed = next.w !== viewport.w || next.h !== viewport.h;
@@ -1298,33 +1875,43 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return { value: { ...viewport } };
   }
 
-  // For tests: runs an expression in the page and returns its value.
-  // `expression` in every frame of the page (each frame's own document), values in no special order;
-  // frames that fail or are gone are skipped. On the page itself, not a pop-up on show.
-  async function evaluateFrames(expression) {
+  /**
+   * `expression` in every frame of the page (each frame's own document, cross-site iframes included),
+   * values in no special order; frames that fail, do not answer or are gone are skipped. On the page
+   * itself, not a pop-up on show. withFrames: [{ frameId, value }] instead of the bare values (frameId
+   * as media() entries carry it).
+   */
+  async function evaluateFrames(expression, { withFrames = false } = {}) {
     const cdp = mainPage ?? requireReady();
-    const ids = [...frameContexts].slice(0, 60);
-    const results = await Promise.all(ids.map((contextId) => cdp.send('Runtime.evaluate', { expression: String(expression), contextId, returnByValue: true })
-      .then((r) => (r.exceptionDetails ? undefined : r.result?.value)).catch(() => undefined)));
-    return results.filter((v) => v !== undefined);
+    const contexts = [...frameContexts.values()].slice(0, 60);
+    const results = await Promise.all(contexts.map(({ sessionId, contextId, frameId }) => timed(
+      cdp.send('Runtime.evaluate', { expression: String(expression), contextId, returnByValue: true }, sessionId ?? undefined),
+      EVAL_TIMEOUT_MS, 'The page did not answer',
+    ).then((r) => (r.exceptionDetails ? undefined : { frameId, value: r.result?.value })).catch(() => undefined)));
+    const answered = results.filter((r) => r !== undefined && r.value !== undefined);
+    return withFrames ? answered : answered.map((r) => r.value);
   }
 
-  async function evaluate(expression) {
+  // Runs an expression in the page (the one on show) and returns its value; a page that does not
+  // answer within timeoutMs (a hung or crashed renderer) rejects with UNAVAILABLE.
+  async function evaluate(expression, { timeoutMs = EVAL_TIMEOUT_MS } = {}) {
     const cdp = requireReady();
-    const { result, exceptionDetails } = await cdp.send('Runtime.evaluate', { expression: String(expression), awaitPromise: true, returnByValue: true });
+    const { result, exceptionDetails } = await timed(cdp.send('Runtime.evaluate', { expression: String(expression), awaitPromise: true, returnByValue: true }),
+      timeoutMs, 'The page did not answer');
     if (exceptionDetails) throw new LumenError('FAILED', exceptionDetails.exception?.description ?? exceptionDetails.text ?? 'The page threw');
     return result?.value;
   }
 
-  // Restarts Edge when the VPN switch changed what --proxy-server must be, and reopens the page.
+  // Restarts Edge when the VPN switch changed what --proxy-server must be, and reopens the page
+  // (Lumen's own reopen: not the user's input).
   async function applyProxy() {
     const want = vpn()?.proxyUrl?.() ?? null;
     const wantOn = !!vpn()?.status?.().enabled;
     const running = !!(child || page || starting);
     if (!running || (want === launchedProxy && (want || !wantOn))) return {};
-    const url = store.get('browser.url')?.v;
+    const url = mainUrl;
     await close();
-    if (url) await open(url).catch(() => {}); // a fail-closed refusal shows as browser.session 'error'
+    if (url) await open(url, { userInput: false }).catch(() => {}); // a fail-closed refusal shows as browser.session 'error'
     return {};
   }
 
@@ -1345,7 +1932,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (cookies) {
       await step('Network.clearBrowserCookies');
       let origin = null;
-      try { origin = new URL(store.get('browser.url')?.v).origin; } catch { /* no page */ }
+      try { origin = new URL(mainUrl).origin; } catch { /* no page */ } // the page's site, not a pop-up's
       if (origin && origin !== 'null') await step('Storage.clearDataForOrigin', { origin, storageTypes: 'all' });
     }
   }
@@ -1361,14 +1948,24 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (stopped) throw new LumenError('UNAVAILABLE', 'Lumen is stopping');
     while (wiping) await wiping.catch(() => {});
     const wasRunning = !!(child || page || starting);
-    const reopen = history ? null : store.get('browser.url')?.v ?? null;
+    // The page itself (a pop-up's sign-in address is not reopened as the page), or the one a relaunch
+    // after Edge died would have brought back.
+    const reopen = history ? null : mainUrl ?? crashUrl;
+    if (history) {
+      // Never bring back a page that is being cleared, even when Edge already died (the page itself
+      // is forgotten with the rest below; clearLive still needs its site).
+      clearTimeout(relaunchTimer);
+      relaunchTimer = null;
+      crashUrl = null;
+    }
     const wipe = (async () => {
       if (starting) await starting.catch(() => {});
       await clearLive({ history, cache, cookies });
-      if (child || page) await close();
-      else await killStrays(); // an Edge left behind by an earlier run would keep the files locked
-      mediaSeen = [];
-      mediaRequests.clear();
+      const live = !!(child || page);
+      await close(); // also when Edge already died: no relaunch after this
+      if (closing) await closing.catch(() => {}); // the teardown after a death is still sweeping
+      if (!live) await killStrays(); // an Edge left behind by an earlier run would keep the files locked
+      tracker.reset();
       lastSnapshot = null;
       if (history) {
         lastUserInput = 0;
@@ -1388,7 +1985,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (result.left.length) log.warn('some browsing data was in use and stayed', { count: result.left.length });
     let restarted = false;
     if (wasRunning && !stopped && (reopen || sinks.size)) {
-      restarted = await open(reopen ?? homeUrl).then(() => true, (err) => {
+      restarted = await open(reopen ?? homeUrl, { userInput: false }).then(() => true, (err) => {
         log.warn('the browser did not start again after clearing', { message: err.message });
         return false;
       });
@@ -1411,7 +2008,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     if (lastFrame && ready) fn(lastFrame.bytes, lastFrame);
     return () => {
       if (!sinks.delete(fn) || sinks.size) return;
-      viewport = requestedViewport ?? viewport;
+      // The size of a client still watching, not that of one that asked and has left since.
+      const r = latestRequest();
+      viewport = r ? { w: r.w, h: r.h } : requestedViewport ?? viewport;
       applyMetrics();
       if (!watchers.size) armIdle();
     };
@@ -1428,6 +2027,20 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   /** DevTools details of the running browser for a capture tab, or null when it is not ready. */
   const devtools = () => (ready && devPort && mainTargetId ? { port: devPort, targetId: mainTargetId, ws: browser } : null);
+
+  /**
+   * Opens one of Lumen's own pages on this PC (live video's capture page, its address carrying a
+   * secret token) in a tab of its own, which the guard on this PC's pages lets through (guardRequest).
+   * → /json/new's target.
+   */
+  async function openOwnTab(url) {
+    if (!ready || !devPort) throw new LumenError('UNAVAILABLE', 'The browser is not open');
+    const href = new URL(url).href;
+    ownTabs.add(href);
+    const res = await fetch(`http://127.0.0.1:${devPort}/json/new?${href}`, { method: 'PUT' });
+    if (!res.ok) throw new LumenError('FAILED', `The browser did not open a tab (${res.status})`);
+    return res.json();
+  }
 
   /** Device scale of the TV's viewport (its CSS size stays 1280×720). */
   function setTvScale(scale) {
@@ -1507,8 +2120,11 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return { value: { clicked: el.text || el.tag, tag: el.tag } };
   }
 
-  /** Video streams the current page loaded, newest first. */
-  const media = () => mediaSeen.map((m) => ({ ...m, headers: { ...m.headers } }));
+  /**
+   * Video streams the current page and its frames loaded, newest first: { url, kind, mime, at,
+   * headers, frameId, current, role?, audioOnly?, audio?, variants?, renditions? } (see createMediaTracker).
+   */
+  const media = () => tracker.list();
 
   /** The size frames arrive in (input coordinates are in frame pixels). */
   const frameSize = () => ({ w: lastFrame?.w ?? viewport.w, h: lastFrame?.h ?? viewport.h });
@@ -1517,6 +2133,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     applyProxy,
     addSink,
     devtools,
+    openOwnTab,
     setTvScale,
     fitContents,
     setSparseFrames,

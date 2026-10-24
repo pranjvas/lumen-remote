@@ -566,7 +566,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       if (url) await feature.open(url, { userInput: !restore });
       else {
         await feature.ensureRunning();
-        if (!store.get('browser.url')?.v) await feature.nav('home');
+        if (!store.get('browser.url')?.v) await feature.nav('home', { userInput: !restore });
       }
       await adapter.request('screen', { on: true });
       screenSent = true;

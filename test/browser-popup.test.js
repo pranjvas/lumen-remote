@@ -81,6 +81,39 @@ describe('browser: sign-in pop-ups', { skip }, () => {
     assert.equal(await stack.server.features.browser.evaluate('document.title'), 'Shop');
   });
 
+  test('closing the browser with a pop-up on show says the pop-up is gone, so the next pop-up is news again', async () => {
+    await openShop();
+    await clickButton();
+    await waitFor(() => state('popup') === true, { timeout: 15000, message: 'the pop-up on show' });
+    okAck(await viewer.send('browser.close', {}, { timeout: 30000 }));
+    assert.equal(state('popup'), false, 'popup false once Edge is closed');
+    const patches = [];
+    const off = stack.server.store.on('patch', (patch) => { if (patch['browser.popup']) patches.push(patch['browser.popup'].v); });
+    try {
+      await openShop();
+      await clickButton();
+      await waitFor(() => state('popup') === true, { timeout: 15000, message: 'the next pop-up on show' });
+      // Patches go out in 50 ms batches.
+      await waitFor(() => patches.includes(true), { timeout: 2000, message: 'a patch said popup true (tvscreen pauses live video on it)' });
+    } finally {
+      off();
+    }
+    okAck(await viewer.send('browser.nav', { action: 'back' }));
+    await waitFor(() => state('popup') === false, { timeout: 10000, message: 'the pop-up closed' });
+  });
+
+  test('Clear history that keeps history, with a pop-up on show, reopens the page itself, not the sign-in address', async () => {
+    await openShop();
+    await clickButton();
+    await waitFor(() => state('popup') === true && /\/signin$/.test(state('url') ?? ''), { timeout: 15000, message: 'the pop-up and its address' });
+    const ack = await viewer.send('browser.clearHistory', { history: false, cache: true }, { timeout: 90000 });
+    okAck(ack);
+    assert.equal(ack.value.restarted, true);
+    await waitFor(() => state('title') === 'Shop', { timeout: 30000, message: `the shop page again (now ${state('title')})` });
+    assert.equal(state('url'), `${base}/`);
+    assert.equal(state('popup'), false);
+  });
+
   test('a plain window.open (no size) still opens in the same tab', async () => {
     await openShop();
     await stack.server.features.browser.evaluate(`window.open('${base}/signin'); true`);

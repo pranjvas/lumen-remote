@@ -554,4 +554,194 @@ describe('browser: links to this PC are refused by default', () => {
     assert.equal(validateUrl('http://127.0.0.1:8790/', { allowLoopback: true }), 'http://127.0.0.1:8790/');
     assert.equal(validateUrl('https://example.com/a'), 'https://example.com/a');
   });
+
+  test('every other spelling of this PC is refused too: IPv4 inside IPv6, trailing dots, integer forms', async () => {
+    const { isLoopbackHost, validateUrl } = await import('../server/features/browser.js');
+    for (const h of ['[::ffff:7f00:1]', '::ffff:7f00:1', '::ffff:127.0.0.1', 'localhost.', 'localhost..', 'app.localhost.', 'LOCALHOST',
+      '[::7f00:1]', '[::ffff:0:0]', '[64:ff9b::7f00:1]', '[::]', '127.1', '0177.0.0.1', '%6c%6fcalhost']) {
+      assert.equal(isLoopbackHost(h), true, h);
+    }
+    for (const h of ['localhost.example.com', 'example.com.', 'mylocalhost', '[::ffff:c0a8:102]', '[2001:db8::1]', '128.0.0.1', '', null]) {
+      assert.equal(isLoopbackHost(h), false, String(h));
+    }
+    for (const url of ['http://[::ffff:127.0.0.1]:8790/', 'http://localhost.:8790/', 'http://app.localhost./', 'http://[::ffff:7f00:1]/',
+      'http://[64:ff9b::7f00:1]/', 'http://2130706433/']) {
+      assert.throws(() => validateUrl(url), /this PC/, url);
+    }
+    assert.equal(validateUrl('http://[::ffff:c0a8:102]/'), 'http://[::ffff:c0a8:102]/', 'a LAN address inside IPv6 is not this PC');
+  });
+
+  test('the hub refuses the same forms for browser.open, browser.openOnTv and cast.url (they share isLoopbackHost)', async () => {
+    const stack = await startStack({ config: { browser: { allowLoopback: false } } });
+    try {
+      const c = stack.browser();
+      await c.hello;
+      for (const cmd of ['browser.open', 'cast.url']) {
+        for (const url of ['http://[::ffff:127.0.0.1]:9/', 'http://localhost.:9/', 'http://app.localhost./x']) {
+          const ack = await c.send(cmd, { url });
+          assert.equal(ack.ok, false, `${cmd} ${url}`);
+          assert.equal(ack.error.code, 'INVALID', `${cmd} ${url}`);
+        }
+      }
+      const restore = await c.send('browser.open', { url: 'https://example.com/', restore: 'yes' });
+      assert.equal(restore.ok, false, 'restore must be a boolean');
+      assert.equal(restore.error.code, 'INVALID');
+    } finally {
+      await stack.stop();
+    }
+  });
+});
+
+describe('browser: HLS playlists are told apart by their text (classifyPlaylist)', () => {
+  test('a master with an audio and a subtitles rendition, URIs resolved against the response URL', async () => {
+    const { classifyPlaylist } = await import('../server/features/browser.js');
+    const text = ['#EXTM3U', '#EXT-X-VERSION:6',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/en.m3u8"',
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",URI="https://subs.example.net/en.m3u8"',
+      '#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="CC",INSTREAM-ID="CC1"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud",SUBTITLES="subs"',
+      'v1080/index.m3u8?token=a',
+      '#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="aud"',
+      '/abs/v360.m3u8',
+      '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,URI="iframes.m3u8"', ''].join('\r\n');
+    assert.deepEqual(classifyPlaylist(text, 'https://cdn.example.com/show/master.m3u8?sig=1'), {
+      role: 'master',
+      variants: [
+        { url: 'https://cdn.example.com/show/v1080/index.m3u8?token=a', bandwidth: 5000000, height: 1080, codecs: 'avc1.640028,mp4a.40.2' },
+        { url: 'https://cdn.example.com/abs/v360.m3u8', bandwidth: 1200000, height: 360, codecs: 'avc1.4d401e,mp4a.40.2' },
+      ],
+      renditions: [
+        { url: 'https://cdn.example.com/show/audio/en.m3u8', type: 'audio' },
+        { url: 'https://subs.example.net/en.m3u8', type: 'subtitles' },
+      ],
+    });
+  });
+
+  test('a packed-AAC media playlist is audio only; TS and fMP4 ones are not; WebVTT segments are subtitles; other text is no playlist', async () => {
+    const { classifyPlaylist } = await import('../server/features/browser.js');
+    const media = (...segments) => ['#EXTM3U', '#EXT-X-TARGETDURATION:6', ...segments.flatMap((s) => ['#EXTINF:6.0,', s]), '#EXT-X-ENDLIST'].join('\n');
+    assert.deepEqual(classifyPlaylist(media('seg1.aac', 'seg2.aac?x=1'), 'https://a.example/a.m3u8'), { role: 'media', audioOnly: true });
+    assert.deepEqual(classifyPlaylist(media('seg1.ts', 'seg2.ts'), 'https://a.example/v.m3u8'), { role: 'media', audioOnly: false });
+    assert.deepEqual(classifyPlaylist(`#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n${media('s1.m4s').slice(8)}`, 'https://a.example/v.m3u8'), { role: 'media', audioOnly: false });
+    assert.deepEqual(classifyPlaylist(media('a.vtt', 'b.webvtt'), 'https://a.example/s.m3u8'), { role: 'subtitles' });
+    assert.deepEqual(classifyPlaylist('#EXTM3U\n#EXT-X-TARGETDURATION:2\n', 'https://a.example/live.m3u8'), { role: 'media', audioOnly: false }, 'a live playlist with no segments yet');
+    assert.equal(classifyPlaylist('<html>not found</html>', 'https://a.example/x.m3u8'), null);
+    assert.equal(classifyPlaylist('', 'https://a.example/x.m3u8'), null);
+  });
+
+  test('playlistKey drops only the LL-HLS delivery directives, leaving the rest of the address byte for byte', async () => {
+    const { playlistKey } = await import('../server/features/browser.js');
+    assert.equal(playlistKey('https://a.example/v.m3u8?_HLS_msn=12&_HLS_part=3&sig=a~b%2Fc'), 'https://a.example/v.m3u8?sig=a~b%2Fc');
+    assert.equal(playlistKey('https://a.example/v.m3u8?_HLS_skip=YES'), 'https://a.example/v.m3u8');
+    assert.equal(playlistKey('https://a.example/v.m3u8?sig=1&_HLS_msn=4#t'), 'https://a.example/v.m3u8?sig=1#t');
+    assert.equal(playlistKey('https://a.example/v.m3u8?msn=4'), 'https://a.example/v.m3u8?msn=4');
+  });
+});
+
+describe('browser: the media list (createMediaTracker) whatever order the Network events come in', () => {
+  const COOKIE = 'session=abc';
+  const req = (id, url, extra = {}) => ({ requestId: id, type: 'XHR', frameId: 'F1', request: { url, headers: { Referer: 'https://site.example/watch' } }, ...extra });
+  const extra = (id, headers = { Cookie: COOKIE, Host: 'cdn.example.com' }) => ({ requestId: id, headers });
+  const res = (id, url, mimeType = 'application/vnd.apple.mpegurl', status = 200) => ({ requestId: id, response: { url, mimeType, status } });
+  const done = (id) => ({ requestId: id, encodedDataLength: 100 });
+  const URL1 = 'https://cdn.example.com/v.m3u8';
+
+  async function tracker(opts) {
+    const { createMediaTracker } = await import('../server/features/browser.js');
+    return createMediaTracker({ isMainDocument: (p, s) => !s && p.type === 'Document' && p.frameId === 'F1', ...opts });
+  }
+  const orders = {
+    'extra before the response': (t) => { t.requestWillBeSent(req('1', URL1)); t.extraInfo(extra('1')); t.responseReceived(res('1', URL1)); t.loadingFinished(done('1')); },
+    'extra after the response': (t) => { t.requestWillBeSent(req('1', URL1)); t.responseReceived(res('1', URL1)); t.extraInfo(extra('1')); t.loadingFinished(done('1')); },
+    'extra after the load finished': (t) => { t.requestWillBeSent(req('1', URL1)); t.responseReceived(res('1', URL1)); t.loadingFinished(done('1')); t.extraInfo(extra('1')); },
+    'extra before the request': (t) => { t.extraInfo(extra('1')); t.requestWillBeSent(req('1', URL1)); t.responseReceived(res('1', URL1)); t.loadingFinished(done('1')); },
+  };
+  for (const [name, play] of Object.entries(orders)) {
+    test(`the cookie reaches the entry: ${name}`, async () => {
+      const t = await tracker();
+      play(t);
+      const list = t.list();
+      assert.equal(list.length, 1);
+      assert.deepEqual(list[0].headers, { cookie: COOKIE, referer: 'https://site.example/watch', origin: null, userAgent: null });
+      assert.equal(list[0].frameId, 'F1');
+      assert.equal(list[0].current, true);
+    });
+  }
+
+  test("a late extra-headers event of a redirect's first hop does not put that site's cookie on the next hop", async () => {
+    const t = await tracker();
+    t.requestWillBeSent(req('7', 'https://a.example/v.m3u8'));
+    t.requestWillBeSent({ ...req('7', URL1), redirectResponse: { status: 302 } });
+    t.extraInfo(extra('7', { Cookie: 'a=site-a', Host: 'a.example' }));
+    t.responseReceived(res('7', URL1));
+    assert.equal(t.list()[0].headers.cookie, null);
+    t.extraInfo(extra('7'));
+    assert.equal(t.list()[0].headers.cookie, COOKIE);
+  });
+
+  test('cross-site iframe sessions are kept apart: the same requestId in two sessions is two requests', async () => {
+    const t = await tracker();
+    t.requestWillBeSent({ ...req('5', URL1), frameId: 'F9' }, 'S1');
+    t.requestWillBeSent(req('5', 'https://cdn.example.com/other.mp4'));
+    t.extraInfo(extra('5'), 'S1');
+    t.responseReceived(res('5', URL1), 'S1');
+    t.responseReceived(res('5', 'https://cdn.example.com/other.mp4', 'video/mp4'));
+    const [file, hls] = t.list();
+    assert.deepEqual([file.kind, file.headers.cookie, file.frameId], ['file', null, 'F1']);
+    assert.deepEqual([hls.kind, hls.headers.cookie, hls.frameId], ['hls', COOKIE, 'F9']);
+    // An iframe's own Document request is not the page's: the list stays.
+    t.requestWillBeSent({ ...req('6', 'https://player.example/embed'), type: 'Document', frameId: 'F1' }, 'S1');
+    assert.equal(t.list().length, 2);
+    t.requestWillBeSent({ ...req('8', 'https://site.example/next'), type: 'Document' });
+    assert.equal(t.list().length, 0, 'the page itself moved on');
+  });
+
+  test('playlists are read: a master names its audio and subtitles renditions, before and after they are listed; LL-HLS reloads are one entry and never push the master out', async () => {
+    const bodies = new Map();
+    const reads = [];
+    const t = await tracker({
+      keep: 5,
+      readBody: async (requestId, sessionId) => { reads.push(requestId); return bodies.get(`${sessionId ?? ''}:${requestId}`); },
+    });
+    const load = async (id, url, body, { base64 = false, mime = undefined } = {}) => {
+      bodies.set(`:${id}`, base64 ? { body: Buffer.from(body).toString('base64'), base64Encoded: true } : { body, base64Encoded: false });
+      t.requestWillBeSent(req(id, url));
+      t.responseReceived(res(id, url, mime));
+      t.loadingFinished(done(id));
+      await new Promise((r) => setImmediate(r));
+    };
+    const base = 'https://cdn.example.com/show/';
+    await load('a', `${base}audio/en.m3u8`, '#EXTM3U\n#EXTINF:4,\na1.m4s\n'); // the audio rendition, listed before its master
+    await load('m', `${base}master.m3u8`, ['#EXTM3U', '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",URI="audio/en.m3u8"',
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",URI="subs/en.m3u8"', '#EXT-X-STREAM-INF:BANDWIDTH=9,RESOLUTION=1280x720', 'v720.m3u8', ''].join('\n'), { base64: true });
+    await load('s', `${base}subs/en.m3u8`, '#EXTM3U\n#EXTINF:4,\ns1.m4s\n');
+    await load('v', `${base}v720.m3u8`, '#EXTM3U\n#EXTINF:4,\nv1.ts\n');
+    const byUrl = (u) => t.list().find((m) => m.url === u);
+    assert.equal(byUrl(`${base}master.m3u8`).role, 'master');
+    assert.deepEqual(byUrl(`${base}master.m3u8`).variants, [{ url: `${base}v720.m3u8`, bandwidth: 9, height: 720, codecs: null }]);
+    assert.equal(byUrl(`${base}audio/en.m3u8`).audio, true, 'marked when the master came after it');
+    assert.equal(byUrl(`${base}subs/en.m3u8`).role, 'subtitles', 'marked when it came after the master, though its segments are fMP4');
+    assert.deepEqual([byUrl(`${base}v720.m3u8`).role, byUrl(`${base}v720.m3u8`).audioOnly], ['media', false]);
+
+    // LL-HLS: the variant reloads with delivery directives many times; it stays one entry, read once.
+    const before = reads.length;
+    for (let i = 0; i < 12; i += 1) await load(`r${i}`, `${base}v720.m3u8?_HLS_msn=${i}&_HLS_part=0`, '#EXTM3U\n#EXTINF:4,\nv1.ts\n');
+    assert.equal(reads.length, before, 'a playlist already read is not read again');
+    assert.equal(t.list().filter((m) => m.url === `${base}v720.m3u8`).length, 1);
+    assert.equal(byUrl(`${base}v720.m3u8`).role, 'media', 'carried over to the reloaded entry');
+    // Other streams push old entries out, never the master.
+    for (let i = 0; i < 8; i += 1) await load(`f${i}`, `https://cdn.example.com/clip${i}.mp4`, '', { mime: 'video/mp4' });
+    assert.ok(byUrl(`${base}master.m3u8`), 'the master is still listed');
+    assert.ok(t.list().length <= 5 + 1, `trimmed (${t.list().length})`);
+  });
+
+  test('a same-document navigation (an SPA) marks what was listed as no longer current', async () => {
+    const t = await tracker();
+    t.requestWillBeSent(req('1', URL1));
+    t.responseReceived(res('1', URL1));
+    t.nextGeneration();
+    t.requestWillBeSent(req('2', 'https://cdn.example.com/next.mpd'));
+    t.responseReceived(res('2', 'https://cdn.example.com/next.mpd', 'application/dash+xml'));
+    assert.deepEqual(t.list().map((m) => [m.kind, m.current]), [['dash', true], ['hls', false]]);
+  });
 });

@@ -949,8 +949,12 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     emptyStats = 0;
     encoderErrors = [];
     if (!captureTarget) {
+      // Through the browser feature: new tabs on this PC are refused unless it opened them itself.
+      const captureUrl = `http://127.0.0.1:${port}/capture?t=${token}`;
       const signal = AbortSignal.timeout(settings.browserTimeoutMs);
-      const target = await (await fetch(`http://127.0.0.1:${dt.port}/json/new?http://127.0.0.1:${port}/capture?t=${token}`, { method: 'PUT', signal })).json();
+      const target = feature.openOwnTab
+        ? await feature.openOwnTab(captureUrl)
+        : await (await fetch(`http://127.0.0.1:${dt.port}/json/new?${captureUrl}`, { method: 'PUT', signal })).json();
       captureTarget = { id: target.id, cdp: await connectCdp(target.webSocketDebuggerUrl, settings.browserTimeoutMs), devPort: dt.port };
     }
     await waitForPage();

@@ -10,12 +10,16 @@ import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import { startStack, waitFor } from './helpers.js';
 import { parseMessage, TV_CODEC_PROBES } from '../server/features/livevideo.js';
 import { findBox } from '../server/util/fmp4.js';
 
 const EDGE = process.env.LUMEN_EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const skip = !fs.existsSync(EDGE) && `headless Edge is not installed at ${EDGE}`;
+const LAN_IP = Object.values(os.networkInterfaces()).flat()
+  .filter((i) => i && i.family === 'IPv4' && !i.internal && /^(192\.168|10|172\.(1[6-9]|2\d|3[01]))\./.test(i.address))
+  .map((i) => i.address)[0] ?? null;
 const PAGE = '<title>Live</title><div id=b style="position:absolute;top:100px;width:100px;height:100px;background:#fc0"></div>'
   + '<script>let n=0;(function f(){n++;b.style.left=(n*4%1000)+"px";requestAnimationFrame(f)})();'
   + 'const ac=new AudioContext();const o=ac.createOscillator();o.connect(ac.destination);o.start();</script>';
@@ -249,5 +253,42 @@ describe('tvscreen: live video on the TV', { skip }, () => {
     agent.sendScreenInput({ key: 'red' });
     await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
     await b.waitForState('tvscreen.live', (r) => r?.v?.state === 'off', { timeout: 5000 });
+  });
+});
+
+// With this PC's pages refused (allowLoopback off, the default) every tab's requests pass the
+// browser-wide guard (browser.js guardRequest): live video's capture page, on this PC, is Lumen's own
+// tab (openOwnTab) and still opens.
+// The page itself is served on the LAN address. Skips without one.
+describe('tvscreen: live video with pages on this PC refused', { skip: skip || (!LAN_IP && 'no LAN IPv4 address to serve the page on') }, () => {
+  let stack, b, agent, web;
+  const caps = Object.fromEntries(TV_CODEC_PROBES.map((c) => [c, c.startsWith('avc1')]));
+  before(async () => {
+    web = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
+    await new Promise((r) => web.listen(0, LAN_IP, r));
+    stack = await startStack({ config: { browser: { edgePath: EDGE, idleMs: 120000, allowLoopback: false }, liveVideo: { enabled: true, maxHeight: 1080 } } });
+    b = stack.browser();
+    await b.hello;
+    agent = stack.agent({ version: '0.8.1' });
+    await b.waitForState('conn.agent', (r) => r?.v === 'online', { timeout: 10000 });
+  });
+  after(async () => {
+    await stack?.stop();
+    web?.close();
+  });
+
+  test('the capture tab opens and the TV gets the stream', async () => {
+    const ack = await b.send('browser.openOnTv', { url: `http://${LAN_IP}:${web.address().port}/` }, { timeout: 40000 });
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    await waitFor(() => agent.screen.find((m) => m.t === 'screen-live-offer'), { timeout: 5000, what: 'the live offer' });
+    agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'ready', caps }));
+    const statsTimer = setInterval(() => agent.ws.send(JSON.stringify({ t: 'screen-live', state: 'stats', lag: 0.1, dropped: 0, decoded: 120, stalls: 0 })), 500);
+    try {
+      await waitFor(() => agent.frames.some((f) => tag(f) === 'LVM'), { timeout: 30000, what: 'live video fragments' });
+    } finally {
+      clearInterval(statsTimer);
+    }
+    agent.sendScreenInput({ key: 'red' });
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
   });
 });

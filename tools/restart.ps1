@@ -5,7 +5,8 @@
 .DESCRIPTION
   Stops the node process running server/index.js, starts it again with tools/start-hidden.js, and
   polls /api/health. With -KeepTvPage, the page Lumen's browser showed on the TV (or on its own) is
-  opened again afterwards, since a restart closes the browser and the TV screen.
+  opened again afterwards (as a restore, which is not anyone's input), since a restart closes the
+  browser and the TV screen. Without it, a TV showing Lumen's browser is told to close it first.
 #>
 [CmdletBinding()]
 param(
@@ -23,7 +24,7 @@ function Send-Hub([string]$Cmd, [hashtable]$CmdArgs = @{}) {
 const ws = new WebSocket('ws://127.0.0.1:$Port/live', { headers: { Origin: 'http://127.0.0.1:$Port' } });
 const args = JSON.parse(process.env.LUMEN_CMD_ARGS || '{}');
 ws.addEventListener('open', () => ws.send(JSON.stringify({ t: 'cmd', id: 'r1', cmd: '$Cmd', ...args })));
-ws.addEventListener('message', (ev) => { const m = JSON.parse(ev.data); if (m.t === 'ack' && m.id === 'r1') { console.log(JSON.stringify(m)); ws.close(); } });
+ws.addEventListener('message', (ev) => { const m = JSON.parse(ev.data); if (m.t === 'ack' && m.id === 'r1') { console.log(JSON.stringify(m)); ws.close(); setTimeout(() => process.exit(0), 100); } });
 setTimeout(() => process.exit(0), 60000);
 "@
   # Through the environment: Windows PowerShell mangles the quotes of JSON passed as an argument.
@@ -34,7 +35,7 @@ setTimeout(() => process.exit(0), 60000);
 function Get-State([string]$Key) {
   $script = @"
 const ws = new WebSocket('ws://127.0.0.1:$Port/live', { headers: { Origin: 'http://127.0.0.1:$Port' } });
-ws.addEventListener('message', (ev) => { const m = JSON.parse(ev.data); if (m.t === 'hello') { console.log(JSON.stringify(m.state['$Key']?.v ?? null)); ws.close(); } });
+ws.addEventListener('message', (ev) => { const m = JSON.parse(ev.data); if (m.t === 'hello') { console.log(JSON.stringify(m.state['$Key']?.v ?? null)); ws.close(); setTimeout(() => process.exit(0), 100); } });
 setTimeout(() => process.exit(0), 10000);
 "@
   node -e $script
@@ -47,6 +48,16 @@ if ($KeepTvPage) {
     $onTv = Get-State 'tvscreen.on' | ConvertFrom-Json
     if ($url) { $restore = @{ url = $url; tv = [bool]$onTv } }
   } catch { Write-Host 'Lumen was not answering; nothing to restore.' }
+} else {
+  # Without -KeepTvPage the TV leaves Lumen's browser cleanly now, instead of being left on a screen
+  # whose server has gone.
+  try {
+    $onTv = Get-State 'tvscreen.on' | ConvertFrom-Json
+    if ($onTv -eq $true) {
+      $null = Send-Hub 'tvscreen.close'
+      Write-Host 'Closed the browser on the TV.'
+    }
+  } catch { }
 }
 
 $procs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'lumen-remote\\server\\index.js' }
@@ -67,6 +78,7 @@ Write-Host "Healthy: $health"
 
 if ($restore) {
   $cmd = if ($restore.tv) { 'browser.openOnTv' } else { 'browser.open' }
-  $ack = Send-Hub $cmd @{ url = $restore.url } | ConvertFrom-Json
+  # restore: Lumen putting the page back is nobody's click, so a video it starts by itself stays on the page.
+  $ack = Send-Hub $cmd @{ url = $restore.url; restore = $true } | ConvertFrom-Json
   Write-Host ("Reopened the page{0}: {1}" -f ($(if ($restore.tv) { ' on the TV' } else { '' })), $(if ($ack.ok) { 'ok' } else { $ack.error.message }))
 }

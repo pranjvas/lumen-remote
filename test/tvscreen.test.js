@@ -267,6 +267,67 @@ function fakeBrowser(w = 1000, h = 500) {
   return { inputs, frameSize: () => ({ w, h }), input: async (event) => { inputs.push(event); return {}; } };
 }
 
+// tools/restart.ps1 -KeepTvPage puts the TV's page back with browser.openOnTv { restore: true }: that is
+// nobody's input, so the video the page starts by itself stays on the page (the automatic hand-off
+// takes only videos started within 10 s of someone's input).
+describe("tvscreen: Lumen putting the page back on the TV is nobody's input", { skip }, () => {
+  let stack, b, agent, web, base;
+  const ok = (ack) => assert.equal(ack.ok, true, JSON.stringify(ack.error));
+  const state = (key) => stack.server.store.get(`browser.${key}`)?.v;
+  before(async () => {
+    web = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      if (req.url.startsWith('/clip.m3u8')) return res.end(['#EXTM3U', '#EXTINF:4,', 'seg.ts', '#EXT-X-ENDLIST', ''].join('\n'));
+      // A big video that starts by itself (its playing state set by the page, as in the suite above).
+      if (req.url.startsWith('/video')) {
+        return res.end('<title>Video</title><video id="v" src="/clip.m3u8" style="width:100vw;height:80vh"></video>'
+          + '<script>let p = false; Object.defineProperty(v, "paused", { get: () => p }); v.pause = () => { p = true; };</script>');
+      }
+      return res.end('<title>Home</title><p>Home</p>');
+    });
+    await new Promise((r) => web.listen(0, '127.0.0.1', r));
+    base = `http://127.0.0.1:${web.address().port}`;
+    stack = await startStack({ config: { browser: { edgePath: EDGE, idleMs: 120000, allowLoopback: true, homeUrl: `${base}/home` } } });
+    b = stack.browser();
+    await b.hello;
+    agent = stack.agent();
+    await b.waitForState('conn.agent', (r) => r?.v === 'online', { timeout: 10000 });
+  });
+  after(async () => {
+    await stack?.stop();
+    web?.close();
+  });
+
+  test('browser.openOnTv with restore: true leaves lastInputAt as it was (a page, the page already open, the home page), and its autoplaying video stays on the page; without restore it is input', async () => {
+    const browser = stack.server.features.browser;
+    const plays = () => agent.screen.filter((m) => m.t === 'screen-play').length;
+    assert.equal(browser.lastInputAt(), 0);
+    ok(await b.send('browser.openOnTv', { url: `${base}/video`, restore: true }, { timeout: 40000 }));
+    await b.waitForState('tvscreen.on', (r) => r?.v === true, { timeout: 5000 });
+    await waitFor(() => state('title') === 'Video', { timeout: 15000, what: 'the restored page' });
+    assert.equal(browser.lastInputAt(), 0, 'restoring a page is not input');
+    await new Promise((r) => setTimeout(r, 4000)); // a few hand-off polls (every 1.5 s)
+    assert.equal(plays(), 0, 'the video it started by itself was not handed to the TV');
+    assert.equal(await browser.evaluate('v.paused'), false, 'and keeps playing on the page');
+
+    ok(await b.send('browser.openOnTv', { url: `${base}/video`, restore: true }, { timeout: 40000 }));
+    assert.equal(browser.lastInputAt(), 0, 'restoring the page already open is not input');
+
+    ok(await b.send('tvscreen.close'));
+    await browser.close();
+    assert.equal(state('url'), null);
+    ok(await b.send('browser.openOnTv', { restore: true }, { timeout: 40000 }));
+    await waitFor(() => state('title') === 'Home', { timeout: 15000, what: 'the home page' });
+    assert.equal(browser.lastInputAt(), 0, 'the home page put back is not input');
+
+    const before = Date.now();
+    ok(await b.send('browser.openOnTv', { url: `${base}/video` }, { timeout: 40000 }));
+    assert.ok(browser.lastInputAt() >= before, 'opening a page on the TV is input');
+    await waitFor(() => plays() > 0, { timeout: 15000, what: 'the video handed to the TV player' });
+    ok(await b.send('tvscreen.close'));
+  });
+});
+
 describe('tvscreen: the trackpad pointer stops at every edge (no Edge needed)', () => {
   const store = { map: new Map(), get(k) { return this.map.get(k); }, set(k, v) { this.map.set(k, { v }); } };
   const screen = (page) => createTvScreen({ config: {}, log: createTestLog(), store, agent: () => null, rest: null, browser: () => page, relay: () => null });
