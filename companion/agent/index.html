@@ -39,8 +39,9 @@
     .screen { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; background: #000; z-index: 10; }
     .screen.off { display: none; }
     .screen.video { background: transparent; }
-    /* While the TV's player shows a video, everything above the video plane is see-through. */
-    body.video { background: transparent; }
+    /* While the TV's player shows a video, everything above the video plane is see-through (html too:
+       its own background hides the video). */
+    html.video, body.video { background: transparent; }
     body.video .glow, body.video .card { display: none; }
     .screen.video #frame, .screen.video #cursor { display: none !important; }
     #frame { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; object-fit: contain; }

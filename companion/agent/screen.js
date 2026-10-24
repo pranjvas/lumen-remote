@@ -151,6 +151,14 @@
 
   function avplayTime() { return read(function () { return webapis.avplay.getCurrentTime(); }, null); }
 
+  // AVPlay draws under the page: everything above it must be see-through, the page's root included
+  // (html's own dark background hid every video, with the clock running: seen 24 Oct with Eyes).
+  function videoLayer(on) {
+    [document.documentElement, document.body].forEach(function (el) {
+      if (el) el.classList[on ? 'add' : 'remove']('video');
+    });
+  }
+
   // A screen-video message about the current video (the PC matches `id` to the stream it sent).
   function sendVideo(fields) {
     const msg = { t: 'screen-video' };
@@ -170,7 +178,7 @@
       hidden: false, suspended: false, closed: false, resumeAt: 0, attempt: 0 };
     const mine = video;
     root.className = 'screen video';
-    document.body.classList.add('video');
+    videoLayer(true);
     showHint((title ? title + ' · ' : '') + 'OK play/pause · ◀ ▶ 10 s · Yellow convert · Back returns to the page', 7000);
     // Lumen found a format the TV's player does not take (fragmented-MP4 HLS): skip it.
     if (engine === 'hls') return refused(drm ? 'DRM-protected HLS' : 'fragmented-MP4 HLS', mine);
@@ -453,7 +461,7 @@
     }
     sendVideo(reason ? { state: 'stopped', reason: reason } : { state: 'stopped' });
     video = null;
-    document.body.classList.remove('video');
+    videoLayer(false);
     root.className = active ? 'screen' : 'screen off';
     if (backToPage) showHint(linkDown ? LINK_HINT : 'Back to the page', linkDown ? 0 : 2500);
   }

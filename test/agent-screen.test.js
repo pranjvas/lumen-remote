@@ -77,6 +77,7 @@ function setup({ hlsSupported = true, suspend = true } = {}) {
     document: {
       getElementById: (id) => els[id],
       addEventListener(type, fn) { listeners[type] = fn; },
+      documentElement: element(),
       body: element(),
       hidden: false,
     },
@@ -114,7 +115,7 @@ function setup({ hlsSupported = true, suspend = true } = {}) {
   // A remote key as the TV delivers it (keydown on the document).
   const key = (keyCode) => listeners.keydown({ keyCode, preventDefault() {}, stopPropagation() {} });
   const setHidden = (hidden) => { ctx.document.hidden = hidden; };
-  return { sent, states, avplay, mse, hlsInstances, play, advance, screen, els, key, setHidden, closed: () => closed };
+  return { sent, states, avplay, mse, hlsInstances, play, advance, screen, els, doc: ctx.document, key, setHidden, closed: () => closed };
 }
 
 const fatalMedia = (details) => ({ fatal: true, type: 'mediaError', details });
@@ -167,6 +168,18 @@ test('hls.js: incompatible codecs fail at once without re-attaching', () => {
     assert.equal(h.calls.some((c) => c[0] === 'recoverMediaError'), false, details);
     assert.match(s.sent.find((m) => m.state === 'error').error, new RegExp(details));
   }
+});
+
+test('AVPlay: while a video plays, the page above it is see-through down to html; back on the page, it is not', () => {
+  // Seen 24 Oct with Eyes: html kept its dark background and hid every video, its clock running.
+  const s = setup();
+  s.play('http://pc/relay/tok/a.mp4');
+  assert.ok(s.doc.documentElement.classList.contains('video'), 'html');
+  assert.ok(s.doc.body.classList.contains('video'), 'body');
+  s.key(10009); // Back: to the page
+  assert.equal(s.states().at(-1), 'stopped');
+  assert.equal(s.doc.documentElement.classList.contains('video'), false);
+  assert.equal(s.doc.body.classList.contains('video'), false);
 });
 
 test('AVPlay: a late prepare error from a replaced video does not touch the current one', () => {
