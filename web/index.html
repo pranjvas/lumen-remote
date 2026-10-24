@@ -7,7 +7,9 @@
   <meta name="theme-color" content="#0e1013">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <!-- Not black-translucent: under a see-through status bar, iOS shortens a Home Screen app's view by the
+       status bar's height and leaves a black band at the bottom that no page can paint (seen on iOS 26). -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="Lumen">
   <meta name="description" content="Lumen — a calm, live remote and dashboard for the Samsung Q95T">
   <title>Lumen</title>
