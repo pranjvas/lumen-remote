@@ -58,7 +58,7 @@ const NAMES = {
   rest: 'The TV', remote: 'The remote channel', upnp: 'UPnP', ipc: 'IP Control', agent: 'The TV agent', eyes: 'Lumen Eyes',
   wol: 'Wake-on-LAN', avtransport: 'Media casting', dial: 'App casting', sleep: 'The sleep timer', scenes: 'Scenes',
   tracked: 'Tracked settings', macros: 'Macros', cast: 'Cast', ai: 'Ask Lumen', browser: 'The browser', vpn: 'The VPN',
-  history: 'Clearing history',
+  history: 'Clearing history', incognito: 'Incognito',
 };
 
 // The caller used when hub.handle is given no client (internal use, tests).
@@ -937,6 +937,9 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       broadcast({ t: 'browser.cleared', ...choice });
       return res;
     },
+    // Incognito (features/incognito.js): the browser restarts on a throwaway profile, and Lumen keeps
+    // no record of its pages; off deletes that profile and goes back to the normal one (browser.incognito).
+    'browser.incognito': async ({ on }) => feature('incognito', 'set', { on: boolean(on, 'on') }),
     // "On TV": Lumen's own browser shown full screen on the TV (the TV's built-in browser stays
     // available as browser.openInTvBrowser).
     'browser.openOnTv': async ({ url }) => {

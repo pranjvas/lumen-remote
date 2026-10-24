@@ -29,6 +29,7 @@ import { createTranscoder } from './features/transcode.js';
 import { createLiveVideo } from './features/livevideo.js';
 import { createMemory } from './features/memory.js';
 import { createHistory } from './features/history.js';
+import { createIncognito } from './features/incognito.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -117,6 +118,8 @@ export async function startServer(overrides = {}, seams = {}) {
     // Clear history (hub browser.clearHistory) reaches the browser, the TV screen, the relay, the
     // converter and the log files.
     features.history = createHistory({ ...ctx, features });
+    // Incognito (hub browser.incognito): the browser on a throwaway profile, and no record of its pages.
+    features.incognito = createIncognito({ ...ctx, features });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);

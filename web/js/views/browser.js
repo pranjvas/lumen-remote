@@ -428,7 +428,7 @@ export function mountBrowser(root, ctx) {
       ` · ${s === 'error' && error ? error : sessionLabel}`);
     paintMeta();
 
-    const next = `${s}|${hasFrame}|${s === 'error' ? error : ''}`;
+    const next = `${s}|${hasFrame}|${s === 'error' ? error : ''}|${ctx.state.value('browser.incognito', false)}`;
     if (next === shape) return;
     shape = next;
     if (s === 'off') fill(overlay, welcome());
@@ -439,6 +439,13 @@ export function mountBrowser(root, ctx) {
   }
 
   function welcome() {
+    if (ctx.state.value('browser.incognito', false) === true) {
+      return h('div', { class: 'browser-welcome' },
+        h('div', { class: 'browser-orb', 'aria-hidden': 'true' }, icon('eye-off', 'lg')),
+        h('h2', { class: 'browser-lead', text: 'Incognito' }),
+        h('p', { class: 'browser-copy', text: 'Pages you open aren’t saved in Lumen’s history, cookies or logs. Closing incognito deletes everything from this session.' }),
+        h('div', { class: 'chips browser-suggest' }, SUGGESTIONS.map(([label, target]) => h('button', { class: 'chip', type: 'button', text: label, onClick: () => open(target) }))));
+    }
     return h('div', { class: 'browser-welcome' },
       h('div', { class: 'browser-orb', 'aria-hidden': 'true' }, icon('globe', 'lg')),
       h('h2', { class: 'browser-lead', text: 'A browser inside Lumen' }),
@@ -469,6 +476,94 @@ export function mountBrowser(root, ctx) {
     painted = 0;
     if (showing()) paintMeta();
   }, 1000);
+
+  /* ---------- incognito (hub browser.incognito) ---------- */
+
+  // The switch sits beside the VPN switch; while it is on, the address bar is tinted and carries an
+  // Incognito badge. The first time, a sheet says what it does; leaving with a page open asks first.
+  const INCOGNITO_SEEN = 'lumen.incognitoSeen'; // not lumen.browser.*: Clear history keeps it
+  const incognitoOn = () => ctx.state.value('browser.incognito', false) === true;
+  const incognitoButton = h('button', { class: 'btn ghost browser-incognito', type: 'button', 'aria-pressed': 'false', 'aria-label': 'Incognito' },
+    icon('eye-off'), h('span', { text: 'Incognito' }));
+  const incognitoBadge = h('span', { class: 'browser-incognito-badge', hidden: true, title: 'Incognito: pages aren’t kept' },
+    icon('eye-off', 'sm'), h('span', { text: 'Incognito' }));
+  vpnButtons[0].after(incognitoButton);
+  addressIcon.after(incognitoBadge);
+  let leaving = false; // this phone turned it off (no "ended" notice then)
+
+  async function setIncognito(on, el = incognitoButton) {
+    leaving = !on;
+    incognitoButton.classList.add('is-busy');
+    const ack = await ctx.cmd('browser.incognito', { on }, { el, timeoutMs: 60000 });
+    incognitoButton.classList.remove('is-busy');
+    if (!ack.ok) leaving = false;
+    else toast(on ? 'Incognito · pages you open aren’t kept' : 'Incognito closed · its session was deleted', { level: on ? 'info' : 'ok' });
+    return ack;
+  }
+
+  const incognitoSheet = (title, lead, note, [stay, act, actIcon], run) => openSheet({
+    title,
+    className: 'incognito-sheet',
+    build(body, sheet) {
+      const cancel = h('button', { class: 'btn ghost', type: 'button', text: stay });
+      const confirm = h('button', { class: 'btn primary', type: 'button', autofocus: true }, icon(actIcon), act);
+      cancel.addEventListener('click', () => sheet.close());
+      confirm.addEventListener('click', async () => {
+        confirm.classList.add('is-busy');
+        confirm.disabled = true;
+        const ack = await run(confirm);
+        confirm.classList.remove('is-busy');
+        confirm.disabled = false;
+        if (ack.ok) sheet.close();
+      });
+      body.append(
+        h('div', { class: 'incognito-lead' }, h('span', { class: 'incognito-mark', 'aria-hidden': 'true' }, icon('eye-off')), h('p', { class: 'sheet-lead', text: lead })),
+        h('p', { class: 'clear-note', text: note }),
+        h('div', { class: 'sheet-actions' }, cancel, confirm));
+    },
+  });
+
+  incognitoButton.addEventListener('click', () => {
+    haptic('key');
+    if (!incognitoOn()) {
+      let seen = false;
+      try { seen = localStorage.getItem(INCOGNITO_SEEN) === '1'; } catch { /* storage unavailable */ }
+      if (seen) { setIncognito(true); return; }
+      incognitoSheet('Go incognito',
+        'Pages you open aren’t saved in Lumen’s history, cookies or logs. Closing incognito deletes everything from this session.',
+        'The browser restarts on a fresh profile, so sites start signed out. Everyone using Lumen shares this browser, so it is incognito for them too; the VPN stays as it is.',
+        ['Cancel', 'Go incognito', 'eye-off'],
+        async (el) => {
+          const ack = await setIncognito(true, el);
+          if (ack.ok) try { localStorage.setItem(INCOGNITO_SEEN, '1'); } catch { /* storage unavailable */ }
+          return ack;
+        });
+      return;
+    }
+    if (!url() && ctx.state.value('tvscreen.on', false) !== true) { setIncognito(false); return; }
+    incognitoSheet('Close incognito?',
+      'This closes the incognito page (on the TV too) and deletes everything from this session: cookies, sign-ins and site data.',
+      'The browser goes back to your normal profile and the page you had open before.',
+      ['Stay incognito', 'Close incognito', 'exit'],
+      (el) => setIncognito(false, el));
+  });
+
+  let wasIncognito = false;
+  ctx.state.watch('browser.incognito', () => {
+    const on = incognitoOn();
+    root.dataset.incognito = String(on);
+    incognitoButton.setAttribute('aria-pressed', String(on));
+    incognitoButton.title = on ? 'Close incognito and delete its session' : 'Incognito: pages aren’t kept in Lumen’s history, cookies or logs';
+    incognitoBadge.hidden = !on;
+    addressIcon.hidden = on;
+    // Ended (here, elsewhere, or because the browser closed): this phone forgets its copy of the page.
+    if (wasIncognito && !on) {
+      forgetLocal();
+      if (!leaving) toast('Incognito ended · its session was deleted', { level: 'info' });
+    }
+    leaving = false;
+    wasIncognito = on;
+  });
 
   /* ---------- frames ---------- */
 

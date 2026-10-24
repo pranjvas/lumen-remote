@@ -4,9 +4,12 @@
 // first use, keeps its profile under data/browser-profile, listens on 127.0.0.1 only and closes
 // after idleMs without a viewer. The process-handling follows tools/screenshot.mjs. Clear history
 // (clearHistory, removeProfileData) closes Edge and deletes the chosen kinds of data from the profile.
+// Incognito (setIncognito) runs Edge on a throwaway profile in the temp folder instead.
 import { spawn, execFile, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { LumenError } from '../errors.js';
 
@@ -291,6 +294,11 @@ export function removeProfileData(profileDir, { history = true, cache = true, co
   return { removed, left };
 }
 
+/** The name every incognito profile folder (under the temp folder) of the Lumen using `profileDir` starts with. */
+export function incognitoPrefixFor(profileDir) {
+  return `lumen-incognito-${createHash('sha256').update(path.resolve(profileDir).toLowerCase()).digest('hex').slice(0, 8)}-`;
+}
+
 export function clampViewport(w, h) {
   return {
     w: clamp(Math.round(Number(w) || VIEWPORT.maxW), VIEWPORT.minW, VIEWPORT.maxW),
@@ -448,6 +456,15 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   const { edgePath } = settings;
   const homeUrl = settings.homeUrl ?? HOME_URL; // Home, and the TV's page after Clear history (tests use a loopback one)
   const profileDir = path.join(config.dataDir, PROFILE_DIR);
+  // Incognito: Edge runs on a fresh profile in a new folder under the system's temp folder and never
+  // on profileDir. The folder names start with this Lumen's own prefix (from its profile path), so a
+  // Lumen that was killed finds what it left behind and deletes it (sweepIncognito), and two Lumens
+  // (the tests, a dev stack) never touch each other's.
+  const incognitoPrefix = incognitoPrefixFor(profileDir);
+  let incognito = false;
+  let incognitoDir = null; // the incognito session's profile, from Edge's first start in it
+  let beforeIncognito = null; // the page open when incognito began, shown again when it ends
+  const incognitoListeners = new Set();
 
   let viewport = { w: VIEWPORT.maxW, h: VIEWPORT.maxH };
   // On Windows the spawned msedge.exe hands the profile to a new browser process and exits within a
@@ -750,6 +767,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     else {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     }
+    if (incognitoDir) removeIncognitoDir(incognitoDir); // nor its incognito profile
   }
 
   function taskkill(pid) {
@@ -775,15 +793,15 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // as the fallback (as tools/screenshot.mjs does).
   // msedge.exe processes started with Lumen's profile directory (strays from an earlier run, or
   // helpers that outlived Browser.close). Windows only; elsewhere this is a no-op.
-  function killStrays() {
+  function killStrays(dir = profileDir) {
     if (process.platform !== 'win32') return Promise.resolve();
-    const pattern = `*${profileDir}*`.replace(/'/g, "''");
+    const pattern = `*${dir}*`.replace(/'/g, "''");
     const script = `Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object { $_.CommandLine -like '${pattern}' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
     return new Promise((resolve) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
       { windowsHide: true, timeout: 15000 }, () => resolve()));
   }
 
-  async function closeEdge({ proc, conn, port, pid }) {
+  async function closeEdge({ proc, conn, port, pid, dir }) {
     if (conn) {
       await Promise.race([conn.send('Browser.close').catch(() => {}), sleep(BROWSER_CLOSE_MS)]);
       conn.close();
@@ -794,11 +812,13 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       log.warn('Edge did not close on request; killing it', { pid });
       for (const target of new Set([pid, proc.pid].filter(Boolean))) if (isAlive(target)) await taskkill(target);
     }
-    await killStrays(); // crashpad/utility helpers can outlive the browser process
+    await killStrays(dir); // crashpad/utility helpers can outlive the browser process
   }
 
-  // Edge is never left running after this: killOnExit covers a crash of Lumen itself.
-  async function teardown() {
+  // Edge is never left running after this: killOnExit covers a crash of Lumen itself. While incognito
+  // this ends the incognito session (its profile is deleted) unless keepProfile: Edge starts again
+  // in the same session right away (the VPN switch, a start retry).
+  async function teardown({ keepProfile = false } = {}) {
     launchedProxy = null;
     savedBounds = null;
     clearIdle();
@@ -809,7 +829,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     resetPacing();
     pressed.clear();
     ready = false;
-    const session = { proc: child, conn: browser, port: devPort, pid: browserPid };
+    const session = { proc: child, conn: browser, port: devPort, pid: browserPid, dir: incognitoDir ?? profileDir };
     const cdp = mainPage ?? page;
     const popupCdp = popup?.cdp ?? null;
     popup = null;
@@ -830,6 +850,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       process.off('exit', killOnExit);
     }
     clearPage();
+    if (incognito && !keepProfile) endIncognito();
   }
 
   // ---------- pop-ups ----------
@@ -953,9 +974,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     setSession('starting');
     await killStrays(); // an Edge left behind by an earlier Lumen would keep the profile locked
     const port = await freePort();
-    fs.mkdirSync(profileDir, { recursive: true });
+    if (incognito) incognitoDir ??= fs.mkdtempSync(path.join(os.tmpdir(), incognitoPrefix));
+    else fs.mkdirSync(profileDir, { recursive: true });
     const proc = spawn(edgePath, [
-      '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`,
+      '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${incognitoDir ?? profileDir}`,
       // The largest viewport, so no later size (the TV's 1280×720 after a phone's 358×411) is bigger
       // than the window: the screencast then sent squeezed frames or none at all.
       `--window-size=${VIEWPORT.maxW},${VIEWPORT.maxH}`, screenArg(screenScale),
@@ -1088,7 +1110,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     page = cdp;
     ready = true;
     setSession('ready');
-    log.info('browser started', { port, pid: browserPid, viewport, vpn: !!proxyUrl });
+    log.info('browser started', { port, pid: browserPid, viewport, vpn: !!proxyUrl, incognito });
     if (!watchers.size) armIdle();
   }
 
@@ -1101,7 +1123,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
         // Right after a Lumen restart the old Edge can still be letting go of the profile: try once more.
         if (!/did not start in time/.test(err.message) || stopped) throw err;
         log.info('browser start retry', { message: err.message });
-        await teardown();
+        await teardown({ keepProfile: true });
         await sleep(2000);
         return launch();
       })
@@ -1116,13 +1138,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     return starting;
   }
 
-  async function close() {
+  async function close({ keepProfile = false } = {}) {
     if (!child && !page && !starting) {
+      if (incognito && !keepProfile) endIncognito();
       if (store.get('browser.session')?.v !== 'off') setSession('off');
       return {};
     }
     if (starting) await starting.catch(() => {});
-    await teardown();
+    await teardown({ keepProfile });
     setSession('off');
     log.info('browser closed');
     return {};
@@ -1320,7 +1343,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     const running = !!(child || page || starting);
     if (!running || (want === launchedProxy && (want || !wantOn))) return {};
     const url = store.get('browser.url')?.v;
-    await close();
+    await close({ keepProfile: true }); // an incognito session stays incognito, on the same profile
     if (url) await open(url).catch(() => {}); // a fail-closed refusal shows as browser.session 'error'
     return {};
   }
@@ -1357,6 +1380,14 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   async function clearHistory({ history = true, cache = true, cookies = false } = {}) {
     if (stopped) throw new LumenError('UNAVAILABLE', 'Lumen is stopping');
     while (wiping) await wiping.catch(() => {});
+    // Incognito: Edge is not using the normal profile, so its files go without ending the session;
+    // what the incognito tab holds is cleared in place.
+    if (incognito) {
+      await clearLive({ history, cache, cookies });
+      const result = removeProfileData(profileDir, { history, cache, cookies });
+      if (result.left.length) log.warn('some browsing data was in use and stayed', { count: result.left.length });
+      return { ...result, restarted: false };
+    }
     const wasRunning = !!(child || page || starting);
     const reopen = history ? null : store.get('browser.url')?.v ?? null;
     const wipe = (async () => {
@@ -1392,6 +1423,99 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     }
     log.debug('browsing data cleared', { history, cache, cookies, removed: result.removed, restarted });
     return { ...result, restarted };
+  }
+
+  // ---------- incognito (hub browser.incognito, features/incognito.js) ----------
+
+  // Synchronous (Lumen's exit uses it too). A folder Windows still holds is tried again shortly, and
+  // whatever is left the next start's sweep deletes.
+  function removeIncognitoDir(dir) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 100 });
+    } catch (err) {
+      log.warn('the incognito profile is still in use; deleting it shortly', { code: err.code });
+      setTimeout(() => fs.rm(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 250 }, () => {}), 5000).unref();
+    }
+  }
+
+  function tellIncognito(on) {
+    for (const fn of incognitoListeners) {
+      try { fn(on); } catch (err) { log.warn('incognito listener failed', err); }
+    }
+  }
+
+  // The incognito session is over (Edge is closed): its profile folder goes, and so does what this
+  // feature held about its pages (the videos they loaded, the AI's last read of the page).
+  function endIncognito() {
+    if (!incognito) return;
+    const dir = incognitoDir;
+    incognito = false;
+    incognitoDir = null;
+    mediaSeen = [];
+    mediaRequests.clear();
+    lastSnapshot = null;
+    titleFromPage = null;
+    lastUserInput = 0;
+    if (store.get('browser.media')?.v) publish('media', 0);
+    clearPage();
+    if (dir) removeIncognitoDir(dir);
+    publish('incognito', false);
+    log.info('incognito ended; its profile was deleted');
+    tellIncognito(false);
+  }
+
+  // Incognito folders of this Lumen that a killed run left (with their Edge, if it still runs).
+  function sweepIncognito() {
+    let names;
+    try { names = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(incognitoPrefix)); } catch { return null; }
+    if (!names.length) return null;
+    return killStrays(path.join(os.tmpdir(), incognitoPrefix)).then(() => {
+      for (const name of names) removeIncognitoDir(path.join(os.tmpdir(), name));
+      log.info('deleted the incognito profile an earlier run left behind', { count: names.length });
+      tellIncognito(false);
+    });
+  }
+
+  /**
+   * Incognito on or off. On: Edge closes (the normal profile is saved as it was) and starts again on a
+   * fresh profile in the temp folder, on the home page, when it was in use or the TV shows it. Off:
+   * that Edge closes and its profile is deleted; the page open before incognito comes back if the
+   * browser was in use. Edge closing for any other reason (Close, no viewer for idleMs, a crash, Lumen
+   * stopping) ends incognito the same way. → { value: { on } }.
+   */
+  async function setIncognito(on) {
+    if (stopped) throw new LumenError('UNAVAILABLE', 'Lumen is stopping');
+    while (wiping) await wiping.catch(() => {});
+    if (on === incognito) return { value: { on } };
+    const inUse = !!(child || page || starting);
+    const back = on ? null : beforeIncognito;
+    // Launches wait for the switch (ensureRunning waits on `wiping`), so no page opens in between
+    // on the profile being left.
+    const change = (async () => {
+      if (starting) await starting.catch(() => {});
+      if (on) {
+        beforeIncognito = store.get('browser.url')?.v ?? null;
+        await close();
+        incognito = true;
+        publish('incognito', true);
+        log.info('incognito on');
+        tellIncognito(true);
+      } else {
+        beforeIncognito = null;
+        await close();
+      }
+    })();
+    wiping = change;
+    try {
+      await change;
+    } finally {
+      if (wiping === change) wiping = null;
+    }
+    const target = on ? homeUrl : back ?? (sinks.size ? homeUrl : null);
+    if ((inUse || sinks.size) && target && !stopped) {
+      await open(target).catch((err) => log.warn('the browser did not start again', { message: err.message }));
+    }
+    return { value: { on } };
   }
 
   /** Adds a frame receiver (bytes, frame) and locks the TV viewport; → a function that removes it. */
@@ -1537,10 +1661,28 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     clearHistory,
     evaluate,
     evaluateFrames,
+    setIncognito,
+    /** Whether the browser is incognito (features/incognito.js keeps the log quiet while it is). */
+    incognito: () => incognito,
+    /** For tests: the incognito session's profile folder, once Edge started in it. */
+    incognitoProfile: () => incognitoDir,
+    /** fn(on) whenever incognito starts or ends, for any reason; → a function that unsubscribes. */
+    onIncognito(fn) {
+      incognitoListeners.add(fn);
+      return () => incognitoListeners.delete(fn);
+    },
 
     start() {
       setSession('off');
       clearPage();
+      publish('incognito', false);
+      // Launches wait until a killed run's incognito Edge and profile are gone.
+      const sweep = sweepIncognito();
+      if (sweep) {
+        const done = sweep.catch((err) => log.warn('old incognito profiles not swept', { message: err.message }))
+          .finally(() => { if (wiping === done) wiping = null; });
+        wiping ??= done;
+      }
     },
 
     async stop() {

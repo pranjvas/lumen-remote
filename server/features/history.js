@@ -11,6 +11,15 @@ const BROWSING_TAGS = new Set(['browser', 'tvscreen', 'relay', 'transcode', 'cas
 // Fields of those lines that name a page, a site or a page's title: their values go.
 const PLACE_KEYS = new Set(['url', 'host', 'hostname', 'href', 'origin', 'referer', 'from', 'to', 'registered', 'resolved', 'stream', 'dest', 'target', 'page', 'link', 'title']);
 const CLEARED = '[cleared]';
+const CLEAR_HISTORY = Object.freeze({ tags: BROWSING_TAGS, keys: PLACE_KEYS, mark: CLEARED });
+// Incognito (features/incognito.js): lines written while it is on name no page, site or title at all,
+// and Ask Lumen's lines keep neither the request nor the reply nor a tool's summary (they can quote
+// the page). Lines of other features keep their own text with every outside web address masked.
+const INCOGNITO = Object.freeze({
+  tags: new Set([...BROWSING_TAGS, 'ai', 'ai-api', 'ai-sdk', 'mcp']),
+  keys: new Set([...PLACE_KEYS, 'text', 'reply', 'summary']),
+  mark: '[incognito]',
+});
 // A lumen.log line (ISO time) or a stdout.log line (console time): time, level, [tag], message, JSON.
 const LINE = /^(?<head>(?:\S+\s+)?(?:DEBUG|INFO|WARN|ERROR)\s+)\[(?<tag>[^\]]+)\] (?<rest>.*)$/;
 const URL_RE = /\b(?:https?|wss?):\/\/[^\s"'<>\\]+/gi;
@@ -39,11 +48,11 @@ function maskPlaces(text) {
     .replace(IPV4_RE, (ip) => (isPrivateHost(ip) ? ip : '[ip]'));
 }
 
-function scrubValue(value, key) {
-  if (key !== undefined && PLACE_KEYS.has(key) && value !== null && value !== undefined && value !== '') return CLEARED;
+function scrubValue(value, key, rules) {
+  if (key !== undefined && rules.keys.has(key) && value !== null && value !== undefined && value !== '') return rules.mark;
   if (typeof value === 'string') return maskPlaces(value);
-  if (Array.isArray(value)) return value.map((item) => scrubValue(item));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrubValue(v, k)]));
+  if (Array.isArray(value)) return value.map((item) => scrubValue(item, undefined, rules));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrubValue(v, k, rules)]));
   return value;
 }
 
@@ -53,11 +62,11 @@ function scrubValue(value, key) {
  * and title field is cleared and addresses or site names in the text are masked; in every other line
  * web addresses outside this PC and the home network are masked. Everything else stays as it was.
  */
-export function scrubLine(line) {
+export function scrubLine(line, rules = CLEAR_HISTORY) {
   const cr = line.endsWith('\r') ? '\r' : '';
   const body = cr ? line.slice(0, -1) : line;
   const m = LINE.exec(body);
-  if (!m || !BROWSING_TAGS.has(m.groups.tag.split(':')[0])) {
+  if (!m || !rules.tags.has(m.groups.tag.split(':')[0])) {
     const out = maskUrls(body);
     return out === body ? line : out + cr;
   }
@@ -67,15 +76,18 @@ export function scrubLine(line) {
   let extra = brace >= 0 ? rest.slice(brace + 1) : '';
   if (extra) {
     try {
-      extra = JSON.stringify(scrubValue(JSON.parse(extra)));
+      extra = JSON.stringify(scrubValue(JSON.parse(extra), undefined, rules));
     } catch {
       // Not JSON (cut short, or unserialisable): clear the place fields by pattern instead.
-      extra = maskPlaces(extra.replace(/"([\w-]+)":"(?:[^"\\]|\\.)*"/g, (all, key) => (PLACE_KEYS.has(key) ? `"${key}":"${CLEARED}"` : all)));
+      extra = maskPlaces(extra.replace(/"([\w-]+)":"(?:[^"\\]|\\.)*"/g, (all, key) => (rules.keys.has(key) ? `"${key}":"${rules.mark}"` : all)));
     }
   }
   const out = `${head}[${tag}] ${maskPlaces(message)}${extra ? ` ${extra}` : ''}`;
   return out === body ? line : out + cr;
 }
+
+/** A log line as Lumen writes it while the browser is incognito (scrubLine with the INCOGNITO rules). */
+export const incognitoLine = (line) => scrubLine(line, INCOGNITO);
 
 /**
  * Rewrites every log file in `dir` (*.log and rotated *.log.N) through scrubLine. Files are rewritten
