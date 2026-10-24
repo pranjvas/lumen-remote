@@ -8,6 +8,7 @@ import { toast } from '../ui/toast.js';
 import { openSheet } from '../ui/sheet.js';
 import { haptic } from '../ui/haptics.js';
 import { accelerate, bindTrackpad, readGain } from '../ui/trackpad.js';
+import { fitFrame, sizeDiffers, viewportFor } from './browser-fit.js';
 
 const RATE_MS = 33;          // moves and wheel deltas coalesce to ~30 messages/s
 const VIEWPORT_MS = 250;     // resize settle before browser.viewport
@@ -18,8 +19,6 @@ const WHEEL_LINE_PX = 40;
 const PAD_KEY = 'lumen.browser.pad';
 const POINTER_EDGE = 0.002;  // the server keeps the pointer this far (fraction of the page) inside
 const PAD_SCROLL = 1.5;      // two-finger scroll: page pixels per stage pixel the fingers travel
-const VIEWPORT_MIN = 320;
-const VIEWPORT_MAX = { w: 1280, h: 800 };
 const SEARCH = 'https://duckduckgo.com/?q=';
 const SUGGESTIONS = [['DuckDuckGo', 'https://duckduckgo.com/'], ['Wikipedia', 'https://en.wikipedia.org/'], ['YouTube', 'https://www.youtube.com/'], ['Hacker News', 'https://news.ycombinator.com/']];
 const BUTTONS = ['left', 'middle', 'right'];
@@ -109,9 +108,11 @@ export function mountBrowser(root, ctx) {
 
   /* ---------- address bar, nav, actions ---------- */
 
+  // inputmode search, not url: the iPhone's URL keyboard has no space bar, and text with spaces is a
+  // search (toUrl). type stays text (type=search brings WebKit's own search-field styling).
   const address = h('input', {
-    class: 'browser-address', type: 'text', inputmode: 'url', enterkeyhint: 'go', placeholder: 'Search or enter an address',
-    'aria-label': 'Address or search', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+    class: 'browser-address', type: 'text', inputmode: 'search', enterkeyhint: 'go', placeholder: 'Search or enter an address',
+    'aria-label': 'Address or search', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
   });
   const addressIcon = h('span', { class: 'browser-address-icon' }, icon('globe', 'sm'));
   const go = h('button', { class: 'icon-btn browser-go', type: 'submit', 'aria-label': 'Go', title: 'Go' }, icon('enter', 'sm'));
@@ -149,14 +150,17 @@ export function mountBrowser(root, ctx) {
   const tvButtons = [];
   // While the TV shows Lumen's browser: hand the page's video to the TV's player, or close it.
   const tvExtras = [];
-  const tvExtra = (cls, label, iconName, cmd, done, short = label) => {
+  // A TV command from a button: busy while it runs, `done` toasted when it is accepted.
+  async function tvCommand(b, cmd, { args = {}, timeoutMs = 20000, done = null } = {}) {
+    if (b.classList.contains('is-busy')) return;
+    b.classList.add('is-busy');
+    const ack = await ctx.cmd(cmd, args, { el: b, timeoutMs });
+    b.classList.remove('is-busy');
+    if (ack.ok && done) toast(done, { level: 'ok' });
+  }
+  const tvExtra = (cls, label, iconName, cmd, done, short = label, { args = {}, timeoutMs = 20000 } = {}) => {
     const b = h('button', { class: `btn ghost ${cls}`.trim(), type: 'button', hidden: true, 'aria-label': label, title: label }, icon(iconName), h('span', { text: short }));
-    b.addEventListener('click', async () => {
-      b.classList.add('is-busy');
-      const ack = await ctx.cmd(cmd, {}, { el: b, timeoutMs: 20000 });
-      b.classList.remove('is-busy');
-      if (ack.ok) toast(done, { level: 'ok' });
-    });
+    b.addEventListener('click', () => tvCommand(b, cmd, { args, timeoutMs, done }));
     tvExtras.push(b);
     return b;
   };
@@ -171,6 +175,10 @@ export function mountBrowser(root, ctx) {
   }, icon('trash', 'sm'), h('span', { text: 'Clear history' }));
   clearButton.addEventListener('click', () => { haptic('key'); openClear(); });
   const keyboardBtn = h('button', { class: 'btn ghost', type: 'button', 'aria-label': 'Keyboard', 'aria-pressed': 'false' }, icon('keyboard'), h('span', { text: 'Keyboard' }));
+  // Chromium (Android, desktop) focuses a pressed button, which blurred the text field (keyboard off)
+  // before the click toggled it straight back on. The press must leave focus where it is.
+  keyboardBtn.addEventListener('pointerdown', (e) => e.preventDefault());
+  keyboardBtn.addEventListener('mousedown', (e) => e.preventDefault());
   keyboardBtn.addEventListener('click', () => setKeyboard(!keyboardOn));
   const padButtons = [
     h('button', { class: 'icon-btn browser-nav', type: 'button', 'aria-label': 'Mouse', title: 'Trackpad: move a pointer over the page (and the TV)', 'aria-pressed': 'false' }, icon('mouse')),
@@ -265,6 +273,16 @@ export function mountBrowser(root, ctx) {
   const dot = h('span', { class: 'status-dot off', 'aria-hidden': 'true' });
   const statusText = h('span', { class: 'browser-status-text', 'aria-live': 'polite' });
   const meta = h('span', { class: 'browser-meta muted' });
+  // One status chip: what the TV is really doing while it shows the page (the agent closed, a
+  // conversion, a failed or black video, live video turned off) with the one thing to do about it,
+  // or, with the TV off, that the page is laid out for another device.
+  const chipLong = h('span', { class: 'browser-chip-long' });
+  const chipShort = h('span', { class: 'browser-chip-short' });
+  const chipText = h('span', { class: 'browser-chip-text' }, chipLong, chipShort);
+  const chipAction = h('button', { class: 'browser-chip-action', type: 'button', hidden: true });
+  const chip = h('span', { class: 'browser-chip', role: 'status', hidden: true }, h('span', { class: 'browser-chip-dot', 'aria-hidden': 'true' }), chipText, chipAction);
+  let chipRun = null;
+  chipAction.addEventListener('click', () => { haptic('key'); chipRun?.(chipAction); });
 
   root.append(
     h('header', { class: 'view-head browser-head' },
@@ -273,14 +291,14 @@ export function mountBrowser(root, ctx) {
         h('p', { class: 'view-sub', text: 'Pages render in Edge on this PC and stream here · Open on TV hands them to the TV' }))),
     h('div', { class: 'browser-bar' },
       h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload, padButtons[0]),
-      form, vpnButtons[0], tvButton('primary'), tvExtra('browser-tvx', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV'), tvExtra('browser-tvx', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
-    h('div', { class: 'browser-status' }, dot, statusText, meta, clearButton, closeButtons[1]),
+      form, vpnButtons[0], tvButton('primary'), tvExtra('browser-tvx', 'Video → TV', 'play', 'tvscreen.playVideo', 'Sent to the TV'), tvExtra('browser-tvx', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
+    h('div', { class: 'browser-status' }, dot, statusText, meta, chip, clearButton, closeButtons[1]),
     vpnRow,
     stage,
     pad,
     // One row on phones; while the TV shows the page its two buttons take the place of On TV.
     h('div', { class: 'browser-tools' }, phoneNav.back, phoneNav.forward, phoneNav.reload, padButtons[1], keyboardBtn, tvButton('tool'),
-      tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Playing on the TV', 'Video'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV')),
+      tvExtra('', 'Video → TV', 'play', 'tvscreen.playVideo', 'Sent to the TV', 'Video'), tvExtra('', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV')),
   );
 
   /* ---------- commands ---------- */
@@ -306,20 +324,74 @@ export function mountBrowser(root, ctx) {
     if (ack.ok) toast('On the TV · arrows move, OK clicks, Yellow plays the video', { level: 'ok' });
   }
 
-  ctx.state.watch('tvscreen.on', () => {
-    const on = ctx.state.value('tvscreen.on', false) === true;
-    for (const b of tvExtras) b.hidden = !on;
-    for (const b of tvButtons) b.setAttribute('aria-pressed', on ? 'true' : 'false');
-    if (padOn) syncPointer();
-  });
-  // The TV dropped Lumen's page (it closed it, or the agent crashed): say so, once, as it happens.
-  ctx.state.watch('tvscreen.lost', () => {
-    const lost = ctx.state.value('tvscreen.lost', null);
-    if (lost?.at && Date.now() - lost.at < 30000) toast(`${lost.reason || 'The TV closed Lumen’s page'}. Tap On TV to show it again.`, { level: 'warn', timeout: 6000 });
-  });
+  /* ---------- the status chip ---------- */
+
+  const VIDEO_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
+  const convertForTv = (b) => tvCommand(b, 'tvscreen.playVideo', { args: { convert: true }, timeoutMs: 90000, done: 'Converting for the TV' });
+
+  // → { tone, text, action?, run?, busy? } or null. The server's keys: tvscreen.video (the TV
+  // player's state), tvscreen.handoff ({ stage: 'direct' | 'copy' | 'encode' | 'drm', converting }),
+  // tvscreen.liveBlocked (live video stopped offering itself after the TV dropped it twice).
+  function tvChip() {
+    if (ctx.state.value('tvscreen.on', false) !== true) return null;
+    const agent = ctx.state.value('conn.agent', null);
+    if (agent === 'launching') return { tone: 'warn', text: 'Starting the TV agent…', busy: true };
+    if (agent !== 'online') return { tone: 'bad', text: 'TV agent closed', action: 'Reopen on TV', run: openOnTv };
+    const video = ctx.state.value('tvscreen.video', null);
+    const handoff = ctx.state.value('tvscreen.handoff', null);
+    const stage = handoff && typeof handoff === 'object' && typeof handoff.stage === 'string' ? handoff.stage : null;
+    const converted = stage === 'copy' || stage === 'encode';
+    const active = VIDEO_ACTIVE.has(video);
+    // Only while ffmpeg runs. Once the copy is sent, the TV plays it but the video stays 'loading' (the
+    // agent sends no 'playing' for a converted stream), so a converted 'loading' shows no chip.
+    if (handoff?.converting === true) return { tone: 'warn', text: 'Converting for the TV…', busy: true };
+    if (stage !== 'drm') {
+      if (video === 'error') return { tone: 'bad', text: 'The TV could not play the video', short: 'TV player failed', action: 'Convert for TV', run: convertForTv };
+      if (active && stage && !converted) return { tone: 'info', text: 'Black picture?', action: 'Convert for TV', run: convertForTv };
+    }
+    if (active) return null; // the TV's player is in front: live video waits behind it
+    const blocked = ctx.state.value('tvscreen.liveBlocked', false);
+    if (blocked) {
+      const drops = typeof blocked === 'object' && Number.isFinite(blocked.strikes) ? blocked.strikes : 2;
+      return {
+        tone: 'warn', text: `Still frames (live video off after ${drops} drops)`, short: 'Still frames', action: 'Turn live on',
+        run: (b) => tvCommand(b, 'tvscreen.live', { args: { on: true }, timeoutMs: 15000, done: 'Live video on' }),
+      };
+    }
+    return null;
+  }
+
+  // Shown once the frames have kept another device's size for a while after this phone last asked.
+  function sizeChip() {
+    const now = performance.now();
+    if (session() !== 'ready' || !hasFrame || now - sentAt < 3000 || now - reclaimedAt < 3000 || !sizedElsewhere()) return null;
+    return { tone: 'info', text: 'Sized for another device', short: 'Other device’s size', action: 'Tap to fit', run: () => { reclaimedAt = performance.now(); viewport(true); } };
+  }
+
+  let chipShape = '';
+  function paintChip() {
+    const c = tvChip() || sizeChip();
+    const shape = c ? `${c.tone}|${c.text}|${c.action || ''}|${!!c.busy}` : '';
+    if (shape === chipShape) return; // rebuilding the button between press and click would swallow it
+    chipShape = shape;
+    chip.hidden = !c;
+    root.classList.toggle('has-chip', !!c);
+    if (!c) { chipRun = null; return; }
+    chip.dataset.tone = c.tone;
+    chip.classList.toggle('is-working', !!c.busy);
+    // Narrow phones show the short wording when there is one; the whole sentence stays the chip's title.
+    chipLong.textContent = c.text;
+    chipShort.textContent = c.short || c.text;
+    chip.title = c.text;
+    chipAction.hidden = !c.action;
+    chipAction.textContent = c.action || '';
+    chipAction.classList.remove('is-busy');
+    chipRun = c.run || null;
+  }
 
   function retry() {
-    open(lastUrl || url() || toUrl(address.value) || SUGGESTIONS[0][1]);
+    // The page that is open (a crashed browser keeps it), else the last one asked for.
+    open(url() || lastUrl || toUrl(address.value) || SUGGESTIONS[0][1]);
   }
 
   /* ---------- clear history ---------- */
@@ -448,12 +520,17 @@ export function mountBrowser(root, ctx) {
 
   const wait = (text) => h('div', { class: 'browser-wait', role: 'status' }, h('span', { class: 'spinner' }), h('span', { text }));
 
+  // The session's error covers a start that failed and a browser that went away later (Edge or its
+  // page crashed), so the heading says which when the message does.
+  const failureTitle = (message) => (/crash/i.test(message || '') ? 'The browser crashed'
+    : /could not start|did not start/i.test(message || '') ? 'The browser could not start' : 'The browser stopped');
+
   function failure(message) {
     const again = h('button', { class: 'btn primary', type: 'button' }, icon('refresh'), 'Retry');
     again.addEventListener('click', retry);
     return h('div', { class: 'browser-welcome browser-error', role: 'alert' },
       h('div', { class: 'browser-orb', 'aria-hidden': 'true' }, icon('alert', 'lg')),
-      h('h2', { class: 'browser-lead', text: 'The browser could not start' }),
+      h('h2', { class: 'browser-lead', text: failureTitle(message) }),
       h('p', { class: 'browser-copy', text: message || 'Something went wrong on the PC.' }),
       again);
   }
@@ -467,7 +544,7 @@ export function mountBrowser(root, ctx) {
   setInterval(() => {
     fps = painted;
     painted = 0;
-    if (showing()) paintMeta();
+    if (showing()) { paintMeta(); paintChip(); }
   }, 1000);
 
   /* ---------- frames ---------- */
@@ -480,6 +557,7 @@ export function mountBrowser(root, ctx) {
   // without making the stream wait for it. A frame that fails to decode is skipped, not the next one.
   async function onFrame(msg) {
     ctx.live.post('browser.ack', { seq: msg.seq });
+    if (msg.w > 0 && msg.h > 0) lastFrameCss = { w: msg.w, h: msg.h };
     if (!showing()) return;
     if (decoding) { queued = msg; return; }
     decoding = true;
@@ -530,13 +608,17 @@ export function mountBrowser(root, ctx) {
     }
   }
 
+  // The stage's content box (it has a border and no padding). Its border box would be 2 px larger,
+  // and on short phones the stage is sized from its content: each resize then grew it by 2 px.
+  const stageBox = () => ({ width: stage.clientWidth, height: stage.clientHeight });
+
   // The canvas keeps the frame's aspect inside the stage; the stage letterboxes the rest.
   function fit() {
-    const r = stage.getBoundingClientRect();
-    if (!r.width || !r.height || !frame.w) return;
-    const s = Math.min(r.width / frame.w, r.height / frame.h);
-    canvas.style.width = `${Math.floor(frame.w * s)}px`;
-    canvas.style.height = `${Math.floor(frame.h * s)}px`;
+    const r = stageBox();
+    const size = frame.w ? fitFrame(r.width, r.height, frame.w, frame.h) : null;
+    if (!size) return;
+    canvas.style.width = `${size.w}px`;
+    canvas.style.height = `${size.h}px`;
     placePointer();
   }
 
@@ -546,22 +628,47 @@ export function mountBrowser(root, ctx) {
 
   let viewportTimer = 0;
   let sentViewport = '';
-  function viewport(force = false) {
+  let sentSize = null;     // the page size this phone last asked for
+  let sentAt = -Infinity;
+  let lastFrameCss = null; // the page size the newest frame was laid out at (CSS px, from its header)
+  let mouseHeld = false;
+  function viewport(force = false, since = performance.now()) {
     clearTimeout(viewportTimer);
     viewportTimer = setTimeout(() => {
       if (!showing()) return;
-      const r = stage.getBoundingClientRect();
-      if (!r.width || !r.height) return;
-      // The page is laid out at the stage's CSS size so text appears at its normal size (laying it
-      // out in device pixels made a phone show 16 px text at about 11 px). Scaled uniformly into the
-      // server's clamp box so the frame keeps the stage's aspect.
-      const s = Math.min(1, VIEWPORT_MAX.w / r.width, VIEWPORT_MAX.h / r.height);
-      const w = clamp(Math.round(r.width * s), VIEWPORT_MIN, VIEWPORT_MAX.w);
-      const hh = clamp(Math.round(r.height * s), VIEWPORT_MIN, VIEWPORT_MAX.h);
+      // Never re-laid out under a finger or a held button (the click would land on what moved there),
+      // for up to 3 s.
+      if ((touch || mouseHeld) && performance.now() - since < 3000) { viewport(force, since); return; }
+      // The page is laid out at the stage's CSS size, scaled uniformly into the server's box so the
+      // frame keeps the stage's shape (browser-fit.js viewportFor).
+      const r = stageBox();
+      const size = viewportFor(r.width, r.height);
+      if (!size) return;
+      const { w, h: hh } = size;
       const key = `${w}x${hh}`;
       if (!force && key === sentViewport) return;
-      if (ctx.live.post('browser.viewport', { w, h: hh })) sentViewport = key;
+      if (ctx.live.post('browser.viewport', { w, h: hh })) {
+        sentViewport = key;
+        sentSize = { w, h: hh };
+        sentAt = performance.now();
+      }
     }, VIEWPORT_MS);
+  }
+
+  // The page has one size for every client. When another device (on the Browser view too) asked for
+  // its own size last, the page this phone shows is laid out for that one; using this phone (a tap,
+  // a click, the wheel, the trackpad, a key) asks for this phone's size again. Not while the TV shows
+  // the page: its 1280×720 layout holds then.
+  let reclaimedAt = -Infinity;
+  const tvOn = () => ctx.state.value('tvscreen.on', false) === true;
+  const sizedElsewhere = () => !tvOn() && sizeDiffers(lastFrameCss, sentSize);
+  function reclaim() {
+    if (tvOn()) return;
+    const now = performance.now();
+    if (now - reclaimedAt < 1500) return;
+    if (!sizeDiffers(lastFrameCss, sentSize)) return;
+    reclaimedAt = now;
+    viewport(true);
   }
 
   new ResizeObserver(() => { fit(); viewport(); }).observe(stage);
@@ -634,6 +741,7 @@ export function mountBrowser(root, ctx) {
     wheels.flush();
     if (!still || !frame.w) return;
     if (!long) haptic('key');
+    commitTyping(); // a word still being composed reaches the page before the tap does
     input({ kind: 'click', ...at(pt), button: long ? 'right' : 'left', modifiers: 0, touch: Math.max(1, Math.round(FINGER_PX * scale())) });
     if (keyboardOn && !long) typer.focus({ preventScroll: true });
   }
@@ -642,6 +750,7 @@ export function mountBrowser(root, ctx) {
     const ours = (e) => (touch ? [...e.changedTouches].find((t) => t.identifier === touch.id) : null);
     canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
+      reclaim();
       const t = e.changedTouches[0];
       if (t) touchStart(t.identifier, t, e.timeStamp);
     }, { passive: false });
@@ -666,6 +775,7 @@ export function mountBrowser(root, ctx) {
   canvas.addEventListener('pointerdown', (e) => {
     if (finger(e)) {
       if (TOUCH_EVENTS) return;
+      reclaim();
       // No compatibility mouse events: they would focus the canvas and, through it, the hidden
       // text field, which opens the keyboard on every tap.
       e.preventDefault();
@@ -675,9 +785,12 @@ export function mountBrowser(root, ctx) {
     }
     lastPointer = e.pointerType;
     if (!frame.w) return;
+    reclaim();
+    mouseHeld = true;
     try { canvas.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
     e.preventDefault();
     moves.flush();
+    commitTyping();
     input({ kind: 'down', ...at(e), button: BUTTONS[e.button] || 'left', modifiers: modifiers(e) });
     typer.focus({ preventScroll: true });
   });
@@ -696,17 +809,25 @@ export function mountBrowser(root, ctx) {
       if (!TOUCH_EVENTS) touchEnd(e.pointerId, e, false, e.timeStamp);
       return;
     }
+    mouseHeld = false;
     if (!frame.w) return;
     moves.flush();
     input({ kind: 'up', ...at(e), button: BUTTONS[e.button] || 'left', modifiers: modifiers(e) });
   });
-  canvas.addEventListener('pointercancel', (e) => { if (finger(e) && !TOUCH_EVENTS) touchEnd(e.pointerId, e, true, e.timeStamp); });
+  canvas.addEventListener('pointercancel', (e) => {
+    if (!finger(e)) mouseHeld = false;
+    else if (!TOUCH_EVENTS) touchEnd(e.pointerId, e, true, e.timeStamp);
+  });
   // Capture lost without a pointerup (the system took the touch): the gesture is over, not a tap.
-  canvas.addEventListener('lostpointercapture', (e) => { if (finger(e) && !TOUCH_EVENTS) touchEnd(e.pointerId, e, true, e.timeStamp); });
+  canvas.addEventListener('lostpointercapture', (e) => {
+    if (!finger(e)) mouseHeld = false;
+    else if (!TOUCH_EVENTS) touchEnd(e.pointerId, e, true, e.timeStamp);
+  });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
     if (!frame.w) return;
     e.preventDefault();
+    reclaim();
     const unit = e.deltaMode === 1 ? WHEEL_LINE_PX : 1;
     const s = scale();
     wheels.push({ kind: 'wheel', ...at(e), deltaX: Math.round(e.deltaX * unit * s), deltaY: Math.round(e.deltaY * unit * s), modifiers: modifiers(e) });
@@ -788,6 +909,7 @@ export function mountBrowser(root, ctx) {
     nativeSync = setTimeout(alignTv, 300);
   };
 
+  pad.addEventListener('pointerdown', () => { if (padLive()) reclaim(); });
   bindTrackpad(pad, {
     // A slow stroke across the pad crosses the page; a finger's travel is the same page distance
     // either way, so the pointer moves the way the finger does.
@@ -819,6 +941,7 @@ export function mountBrowser(root, ctx) {
     },
     click(button) {
       if (!padLive()) return;
+      commitTyping();
       if (nativeTv()) {
         if (nativeFrame) { cancelAnimationFrame(nativeFrame); flushNative(); }
         // A tap clicks where the TV's pointer is, as the Mouse view does: moving it to the phone's
@@ -856,16 +979,42 @@ export function mountBrowser(root, ctx) {
   /* ---------- typing ---------- */
 
   // The field stays empty: each character goes out as it is typed, so Backspace always means
-  // "delete in the page", never "delete in the field".
+  // "delete in the page", never "delete in the field". Android keyboards (Gboard, Samsung) keep the
+  // word being typed in a composition and send it only when it ends.
+  let composing = false;
+  let committing = false;
+
+  // A tap or click on the page while a word is still being composed: the word goes to the page first
+  // (taps keep focus in the field, so nothing else would end the composition and the click would run
+  // first, e.g. a search with an empty box). Blurring ends the composition; the field is focused again
+  // so the keyboard stays.
+  function commitTyping() {
+    if (!composing) return;
+    if (document.activeElement !== typer) { composing = false; return; }
+    const word = typer.value;
+    committing = true;
+    try {
+      typer.blur();
+    } finally {
+      committing = false;
+    }
+    composing = false;
+    typer.value = '';
+    if (word) input({ kind: 'text', text: word });
+    typer.focus({ preventScroll: true });
+    if (document.activeElement !== typer) typingOff();
+  }
+
   function setKeyboard(on) {
     keyboardOn = on;
     keyboardBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
     if (on) typer.focus({ preventScroll: true });
-    else if (document.activeElement === typer && matchMedia('(pointer: coarse)').matches) typer.blur();
+    else if (document.activeElement === typer) typer.blur(); // with a mouse too: keys stop going to the page
   }
 
   typer.addEventListener('keydown', (e) => {
     e.stopPropagation();
+    reclaim();
     if (e.isComposing || e.key === 'Unidentified' || e.key === 'Process') return;
     // Esc leaves the page (so keyboard users are never trapped); Shift+Esc sends Escape to the page.
     if (e.key === 'Escape' && !e.shiftKey) {
@@ -875,13 +1024,27 @@ export function mountBrowser(root, ctx) {
       keyboardBtn.focus({ preventScroll: true });
       return;
     }
-    const combo = (e.ctrlKey || e.metaKey) && e.key.length === 1;
+    // AltGr (Windows reports it as Ctrl+Alt) types characters (@ { [ \ €, Polish letters): they go
+    // through the input event as text, not as a Ctrl shortcut the server refuses. Ctrl+Alt with a
+    // plain letter or digit stays a shortcut (US layouts have no AltGr characters).
+    const altGr = (e.getModifierState && e.getModifierState('AltGraph'))
+      || (e.ctrlKey && e.altKey && !e.metaKey && !/^[a-z0-9]$/i.test(e.key));
+    const combo = !altGr && (e.ctrlKey || e.metaKey) && e.key.length === 1;
     if (combo && e.key.toLowerCase() === 'v') return; // paste arrives through the paste event
     if (SPECIAL_KEYS.has(e.key) || combo) {
       e.preventDefault();
-      input({ kind: 'key', key: e.key, code: e.code, modifiers: modifiers(e) });
+      sendKey({ kind: 'key', key: e.key, code: e.code, modifiers: modifiers(e) });
     }
   });
+  // Keys are sent with an ack so a shortcut the server will not pass on says so (at most every 5 s).
+  let refusedAt = 0;
+  function sendKey(ev) {
+    ctx.live.send('browser.input', ev, { timeoutMs: 5000 }).then((ack) => {
+      if (ack.ok || ack.error?.code !== 'INVALID' || performance.now() - refusedAt < 5000) return;
+      refusedAt = performance.now();
+      toast(ack.error.message || 'The page did not take that key', { level: 'warn' });
+    });
+  }
   typer.addEventListener('beforeinput', (e) => {
     // Phone keyboards report Backspace and Enter only here (keydown says Unidentified).
     if (e.inputType === 'deleteContentBackward' && !typer.value) {
@@ -893,12 +1056,14 @@ export function mountBrowser(root, ctx) {
     }
   });
   const sendTyped = () => {
+    if (committing) return; // commitTyping sends the word itself, once
     const text = typer.value;
     typer.value = '';
     if (text) input({ kind: 'text', text });
   };
   typer.addEventListener('input', (e) => { if (!e.isComposing) sendTyped(); });
-  typer.addEventListener('compositionend', sendTyped);
+  typer.addEventListener('compositionstart', () => { composing = true; });
+  typer.addEventListener('compositionend', () => { composing = false; sendTyped(); });
   typer.addEventListener('paste', (e) => {
     e.preventDefault();
     const text = e.clipboardData?.getData('text');
@@ -910,9 +1075,25 @@ export function mountBrowser(root, ctx) {
     keyboardBtn.setAttribute('aria-pressed', 'true');
     stage.classList.add('is-typing');
   });
-  typer.addEventListener('blur', () => {
+  function typingOff() {
     keyboardOn = false;
     keyboardBtn.setAttribute('aria-pressed', 'false');
     stage.classList.remove('is-typing');
+  }
+  // commitTyping's blur is only to end a composition (the field is focused again right after).
+  typer.addEventListener('blur', () => { if (!committing) typingOff(); });
+
+  /* ---------- the TV's side (last: it paints with everything above) ---------- */
+
+  let tvWasOn = null;
+  ctx.state.watch(['tvscreen.*', 'conn.agent'], () => {
+    const on = ctx.state.value('tvscreen.on', false) === true;
+    if (on !== tvWasOn) {
+      tvWasOn = on;
+      for (const b of tvExtras) b.hidden = !on;
+      for (const b of tvButtons) b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      if (padOn) syncPointer();
+    }
+    paintChip();
   });
 }

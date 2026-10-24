@@ -7,6 +7,8 @@ import { createState } from './core/state.js';
 import { createContext } from './core/ctx.js';
 import { createVolume } from './core/volume.js';
 import { createPower } from './core/power.js';
+import { RELOADED_KEY, isStale, staleAction } from './core/build.js';
+import { pressing } from './ui/press.js';
 import { initBadges } from './ui/badge.js';
 import { initToasts, toast, whisper, announce } from './ui/toast.js';
 import { setTint } from './ui/tint.js';
@@ -181,8 +183,16 @@ document.addEventListener('visibilitychange', presence);
 /* ---------- live link ---------- */
 
 live.on('hello', (msg) => {
+  // A redeployed Lumen: this page's modules are the old ones, so it does not take the new state.
+  if (isStale(ctx.webBuild, msg.webBuild)) {
+    staleShell(msg.webBuild);
+    document.documentElement.dataset.ready = '1';
+    return;
+  }
+  if (ctx.staleBuild) { ctx.staleBuild = null; ctx.emit('stale', null); } // Lumen went back to this page's build
   ctx.setHello(msg);
-  state.load(msg.state);
+  loadingHello = true;
+  try { state.load(msg.state); } finally { loadingHello = false; }
   ctx.emit('hello', msg);
   ctx.emit('ai-status');
   reported = null;
@@ -198,6 +208,59 @@ live.on('changedOnTv', (msg) => {
 live.on('status', (s) => {
   if (s !== 'open') reported = null;
   if (s === 'closed') announce('Connection to Lumen lost');
+});
+
+/* ---------- a redeployed Lumen ---------- */
+
+const TEXT_INPUT = /^(?:text|search|url|email|password|tel|number|date|datetime-local|month|time|week)$/i;
+
+// Reloading now would interrupt the owner: typing (a field or the page's own text field), a sheet,
+// an upload or a key being held.
+function busy() {
+  const a = document.activeElement;
+  if (a && (a.isContentEditable || a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && TEXT_INPUT.test(a.type || 'text')))) return true;
+  if (document.querySelector('.sheet:not(.is-closing), .is-uploading, .is-pressed')) return true;
+  return pressing();
+}
+
+function reloadFor(build) {
+  try { sessionStorage.setItem(RELOADED_KEY, build); } catch { /* storage unavailable: the banner still offers it */ }
+  location.reload();
+}
+
+let waitingFor = null;
+function staleShell(build) {
+  let reloadedFor = null;
+  try { reloadedFor = sessionStorage.getItem(RELOADED_KEY); } catch { /* storage unavailable */ }
+  const action = staleAction({ build, reloadedFor, busy: busy(), hidden: document.hidden });
+  if (action === 'reload') { reloadFor(build); return; }
+  if (action === 'wait') { waitingFor = build; return; }
+  ctx.staleBuild = build;
+  ctx.emit('stale', build);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !waitingFor) return;
+  const build = waitingFor;
+  waitingFor = null;
+  staleShell(build);
+});
+ctx.on('reload', () => reloadFor(ctx.staleBuild || ''));
+
+/* ---------- TV-side notices (tvscreen.notice: { text, level, at }) ---------- */
+
+// Each new one toasts once, on whatever screen is open; the one already there when the page
+// connects is old news.
+const NOTICE_LEVELS = { ok: 'ok', info: 'info', warn: 'warn', error: 'error', bad: 'error' };
+let loadingHello = false;
+let noticeAt;
+state.watch('tvscreen.notice', () => {
+  const rec = state.get('tvscreen.notice');
+  const notice = rec?.v;
+  const at = notice && typeof notice === 'object' ? notice.at ?? rec.at ?? null : null;
+  if (at === noticeAt) return;
+  noticeAt = at;
+  if (loadingHello || !notice || typeof notice.text !== 'string' || !notice.text) return;
+  toast(notice.text.slice(0, 200), { level: NOTICE_LEVELS[notice.level] || 'info', timeout: 6000 });
 });
 
 function changeText({ key, from, to }) {

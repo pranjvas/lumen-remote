@@ -175,11 +175,17 @@ export function mountBanners(host, ctx) {
   function paint() {
     const link = ctx.live.status;
     const signature = [link, ...['conn.tv', 'conn.remote', 'conn.ipc', 'conn.agent'].map((k) => ctx.state.value(k, null)),
-      AGENT_VIEWS.has(ctx.viewName), [...dismissed].join()].join('|');
+      AGENT_VIEWS.has(ctx.viewName), [...dismissed].join(), ctx.staleBuild || ''].join('|');
     if (signature === shown) return;
     shown = signature;
     clearInterval(countdownTimer);
     const list = [];
+    // Lumen was redeployed and this page did not reload itself (it would have interrupted something).
+    if (ctx.staleBuild) {
+      const reload = h('button', { class: 'btn sm primary', type: 'button' }, icon('refresh', 'sm'), 'Reload');
+      reload.addEventListener('click', () => ctx.emit('reload'));
+      list.push(banner('update', { level: 'info', iconName: 'refresh', title: 'Lumen was updated', text: 'Reload to use the new version', actions: [reload] }));
+    }
     if (link !== 'open') {
       const retry = h('button', { class: 'btn sm', type: 'button', text: 'Retry now', onClick: () => ctx.live.retryNow() });
       const textEl = h('span');
@@ -216,6 +222,7 @@ export function mountBanners(host, ctx) {
 
   ctx.live.on('status', paint);
   ctx.on('view', paint);
+  ctx.on('stale', paint);
   ctx.state.watch(['conn.tv', 'conn.remote', 'conn.ipc', 'conn.agent'], paint);
 }
 

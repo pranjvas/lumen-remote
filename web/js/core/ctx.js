@@ -44,6 +44,8 @@ export function createContext({ live, state }) {
     csrf: null,
     ai: null,
     version: null,
+    webBuild: undefined,
+    staleBuild: null, // set when Lumen now serves another web build than this page's (main.js)
 
     get catalog() { return catalog; },
 
@@ -60,6 +62,9 @@ export function createContext({ live, state }) {
       ctx.csrf = hello.csrf || null;
       ctx.ai = hello.ai || null;
       ctx.version = hello.version || null;
+      // The web build this page was loaded with: the first hello's only ('' when it named none), so a
+      // later hello from a redeployed Lumen can be told apart (core/build.js).
+      if (ctx.webBuild === undefined) ctx.webBuild = typeof hello.webBuild === 'string' ? hello.webBuild : '';
     },
 
     keyInfo: (key) => keyIndex.get(key),
