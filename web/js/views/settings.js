@@ -3,6 +3,7 @@
 // Calibrate + Open TV Menu; Device and Connection rows come from device.*, system.* and conn.*.
 
 import { h, icon, flash, fill } from '../ui/dom.js';
+import { showInstallSteps } from '../ui/install-hint.js';
 import { createSlider } from '../ui/slider.js';
 import { createSegmented } from '../ui/segmented.js';
 import { badge } from '../ui/badge.js';
@@ -20,6 +21,7 @@ const GROUPS = [
   { id: 'bluetooth', title: 'Bluetooth', short: 'Bluetooth', note: 'Read by Lumen Eyes (the native helper app on the TV) when you open Settings. Pair or remove devices in the TV menu (Settings → Connection).' },
   { id: 'device', title: 'Device', short: 'Device' },
   { id: 'connection', title: 'Connection', short: 'Connection' },
+  { id: 'phone', title: 'This phone', short: 'Phone', note: 'Put Lumen, or just its browser, on your Home Screen: one tap opens it full screen, like an app.' },
 ];
 
 const DEVICE_ROWS = [
@@ -96,6 +98,7 @@ export function mountSettings(root, ctx) {
       else if (g.id === 'connection') rows = connectionRows(ctx, scope);
       else if (g.id === 'network') rows = networkRows(ctx, scope);
       else if (g.id === 'bluetooth') rows = bluetoothRows(ctx, scope);
+      else if (g.id === 'phone') rows = phoneRows();
       else rows = (byGroup.get(g.id) || []).map((s) => settingRow(ctx, s, scope));
       if (g.id === 'sound') rows.unshift(...soundExtras(ctx, scope));
       if (!rows.length) continue;
@@ -530,6 +533,16 @@ function latencyOf(ctx, which) {
   if (Number.isFinite(direct)) return direct;
   const all = ctx.state.value('conn.latency', null);
   return all && Number.isFinite(all[which]) ? all[which] : null;
+}
+
+function phoneRows() {
+  return [['app', 'Lumen', 'The whole remote'], ['browser', 'Lumen Browser', 'Opens straight into the browser']].map(([kind, label, hint]) => {
+    const add = h('button', { class: 'btn ghost sm', type: 'button' }, icon('plus'), 'Add to Home Screen');
+    add.addEventListener('click', () => showInstallSteps(kind));
+    return h('div', { class: 'row row-readonly' },
+      h('div', { class: 'row-label' }, h('span', { class: 'label', text: label }), h('span', { class: 'hint', text: hint })),
+      h('div', { class: 'row-control' }, add), h('div', { class: 'row-badge' }));
+  });
 }
 
 function connectionRows(ctx, { watch, on, own }) {

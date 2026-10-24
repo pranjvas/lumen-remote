@@ -77,7 +77,7 @@ export function loadStatic(dir = WEB_DIR) {
       .replace('<title>Lumen</title>', '<title>Lumen Browser</title>')
       .replace('<meta name="apple-mobile-web-app-title" content="Lumen">', '<meta name="apple-mobile-web-app-title" content="Lumen Browser">')
       .replace('<link rel="manifest" href="/manifest.webmanifest">', '<link rel="manifest" href="/browser.webmanifest">')
-      .replace('<link rel="apple-touch-icon" href="/icons/lumen-192.png">', '<link rel="apple-touch-icon" href="/icons/lumen-browser-180.png">');
+      .replace('<link rel="apple-touch-icon" href="/icons/lumen-180.png">', '<link rel="apple-touch-icon" href="/icons/lumen-browser-180.png">');
     const body = Buffer.from(page);
     files.set('/browser', { body, type: MIME['.html'], etag: `"${createHash('sha1').update(body).digest('base64url')}"` });
   }
