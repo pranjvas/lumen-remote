@@ -334,7 +334,34 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     return { value: { on: true, url: store.get('browser.url')?.v ?? null } };
   }
 
+  // The TV killed Lumen's page (or the agent crashed) while it was on the TV: after a short grace (a
+  // network blip reconnects within it) the screen counts as closed, so the phone stops offering
+  // "Close TV" for a page that is gone, and says what happened (tvscreen.lost). A quick reconnect
+  // shows the page again, since a restarted agent comes back without it.
+  const AGENT_GONE_MS = config.tvscreen?.agentGoneMs ?? 10000;
+  let agentGoneTimer = null;
+  function watchAgentForScreen(state) {
+    if (state === 'online') {
+      if (agentGoneTimer) {
+        clearTimeout(agentGoneTimer);
+        agentGoneTimer = null;
+        if (on) agent()?.request?.('screen', { on: true }).catch(() => {});
+      }
+      return;
+    }
+    if (!on || agentGoneTimer) return;
+    agentGoneTimer = setTimeout(() => {
+      agentGoneTimer = null;
+      if (!on || store.get('conn.agent')?.v === 'online') return;
+      log.warn("the TV closed Lumen's page (the agent went away)");
+      store.set('tvscreen.lost', { at: Date.now(), reason: "The TV closed Lumen's page" }, { src: 'derived', via: 'tvscreen' });
+      close().catch(() => {});
+    }, AGENT_GONE_MS);
+  }
+
   async function close() {
+    clearTimeout(agentGoneTimer);
+    agentGoneTimer = null;
     if (!on) return { value: { on: false } };
     on = false;
     generation += 1;
@@ -797,6 +824,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
           stopLive(null);
         }
         if ('browser.popup' in patch) syncLivePause();
+        if ('conn.agent' in patch) watchAgentForScreen(patch['conn.agent']?.v);
       });
     },
     async stop() {

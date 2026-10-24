@@ -79,7 +79,7 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
     await new Promise((r) => web.listen(0, r));
     port = web.address().port;
 
-    stack = await startStack();
+    stack = await startStack({ config: { tvscreen: { agentGoneMs: 1500 } } });
     b = stack.browser();
     await b.hello;
     agent = stack.agent();
@@ -350,5 +350,8 @@ describe('tvscreen: handing the page\'s video to the TV', () => {
     agent.close();
     await b.waitForState('conn.agent', (r) => r?.v !== 'online', { timeout: 10000 });
     await waitFor(() => tvVideo() === null, { timeout: 3000, what: 'the player state cleared' });
+    // The agent stays gone: the screen counts as closed, and the phone is told why.
+    await b.waitForState('tvscreen.on', (r) => r?.v === false, { timeout: 5000 });
+    assert.match(String(stack.server.store.get('tvscreen.lost')?.v?.reason), /closed Lumen/);
   });
 });

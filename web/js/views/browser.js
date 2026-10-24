@@ -312,6 +312,11 @@ export function mountBrowser(root, ctx) {
     for (const b of tvButtons) b.setAttribute('aria-pressed', on ? 'true' : 'false');
     if (padOn) syncPointer();
   });
+  // The TV dropped Lumen's page (it closed it, or the agent crashed): say so, once, as it happens.
+  ctx.state.watch('tvscreen.lost', () => {
+    const lost = ctx.state.value('tvscreen.lost', null);
+    if (lost?.at && Date.now() - lost.at < 30000) toast(`${lost.reason || 'The TV closed Lumen’s page'}. Tap On TV to show it again.`, { level: 'warn', timeout: 6000 });
+  });
 
   function retry() {
     open(lastUrl || url() || toUrl(address.value) || SUGGESTIONS[0][1]);
