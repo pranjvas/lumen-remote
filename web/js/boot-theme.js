@@ -24,7 +24,16 @@
     if (short) document.documentElement.style.setProperty('--app-h', fullH + 'px');
     else document.documentElement.style.removeProperty('--app-h');
   }
+  // iOS settles the window's size after the first paint without always firing resize, so the check
+  // runs again as the page loads, comes back and settles.
   fit();
   window.addEventListener('resize', fit);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', fit);
   window.addEventListener('orientationchange', function () { setTimeout(fit, 250); });
+  document.addEventListener('DOMContentLoaded', fit);
+  window.addEventListener('load', fit);
+  window.addEventListener('pageshow', fit);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) setTimeout(fit, 100); });
+  [100, 400, 1000, 2500].forEach(function (ms) { setTimeout(fit, ms); });
+  window.lumenFitHeight = fit;
 })();

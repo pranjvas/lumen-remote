@@ -146,7 +146,7 @@ function screenMetrics() {
   };
 }
 let metricsTimer = 0;
-const reportMetrics = () => { clearTimeout(metricsTimer); metricsTimer = setTimeout(() => live.post('ui.metrics', screenMetrics()), 800); };
+const reportMetrics = () => { clearTimeout(metricsTimer); metricsTimer = setTimeout(() => { window.lumenFitHeight?.(); live.post('ui.metrics', screenMetrics()); }, 800); };
 window.addEventListener('resize', reportMetrics);
 live.on('status', (st) => { if (st === 'open') reportMetrics(); });
 
