@@ -406,6 +406,8 @@
 .cal-chips { margin: 4px 0 6px; }
 .cal-chips .chip { height: 44px; padding: 0 20px; font-size: 15px; }
 .sheet-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+.install-steps { margin: 14px 0 0; padding-left: 22px; line-height: 1.7; }
+.install-sheet .sheet-actions { flex-wrap: wrap; }
 .sheet-foot { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--hair); }
 
 .capture-list { display: flex; flex-direction: column; margin-top: 14px; border: 1px solid var(--hair); border-radius: 14px; overflow: hidden; }
