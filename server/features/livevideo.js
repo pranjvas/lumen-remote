@@ -783,6 +783,9 @@ async function evaluate(cdp, expression, { gesture = false, timeoutMs = BROWSER_
 const ENCODER_ERRORS_MAX = 3; // video encoder failures within ENCODER_ERROR_WINDOW_MS: the step is dropped
 const ENCODER_ERROR_WINDOW_MS = 60_000;
 const BACKSTOP_LAG_SEC = 6; // the TV this far behind on 3 reports in a row: back to frames
+const SLOW_DECODE_SHARE = 0.4; // the TV decoding under this share of the frames sent is slow
+const SLOW_DECODE_REPORTS = 3; // slow on this many reports in a row (2 s each): a fresh player
+const SLOW_DECODE_GAP_MS = 30000; // at most one such restart this often
 
 export function createLiveVideo({ config, log: rootLog, store, browser }) {
   const log = rootLog.child('livevideo');
@@ -1172,6 +1175,19 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
         lag,
         dropRatio: decodedDelta > 20 ? droppedDelta / (decodedDelta + droppedDelta) : 0,
       };
+      // A TV decoding far fewer frames than the PC sends (seen 24 Oct after H.264 → HEVC 4K → H.264:
+      // 6 of 30 fps, the picture looked paused) is started over in a fresh player, once in a while.
+      if (tv && prev) {
+        const sentFps = lastStats ? (lastStats.frames + lastStats.repeats) / 2 : null;
+        const slow = sentFps !== null && sentFps >= 15 && decodedDelta / 2 < sentFps * SLOW_DECODE_SHARE;
+        v.slowRun = slow ? (v.slowRun ?? 0) + 1 : 0;
+        if (v.slowRun >= SLOW_DECODE_REPORTS && Date.now() - (v.slowResyncAt ?? 0) > SLOW_DECODE_GAP_MS) {
+          v.slowRun = 0;
+          v.slowResyncAt = Date.now();
+          log.warn('the TV decodes the live video slowly; starting its player over', { tvFps: Math.round(decodedDelta / 2), sentFps: Math.round(sentFps) });
+          fanout.resync(viewer);
+        }
+      }
       v.last = { ...signals, kbps: Math.round((sent.sentBytes * 8) / 1000), lagMs: lag !== null ? Math.round(lag * 1000) : (v.last?.lagMs ?? null),
         // Frames the TV decoded per second (it reports every 2 s).
         tvFps: tv && decodedDelta > 0 ? Math.round(decodedDelta / 2) : (v.last?.tvFps ?? null) };

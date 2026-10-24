@@ -924,6 +924,30 @@ describe('the feature (a fake browser, no Edge)', () => {
     }
   });
 
+  test('a TV that decodes far fewer frames than the PC sends gets a fresh player, once per 30 s', async () => {
+    const edge = await fakeBrowser();
+    const { live, logs } = liveFeature(edge);
+    const tv = fakeTv(); // reports every 200 ms with 6 more frames: read as 3 fps
+    try {
+      tv.handle = live.attach(tv.viewer, caps30);
+      await until(() => edge.page() && configsOf(edge.page()).length, 5000, 'the capture config');
+      const page = edge.page();
+      streamFrom(page);
+      await until(() => tv.got.some((m) => m.kind === 'media'), 5000, 'the stream');
+      const resets = () => tv.got.filter((m) => m.kind === 'init' && m.info.reset).length;
+      const before = resets();
+      page.ws.send(JSON.stringify({ t: 'stats', frames: 60, repeats: 0, skipped: 0, bytes: 1000, captured: 60 })); // the PC sends 30 fps
+      await until(() => logs.some((l) => l.msg === 'the TV decodes the live video slowly; starting its player over'), 5000, 'the slow-decode restart');
+      assert.equal(resets(), before + 1, 'a fresh player');
+      await sleep(1500);
+      assert.equal(logs.filter((l) => l.msg.startsWith('the TV decodes the live video slowly')).length, 1, 'not again within 30 s');
+    } finally {
+      tv.stop();
+      await live.stop();
+      edge.close();
+    }
+  });
+
   test('a stuck TV player is started over at once, never blocked; again within 2 minutes, a step down', async () => {
     const edge = await fakeBrowser();
     const { live, logs } = liveFeature(edge);
