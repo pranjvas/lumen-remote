@@ -221,6 +221,34 @@ export function fragmentBatch({ seq, tracks }) {
   return Buffer.concat([build(offsets), u32(8 + dataSize), str4('mdat'), ...data]);
 }
 
+/**
+ * Where each track's tfdt time (a u64, version 1) sits in a fragment made by fragmentBatch:
+ * { [track id]: byte offset }. moof > mfhd > traf > tfhd > tfdt: the first is at byte 60.
+ */
+export function tfdtOffsets(buf) {
+  const out = {};
+  const moof = listBoxes(buf).find((b) => b.type === 'moof');
+  if (!moof) return out;
+  for (const traf of listBoxes(buf, moof.start + 8, moof.start + moof.size)) {
+    if (traf.type !== 'traf') continue;
+    const inner = listBoxes(buf, traf.start + 8, traf.start + traf.size);
+    const tfhd = inner.find((b) => b.type === 'tfhd');
+    const tfdt = inner.find((b) => b.type === 'tfdt');
+    if (tfhd && tfdt && buf[tfdt.start + 8] === 1) out[buf.readUInt32BE(tfhd.start + 12)] = tfdt.start + 12;
+  }
+  return out;
+}
+
+/**
+ * A raw AAC-LC frame of silence (1024 samples) for 1 or 2 channels, or null for other layouts.
+ * Used to fill a short seam in the audio when a viewer's timeline is rebased.
+ */
+export function silentAacFrame(channels) {
+  if (channels === 1) return Buffer.from([0x00, 0xc8, 0x00, 0x80, 0x23, 0x80]);
+  if (channels === 2) return Buffer.from([0x21, 0x00, 0x49, 0x90, 0x02, 0x19, 0x00, 0x23, 0x80]);
+  return null;
+}
+
 /** One moof + mdat holding one sample of `track` at `time` (track timescale), lasting `duration`. */
 export function fragment({ seq, track, time, duration, data, key = true }) {
   return fragmentBatch({ seq, tracks: [{ track, time, samples: [{ duration, data, key }] }] });

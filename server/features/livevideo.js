@@ -16,7 +16,7 @@ import { LumenError } from '../errors.js';
 import { CAPTURE_TITLE, TV_VIEWPORT } from './browser.js';
 import {
   initSegment, fragmentBatch, mimeType, avcCodecString, hevcCodecString, buildHvcC, splitAnnexB, lengthPrefixed,
-  hevcNalType, HEVC_PARAMETER_SETS, VIDEO_TRACK, AUDIO_TRACK, VIDEO_TIMESCALE,
+  hevcNalType, tfdtOffsets, silentAacFrame, HEVC_PARAMETER_SETS, VIDEO_TRACK, AUDIO_TRACK, VIDEO_TIMESCALE,
 } from '../util/fmp4.js';
 
 const CAPTURE_PAGE = new URL('./livecapture.html', import.meta.url);
@@ -105,11 +105,17 @@ const familyOf = (codec) => (/^(hvc1|hev1)/.test(codec) ? 'hevc' : 'avc');
 
 /**
  * Turns the capture page's messages into fMP4. emit({ kind: 'init', buf, mime, codec, width, height,
- * fps, reset, audio }) and emit({ kind: 'media', key, buf, time }): one fragment per ~fragmentMs of
- * media (video and audio together), each starting at a key frame when there is one, so the TV appends
- * a few large pieces a second instead of one per frame. One muxer per capture session: its timeline
- * starts at the session's first key frame.
+ * fps, reset, audio }) and emit({ kind: 'media', key, buf, time, seq, tracks, video, audio,
+ * audioRate }): one fragment per ~fragmentMs of media (video and audio together), each starting at a
+ * key frame when there is one, so the TV appends a few large pieces a second instead of one per
+ * frame. `tracks` is what fragmentBatch built it from; video { time, end } and audio { time, end,
+ * samples } are in track ticks (90 kHz; the audio sample rate), so a viewer's copy can be rebased.
+ * One muxer per capture session: its timeline starts at the session's first key frame. A gap of a
+ * second or more in the video (the encoder died and came back) starts a new stream (a reset init)
+ * at the next key frame instead of leaving a hole the TV's player would stall at.
  */
+const EARLY_AUDIO_US = 1.5e6; // audio held while waiting for a key frame: at most this much
+
 export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMENT_MS, setTimer = setTimeout, clearTimer = clearTimeout }) {
   let vcfg = null; // { codec, width, height, fps, format, config: avcC|hvcC|null }
   let acfg = null; // { sampleRate, channels, config }
@@ -117,6 +123,7 @@ export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMEN
   let family = null;
   let base = null; // µs of the first key frame
   let waitKey = true;
+  let resetPending = false; // a gap in the video: a new stream from the next key frame
   let firstVideoAt = null;
   let seq = 1;
   let audioNext = null;
@@ -124,6 +131,9 @@ export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMEN
   let lastVideoTime = -1;
   let batch = null; // { video: [{ time, data, key }], audio: [{ time, data }], since }
   let flushTimer = null;
+  // Audio that came while waiting for a key frame (the capture's audio starts before the hardware
+  // encoder's first key frame; a step change waits for one too): [{ ts, data }], the last ~1.5 s.
+  let early = [];
 
   function audioSpecificConfig(rate, channels) {
     const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
@@ -167,8 +177,24 @@ export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMEN
     if (video.length) tracks.push({ track: VIDEO_TRACK, time: start, samples: video });
     if (b.audio.length) tracks.push({ track: AUDIO_TRACK, time: b.audio[0].time, samples: b.audio.map((s) => ({ data: s.data, key: true, duration: 1024 })) });
     const key = !!b.video[0]?.key;
-    const time = b.video.length ? start / VIDEO_TIMESCALE : b.audio[0].time / (acfg?.sampleRate || 48000);
-    emit({ kind: 'media', key, time, buf: fragmentBatch({ seq: seq++, tracks }) });
+    const audioRate = acfg?.sampleRate || 48000;
+    const time = b.video.length ? start / VIDEO_TIMESCALE : b.audio[0].time / audioRate;
+    const n = seq++;
+    emit({ kind: 'media', key, time, seq: n, tracks, audioRate, audioChannels: acfg?.channels ?? 2, buf: fragmentBatch({ seq: n, tracks }),
+      video: video.length ? { time: start, end: videoNext } : null,
+      audio: b.audio.length ? { time: b.audio[0].time, end: b.audio[0].time + 1024 * b.audio.length, samples: b.audio.map((s) => s.data) } : null });
+  }
+
+  // AAC frames are 1024 samples: consecutive frames butt up against each other unless the clock
+  // jumped (a gap in the capture), so the TV's player never sees overlaps or hairline gaps.
+  function admitAudio(ts, data) {
+    const rate = acfg.sampleRate;
+    const fromTs = Math.round(((ts - base) * rate) / 1e6);
+    if (fromTs < 0) return;
+    const time = audioNext !== null && Math.abs(fromTs - audioNext) < 2048 ? audioNext : fromTs;
+    if (audioNext !== null && time !== audioNext && batch?.audio.length) flush(); // a gap ends the run
+    audioNext = time + 1024;
+    add('audio', { time, data });
   }
 
   function add(kind, sample) {
@@ -210,36 +236,51 @@ export function createMuxer({ emit, now = () => Date.now(), fragmentMs = FRAGMEN
       }
       if (!maybeInit()) return;
       if (waitKey && !key) return;
-      waitKey = false;
       if (base === null) base = ts;
       let time = Math.round(((ts - base) * VIDEO_TIMESCALE) / 1e6);
       if (time <= lastVideoTime) time = lastVideoTime + 1;
       if (time < 0) return;
+      // A second or more without video (the encoder failed and came back): the seam would be a
+      // hole in the TV's buffer, so a new stream (a fresh player on the TV) starts at the next key
+      // frame. Shorter gaps are closed by the flush (videoNext).
+      if (lastVideoTime >= 0 && time - lastVideoTime >= VIDEO_TIMESCALE) resetPending = true;
+      if (resetPending) {
+        if (!key) return;
+        resetPending = false;
+        flush();
+        sentInit = null;
+        maybeInit(true);
+      }
+      const held = waitKey;
+      waitKey = false;
       // A key frame starts a fragment of its own, so a viewer can start (or restart) there.
       if (key && batch?.video.length) flush();
+      if (held) {
+        // The audio that came while waiting rides with this key frame (none before media time 0).
+        const list = early;
+        early = [];
+        for (const a of list) admitAudio(a.ts, a.data);
+      }
       lastVideoTime = time;
       add('video', { time, data: sample, key });
       if (span() >= fragmentMs - 500 / (vcfg.fps || 30)) flush();
     },
     audio(ts, data) {
       if (!acfg) return;
-      if (base === null || sentInit === null || waitKey) { maybeInit(); return; }
-      const rate = acfg.sampleRate;
-      const fromTs = Math.round(((ts - base) * rate) / 1e6);
-      if (fromTs < 0) return;
-      // AAC frames are 1024 samples: consecutive frames butt up against each other unless the clock
-      // jumped (a gap in the capture), so the TV's player never sees overlaps or hairline gaps.
-      const time = audioNext !== null && Math.abs(fromTs - audioNext) < 2048 ? audioNext : fromTs;
-      if (audioNext !== null && time !== audioNext && batch?.audio.length) flush(); // a gap ends the run
-      audioNext = time + 1024;
-      add('audio', { time, data });
+      if (base === null || sentInit === null || waitKey) {
+        early.push({ ts, data });
+        while (early.length && ts - early[0].ts > EARLY_AUDIO_US) early.shift();
+        maybeInit();
+        return;
+      }
+      admitAudio(ts, data);
     },
     /** Sends what is packed now (tests; the end of a stream). */
     flush,
     /** µs (capture-page clock) of media time 0, or null before the first key frame. */
     get base() { return base; },
     get initSent() { return sentInit !== null; },
-    stop() { clearTimer(flushTimer); flushTimer = null; batch = null; },
+    stop() { clearTimer(flushTimer); flushTimer = null; batch = null; early = []; },
   };
 }
 
@@ -278,9 +319,25 @@ export function parseMessage(buf) {
  * link is backed up). Each viewer gets the current init segment when it joins, then fragments from
  * the next key frame; one that cannot keep up skips to the next key frame. requestKey() asks the
  * encoder for one (joins and skips need it).
+ *
+ * A skip must not leave a hole in the viewer's timeline (this TV's player stalls at a 33 ms gap, and
+ * seeking over one gets its page killed), so each viewer has its own timeline: after a skip, its
+ * fragments are moved back (tfdt) to butt up against what it already has, video exactly, audio to
+ * the nearest whole AAC frame of the video's shift (a silent frame or two filled in, or a frame or two
+ * left out), so lip sync stays within half a frame (±10.7 ms) and never drifts. A fresh player (a
+ * reset init) starts on the stream's own timeline again. The same skip sheds lag: a TV that reports
+ * itself well behind skips to the next key frame instead of seeking.
  */
+const LAG_SHED_SEC = 1.5; // a TV this far behind on two reports in a row skips ahead ...
+const LAG_CALM_SEC = 1; // ... until it reports less than this
+const SHED_GAP_MS = 1000; // at most one skip per key interval
+const AAC_FRAME = 1024;
+
 export function createFanout({ requestKey, now = () => Date.now(), limitBytes = () => 512 * 1024 }) {
-  const viewers = new Map(); // viewer → { needKey, paused, sentInitGen, drops, sentBytes }
+  // viewer → { needKey, paused, sentInitGen, initAt, drops, sentBytes, and its timeline: vShift,
+  // aShift (track ticks added to the stream's times), vEnd, aEnd (where what it has ends, on its
+  // timeline), rebase (the next key fragment is moved back), audioRebase, lagHigh, shedding, ... }
+  const viewers = new Map();
   let init = null; // { gen, info, buf }
   let gen = 0;
   let lastKeyRequest = 0;
@@ -292,16 +349,108 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
     requestKey();
   }
 
+  function freshTimeline(state) {
+    state.vShift = 0;
+    state.aShift = 0;
+    state.vEnd = null;
+    state.aEnd = null;
+    state.rebase = false;
+    state.audioRebase = null; // { ideal }: the audio's shift is settled at the next fragment with audio
+    state.lastAudio = null;
+    state.shedding = false;
+  }
+
   function sendInit(viewer, state, reset = false) {
     if (!init) return;
-    const info = { ...init.info, reset: reset || init.info.reset };
-    if (viewer.send(initMessage(init.gen, info, init.buf), { key: true, init: true, limit: Infinity })) state.sentInitGen = init.gen;
+    const isReset = reset || !!init.info.reset;
+    const info = { ...init.info, reset: isReset };
+    if (viewer.send(initMessage(init.gen, info, init.buf), { key: true, init: true, limit: Infinity })) {
+      state.sentInitGen = init.gen;
+      state.initAt = now();
+    }
     state.needKey = true;
+    if (isReset) freshTimeline(state); // a new player: the stream's own timeline
+  }
+
+  const readTime = (buf, at) => Number(buf.readBigUInt64BE(at));
+  const writeTime = (buf, at, v) => buf.writeBigUInt64BE(BigInt(Math.max(0, Math.round(v))), at);
+
+  /**
+   * This viewer's copy of fragment `m` → { msg, commit } (commit: its timeline once it is sent).
+   * offsetsOf() gives the tfdt offsets in m.buf (found once per fragment).
+   */
+  function viewerCopy(m, state, offsetsOf) {
+    const v = m.video ?? null;
+    const a = m.audio ?? null;
+    let { vShift, aShift, audioRebase } = state;
+    if (m.key && state.rebase && v && state.vEnd !== null) {
+      // After a skip: this key fragment's video starts exactly where the viewer's video ends.
+      vShift = state.vEnd - v.time;
+      audioRebase = { ideal: Math.round((vShift * (m.audioRate || 48000)) / VIDEO_TIMESCALE) };
+    }
+    let audioRun = null; // a changed audio run: { time, samples }
+    let aEnd = state.aEnd;
+    let lastAudio = state.lastAudio;
+    if (a) {
+      let fill = 0;
+      if (audioRebase) {
+        // Audio follows on exactly too, shifted by the whole number of frames nearest the video's shift.
+        if (state.aEnd !== null) {
+          const contiguous = state.aEnd - a.time;
+          const frames = Math.round((audioRebase.ideal - contiguous) / AAC_FRAME);
+          aShift = contiguous + frames * AAC_FRAME;
+          if (frames > 0) fill = frames;
+        } else aShift = audioRebase.ideal;
+        audioRebase = null;
+      }
+      let samples = a.samples;
+      let start = a.time + aShift;
+      let changed = false;
+      if (fill) {
+        const silent = silentAacFrame(m.audioChannels ?? 2) ?? state.lastAudio ?? samples[0];
+        samples = [...Array(fill).fill(silent), ...samples];
+        start -= fill * AAC_FRAME;
+        changed = true;
+      } else if (state.aEnd !== null && start < state.aEnd - AAC_FRAME / 2) {
+        // Audio this viewer already has (the shift rounded down): those frames are left out.
+        const drop = Math.min(samples.length, Math.round((state.aEnd - start) / AAC_FRAME));
+        samples = samples.slice(drop);
+        start += drop * AAC_FRAME;
+        changed = drop > 0;
+      }
+      if (changed) audioRun = { time: start, samples };
+      if (samples.length) {
+        aEnd = start + samples.length * AAC_FRAME;
+        lastAudio = samples[samples.length - 1];
+      }
+    }
+    const commit = { vShift, aShift, audioRebase, aEnd, lastAudio, vEnd: v ? v.end + vShift : state.vEnd };
+    let msg;
+    if (audioRun && m.tracks) {
+      const tracks = [];
+      for (const t of m.tracks) {
+        if (t.track === VIDEO_TRACK) tracks.push({ ...t, time: Math.max(0, t.time + vShift) });
+        else if (t.track === AUDIO_TRACK && audioRun.samples.length) {
+          tracks.push({ track: AUDIO_TRACK, time: Math.max(0, audioRun.time), samples: audioRun.samples.map((data) => ({ data, key: true, duration: AAC_FRAME })) });
+        }
+      }
+      msg = mediaMessage(gen, m.key, [fragmentBatch({ seq: m.seq ?? 0, tracks })]);
+    } else {
+      msg = mediaMessage(gen, m.key, [m.buf]); // a copy: the shifts go into it
+      if (vShift || aShift) {
+        const offsets = offsetsOf();
+        const head = msg.length - m.buf.length;
+        if (offsets[VIDEO_TRACK] !== undefined && vShift) writeTime(msg, head + offsets[VIDEO_TRACK], readTime(m.buf, offsets[VIDEO_TRACK]) + vShift);
+        if (offsets[AUDIO_TRACK] !== undefined && aShift) writeTime(msg, head + offsets[AUDIO_TRACK], readTime(m.buf, offsets[AUDIO_TRACK]) + aShift);
+      }
+    }
+    return { msg, commit };
   }
 
   return {
     add(viewer) {
-      const state = { needKey: true, paused: false, sentInitGen: -1, drops: 0, sentBytes: 0 };
+      const state = { needKey: true, paused: false, sentInitGen: -1, initAt: null, drops: 0, sentBytes: 0, lagHigh: 0, shedAt: 0, sheds: 0 };
+      freshTimeline(state);
       viewers.set(viewer, state);
       sendInit(viewer, state, true);
       askKey();
@@ -333,35 +482,71 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
       for (const [viewer, state] of viewers) if (!state.paused) sendInit(viewer, state);
     },
     onMedia(m) {
+      let offsets = null;
+      const offsetsOf = () => (offsets ??= tfdtOffsets(m.buf));
       for (const [viewer, state] of viewers) {
         if (state.paused) continue;
         if (state.sentInitGen !== gen) { if (init) sendInit(viewer, state); continue; }
-        if (state.needKey && !m.key) { askKey(); continue; }
-        const msg = mediaMessage(gen, m.key, [m.buf]);
+        // Skipping to the next key frame: after a drop one is asked for; shedding lag waits for the
+        // stream's own (the skip is what sheds the lag).
+        if (state.needKey && !m.key) { if (!state.shedding) askKey(); continue; }
+        const { msg, commit } = viewerCopy(m, state, offsetsOf);
         // A fragment that starts with a key frame may go over the limit once the link has drained a
         // little; anything else is skipped while the link is backed up, and the viewer restarts from
-        // the next key frame.
+        // the next key frame, its timeline moved back to close the gap.
         if (viewer.send(msg, { key: m.key, limit: m.key ? limitBytes() * 2 : limitBytes() })) {
+          Object.assign(state, commit);
           state.needKey = false;
+          state.rebase = false;
+          state.shedding = false;
           state.sentBytes += msg.length;
         } else {
           state.drops += 1;
           state.needKey = true;
+          state.rebase = true;
+          state.shedding = false;
           askKey();
         }
       }
     },
-    /** Per-viewer counters since the last call: { drops, sentBytes }. */
+    /**
+     * The TV's reported lag (s, every 2 s). Well behind on two reports in a row, the viewer skips to
+     * the next key frame (rebased: no hole), once per report, until it is back under a second.
+     * → true when a skip was started.
+     */
+    noteLag(viewer, lag) {
+      const state = viewers.get(viewer);
+      if (!state || state.paused || typeof lag !== 'number' || !Number.isFinite(lag)) return false;
+      if (lag < LAG_CALM_SEC) { state.lagHigh = 0; return false; }
+      if (lag <= LAG_SHED_SEC) return false;
+      state.lagHigh += 1;
+      if (state.lagHigh < 2 || state.needKey || state.vEnd === null || now() - state.shedAt < SHED_GAP_MS) return false;
+      state.needKey = true;
+      state.rebase = true;
+      state.shedding = true;
+      state.shedAt = now();
+      state.sheds += 1;
+      return true;
+    },
+    /** A viewer's timeline against the stream's: { video (90 kHz ticks), audio (samples), sheds }. */
+    shifts(viewer) {
+      const state = viewers.get(viewer);
+      return state ? { video: state.vShift, audio: state.aShift, sheds: state.sheds } : null;
+    },
+    /** Per-viewer counters since the last call: { drops, sentBytes, needKey, initAt }. */
     takeStats(viewer) {
       const state = viewers.get(viewer);
       if (!state) return null;
-      const out = { drops: state.drops, sentBytes: state.sentBytes, needKey: state.needKey };
+      const out = { drops: state.drops, sentBytes: state.sentBytes, needKey: state.needKey, initAt: state.initAt };
       state.drops = 0;
       state.sentBytes = 0;
       return out;
     },
     /** The stream ended (the capture stopped): its init segment is not given to anyone any more. */
-    clear() { init = null; },
+    clear() {
+      init = null;
+      for (const state of viewers.values()) state.initAt = null;
+    },
     get size() { return viewers.size; },
     get gen() { return gen; },
   };
@@ -370,45 +555,73 @@ export function createFanout({ requestKey, now = () => Date.now(), limitBytes = 
 // ---------- rate control ----------
 
 /**
- * Picks the bitrate and the ladder step from what the link and the TV report each second.
- * tick({ drops, queueSec, stalls, dropRatio, refused, statsLate }) → { bitrate?, step? } (changes
- * only), or { exhausted: true } when no step is left. Starts at startIndex (never at a probe step);
- * a probe step above is tried once after probeAfter quiet seconds and dropped at its first trouble.
+ * Picks the bitrate and the ladder step from what the link says every second and the TV reports
+ * every 2 s. tick({ drops, queueSec, statsLate (the PC's side, every tick), tvFresh, stalls, jumps,
+ * resyncs, lag, dropRatio (the TV's report, when one came: tvFresh), refused, refusedIndex,
+ * runtimeError }) → { bitrate?, step?, cause? } (changes only), { resync: true } (start the viewer's
+ * player over), or { exhausted: true } when no step is left. Starts at startIndex (never at a probe
+ * step); a probe step above is tried once after probeAfter quiet seconds and dropped at its first
+ * trouble. The TV's signals are judged over its last reports, not per tick: a tick without a report
+ * neither clears them nor counts as quiet. A format the TV refused, a failed probe and a failing
+ * encoder block their step for good; a step left for dropped frames or repeated player errors is
+ * held for ten minutes and then tried again.
  */
 const PROBE_GRACE_TICKS = 4;
+const HOLD_MS = 10 * 60 * 1000;
+const ERROR_WINDOW_MS = 10 * 60 * 1000;
+const TV_LAG_TROUBLE_SEC = 1.5;
+const UP_CAUSES = new Set(['congestion', 'decode', 'error']);
 
-export function createRateControl({ ladder, startIndex = startIndexOf(ladder), probeAfter = 90 }) {
+export function createRateControl({ ladder, startIndex = startIndexOf(ladder), probeAfter = 90, now = Date.now }) {
   let index = Math.min(startIndex, ladder.length - 1);
   let bitrate = ladder[index].bitrate.start;
   let good = 0;
   let bad = 0;
-  let decodeBad = 0;
-  let lowered = null; // { from, at: tick count, cause }
+  const lowered = []; // steps left for a lower one, latest last: { from, at: tick count, cause }
   let probing = null; // { from, at }
   let ticks = 0;
   let upWait = 45;
-  const blocked = new Set(); // steps the TV refused or could not keep up with
+  const blocked = new Set(); // for good: formats the TV refused, failed probes, failing encoders
+  const held = new Map(); // step → until (ms): left for dropped frames or player errors
+  let errors = []; // when the TV's player failed at run time (not its format)
+  let tvHist = []; // the TV's last 3 reports: { stall, decode }
+  let troubleHist = []; // the TV's last 4 reports: trouble of any kind
+  let lastTvTrouble = false; // the latest report showed trouble (carried over ticks without one)
 
+  const isHeld = (i) => (held.get(i) ?? 0) > now();
   function moveTo(next, cause) {
     if (next === index || next < 0 || next >= ladder.length) return null;
-    if (next > index && cause !== 'probe-failed') lowered = { from: index, at: ticks, cause };
+    if (next > index && cause !== 'probe-failed') lowered.push({ from: index, at: ticks, cause });
     index = next;
     bitrate = Math.min(ladder[index].bitrate.start, ladder[index].bitrate.max);
-    good = bad = decodeBad = 0;
+    good = bad = 0;
+    tvHist = [];
+    troubleHist = [];
+    lastTvTrouble = false;
     return { step: index, bitrate, cause };
   }
-  const below = () => ladder.findIndex((_, i) => i > index && !blocked.has(i));
+  const below = () => ladder.findIndex((_, i) => i > index && !blocked.has(i) && !isHeld(i));
 
   return {
     get index() { return index; },
     get step() { return ladder[index]; },
     get bitrate() { return bitrate; },
-    tick({ drops = 0, queueSec = 0, stalls = 0, dropRatio = 0, refused = false, statsLate = false } = {}) {
+    tick({ drops = 0, queueSec = 0, stalls = 0, dropRatio = 0, refused = false, refusedIndex = null, statsLate = false,
+      runtimeError = false, tvFresh = true, lag = null, jumps = 0, resyncs = 0 } = {}) {
       ticks += 1;
-      const trouble = refused || drops > 0 || queueSec > QUEUE_LIMIT_SEC || stalls > 0 || dropRatio > 0.1 || statsLate;
+      let entry = null;
+      if (tvFresh) {
+        const lagging = typeof lag === 'number' && lag > TV_LAG_TROUBLE_SEC;
+        entry = { stall: stalls > 0 || jumps > 0 || resyncs > 0 || lagging, decode: dropRatio > 0.1 };
+        tvHist = [...tvHist, entry].slice(-3);
+        troubleHist = [...troubleHist, entry.stall || entry.decode].slice(-4);
+        lastTvTrouble = entry.stall || entry.decode;
+      }
+      const tvStalled = tvFresh && (stalls > 0 || jumps > 0 || resyncs > 0);
+      const trouble = refused || runtimeError || drops > 0 || queueSec > QUEUE_LIMIT_SEC || tvStalled || dropRatio > 0.1 || statsLate;
       // A probe step goes at its first trouble, for good: after a few seconds of grace, since the
       // switch itself (a new size from a key frame, maybe a new player on the TV) comes in a burst.
-      if (probing && trouble && !refused && ticks - probing.at <= PROBE_GRACE_TICKS) return null;
+      if (probing && trouble && !refused && !runtimeError && ticks - probing.at <= PROBE_GRACE_TICKS) return null;
       if (probing && trouble) {
         blocked.add(index);
         const back = probing.from;
@@ -417,42 +630,69 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
       }
       if (probing && ticks - probing.at > 30) probing = null; // it held: it is the step now
       if (refused) {
-        blocked.add(index);
+        // The step the refusal came in on (the stream may have changed step since).
+        const at = Number.isInteger(refusedIndex) ? refusedIndex : index;
+        blocked.add(at);
+        if (at !== index) return { resync: true };
         const next = below();
         return next < 0 ? { exhausted: true } : moveTo(next, 'refused');
       }
-      if (dropRatio > 0.1) decodeBad += 1; else decodeBad = 0;
-      if (decodeBad >= 3) {
-        blocked.add(index);
-        const next = below();
-        if (next >= 0) return moveTo(next, 'decode');
-        decodeBad = 0;
+      if (runtimeError) {
+        // The TV's player failed while playing (it was started over already): a second time within
+        // ten minutes, the step is held for ten minutes and the next one down is used.
+        const t = now();
+        errors = [...errors.filter((x) => t - x < ERROR_WINDOW_MS), t];
+        if (errors.length >= 2) {
+          errors = [];
+          held.set(index, t + HOLD_MS);
+          const next = below();
+          return next < 0 ? { exhausted: true } : moveTo(next, 'error');
+        }
       }
-      const congested = drops > 0 || queueSec > QUEUE_LIMIT_SEC || stalls > 0 || statsLate;
+      // Dropped frames on 2 of the TV's last 3 reports: it cannot decode this step.
+      if (entry && tvHist.filter((e) => e.decode).length >= 2) {
+        const next = below();
+        if (next >= 0) {
+          held.set(index, now() + HOLD_MS);
+          return moveTo(next, 'decode');
+        }
+      }
+      // Nothing left below and still in trouble on 3 of the TV's last 4 reports.
+      if (entry && below() < 0 && troubleHist.filter(Boolean).length >= 3) return { exhausted: true };
+      // Congestion: the link (dropped or queued fragments, a late report) or the TV's player (stalls,
+      // restarts or lag on 2 of its last 3 reports). The bitrate goes down to the step's floor, then
+      // the step: at once for the TV, after 3 seconds at the floor for the link.
+      const tvCongested = !!entry && tvHist.filter((e) => e.stall).length >= 2;
+      const pcCongested = drops > 0 || queueSec > QUEUE_LIMIT_SEC || statsLate;
       const { min, max } = ladder[index].bitrate;
-      if (congested) {
+      if (pcCongested || tvCongested) {
         good = 0;
         if (bitrate > min) {
           bitrate = Math.max(min, Math.round(bitrate * 0.7));
           return { bitrate };
         }
+        if (tvCongested) return moveTo(below(), 'congestion');
         bad += 1; // congested at the floor of this step
-        if (bad >= 3 && index < ladder.length - 1) return moveTo(index + 1, 'congestion');
+        if (bad >= 3) return moveTo(below(), 'congestion');
         return null;
       }
+      // The TV's latest report showed trouble: no credit, no climb, no probe until a clean one.
+      if (lastTvTrouble) return null;
       bad = 0;
       good += 1;
-      // A step lowered for congestion is tried again after a quiet while (longer each time).
-      if (lowered && lowered.cause === 'congestion' && ticks - lowered.at >= upWait && good >= 10 && !blocked.has(lowered.from)) {
-        upWait = Math.min(upWait * 2, 600);
-        const back = lowered.from;
-        lowered = null;
-        return moveTo(back, 'up');
+      // A step left for congestion is tried again after a quiet while (longer each time); one left for
+      // dropped frames or player errors once its hold is over. Steps blocked for good are passed over.
+      while (lowered.length && blocked.has(lowered[lowered.length - 1].from)) lowered.pop();
+      const last = lowered[lowered.length - 1];
+      if (last && UP_CAUSES.has(last.cause) && good >= 10 && !isHeld(last.from) && (last.cause !== 'congestion' || ticks - last.at >= upWait)) {
+        if (last.cause === 'congestion') upWait = Math.min(upWait * 2, 600);
+        lowered.pop();
+        return moveTo(last.from, 'up');
       }
       // A probe step above (60 fps, 4K) once the stream has been quiet for a long while.
       let up = index - 1; // the nearest probe step above that has not failed
       while (up >= 0 && ladder[up].probe && blocked.has(up)) up -= 1;
-      if (!lowered && up >= 0 && ladder[up].probe && good >= probeAfter) {
+      if (!lowered.length && up >= 0 && ladder[up].probe && good >= probeAfter) {
         const from = index;
         const change = moveTo(up, 'probe');
         probing = { from, at: ticks };
@@ -464,16 +704,30 @@ export function createRateControl({ ladder, startIndex = startIndexOf(ladder), p
       }
       return null;
     },
+    /** The PC's encoder keeps failing at this step: it is blocked for good and the next one down used. */
+    encoderFailed() {
+      probing = null;
+      blocked.add(index);
+      const next = below();
+      return next < 0 ? { exhausted: true } : moveTo(next, 'encoder');
+    },
   };
 }
 
 // ---------- the feature ----------
 
-function connectCdp(url) {
+// A browser that hangs (Edge closing or crashed under a DevTools call) must not hang the start: every
+// DevTools step has a time limit, and an attempt that runs out ends in the usual retries.
+const BROWSER_TIMEOUT_MS = 8000;
+
+function connectCdp(url, timeoutMs = BROWSER_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
     const pending = new Map();
     let next = 1;
+    const timer = setTimeout(() => { reject(new Error('the browser did not answer')); try { ws.close(); } catch { /* gone */ } }, timeoutMs);
+    ws.addEventListener('open', () => clearTimeout(timer));
+    ws.addEventListener('error', () => clearTimeout(timer));
     ws.addEventListener('open', () => resolve({
       send(method, params = {}) {
         if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error('DevTools connection closed'));
@@ -496,16 +750,26 @@ function connectCdp(url) {
   });
 }
 
-async function evaluate(cdp, expression, { gesture = false } = {}) {
-  const { result, exceptionDetails } = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: gesture });
+async function evaluate(cdp, expression, { gesture = false, timeoutMs = BROWSER_TIMEOUT_MS } = {}) {
+  let timer = null;
+  const answer = cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: gesture });
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the browser did not answer')), timeoutMs); });
+  const { result, exceptionDetails } = await Promise.race([answer, late]).finally(() => clearTimeout(timer));
   if (exceptionDetails) throw new Error(exceptionDetails.exception?.description?.split('\n')[0] ?? exceptionDetails.text);
   return result?.value;
 }
 
+const ENCODER_ERRORS_MAX = 3; // video encoder failures within ENCODER_ERROR_WINDOW_MS: the step is dropped
+const ENCODER_ERROR_WINDOW_MS = 60_000;
+const BACKSTOP_LAG_SEC = 6; // the TV this far behind on 3 reports in a row: back to frames
+
 export function createLiveVideo({ config, log: rootLog, store, browser }) {
   const log = rootLog.child('livevideo');
   const settings = { enabled: false, maxHeight: 1080, maxFps: 60, probeAfterSec: 30, preferHevc: true, idleStopMs: 15_000, gopSeconds: 1, fragmentMs: FRAGMENT_MS,
-    statsLateMs: STATS_LATE_MS, statsGoneMs: STATS_GONE_MS, statsGraceMs: STATS_GRACE_MS, ...config.liveVideo };
+    statsLateMs: STATS_LATE_MS, statsGoneMs: STATS_GONE_MS, statsGraceMs: STATS_GRACE_MS,
+    // Internal timings (tests shorten them).
+    pickTimeoutMs: PICK_TIMEOUT_MS, retryMs: RETRY_MS, browserTimeoutMs: BROWSER_TIMEOUT_MS, controlMs: 1000, ...config.liveVideo };
+  const ev = (cdp, expression, opts = {}) => evaluate(cdp, expression, { timeoutMs: settings.browserTimeoutMs, ...opts });
   const token = randomBytes(24).toString('hex');
   let server = null; // loopback HTTP + WebSocket server for the capture page
   let wss = null;
@@ -526,8 +790,13 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   let lastStats = null;
   let pageClock = null; // wall-clock ms of the capture page's timestamp 0
   let startLower = 0;
+  let rechooseNext = false; // resetRate(): the next viewer starts on a new rate controller
   let stopped = false;
-  const viewers = new Map(); // viewer → { tvStats, refused }
+  let emptyStats = 0; // capture reports in a row with frames but no encoded bytes
+  let encoderErrors = []; // times of video encoder failures the capture page did not recover from
+  // viewer → { tvStats, prevTv, refused, refusedIndex, runtimeError, resyncs, since, lastStatsAt,
+  // onFallback, onRestart, lagRun, stallHist, last }
+  const viewers = new Map();
 
   const publish = (value) => store.set('tvscreen.live', value, { src: 'derived', via: 'livevideo' });
   const fanout = createFanout({
@@ -581,9 +850,36 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     if (msg.t === 'hello') { pageClock = typeof msg.clock === 'number' ? msg.clock : null; const w = pageWaiters; pageWaiters = []; w.forEach((fn) => fn()); }
     else if (msg.t === 'vconfig') muxer?.videoConfig(msg);
     else if (msg.t === 'aconfig') muxer?.audioConfig(msg);
-    else if (msg.t === 'stats') lastStats = msg;
+    else if (msg.t === 'stats') onCaptureStats(msg);
     else if (msg.t === 'ended') onCaptureLost('the capture ended');
-    else if (msg.t === 'error') log.warn('capture page error', { where: String(msg.where).slice(0, 40), message: String(msg.message).slice(0, 200) });
+    else if (msg.t === 'error') onCaptureError(msg);
+  }
+
+  // The capture page encodes frames but nothing comes out (its encoder is gone or stuck): the step's
+  // config makes it build a new one. The TV would otherwise show a frozen picture with sound.
+  function onCaptureStats(msg) {
+    lastStats = msg;
+    if (msg.bytes === 0 && (Number(msg.frames) || 0) + (Number(msg.repeats) || 0) > 0) emptyStats += 1;
+    else emptyStats = 0;
+    if (emptyStats >= 2 && rate) {
+      emptyStats = 0;
+      log.warn('the capture encodes nothing; configuring its encoder again', { step: rate.step.name });
+      sendPage(stepConfig(rate.step, rate.bitrate));
+    }
+  }
+
+  // A video encoder that keeps failing at this step (a probe step whose encoder passed the support
+  // check but fails at its real start): the step is dropped for good.
+  function onCaptureError(msg) {
+    const where = String(msg.where).slice(0, 40);
+    log.warn('capture page error', { where, message: String(msg.message).slice(0, 200), recovered: msg.recovered === true });
+    if (where !== 'video encoder' || msg.recovered === true || !rate) return;
+    const t = Date.now();
+    encoderErrors = [...encoderErrors.filter((x) => t - x < ENCODER_ERROR_WINDOW_MS), t];
+    if (encoderErrors.length < ENCODER_ERRORS_MAX) return;
+    encoderErrors = [];
+    log.warn('the video encoder keeps failing; dropping the step', { step: rate.step.name });
+    applyChange(rate.encoderFailed(), { encoder: true }, null, 'The PC could not encode the live video');
   }
 
   function onChunk(buf) {
@@ -622,33 +918,36 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     await ensureServer();
     muxer?.stop();
     muxer = createMuxer({ emit: onMuxed, fragmentMs: settings.fragmentMs });
+    emptyStats = 0;
+    encoderErrors = [];
     if (!captureTarget) {
-      const target = await (await fetch(`http://127.0.0.1:${dt.port}/json/new?http://127.0.0.1:${port}/capture?t=${token}`, { method: 'PUT' })).json();
-      captureTarget = { id: target.id, cdp: await connectCdp(target.webSocketDebuggerUrl), devPort: dt.port };
+      const signal = AbortSignal.timeout(settings.browserTimeoutMs);
+      const target = await (await fetch(`http://127.0.0.1:${dt.port}/json/new?http://127.0.0.1:${port}/capture?t=${token}`, { method: 'PUT', signal })).json();
+      captureTarget = { id: target.id, cdp: await connectCdp(target.webSocketDebuggerUrl, settings.browserTimeoutMs), devPort: dt.port };
     }
     await waitForPage();
     const cdp = captureTarget.cdp;
-    if (!encoders) encoders = await evaluate(cdp, `lumenEncoders(${JSON.stringify(encoderProbes())})`).catch(() => null);
+    if (!encoders) encoders = await ev(cdp, `lumenEncoders(${JSON.stringify(encoderProbes())})`).catch(() => null);
     ladder = usableLadder({ caps, encoders, maxHeight: settings.maxHeight, maxFps: settings.maxFps, preferHevc: settings.preferHevc });
     if (!ladder.length) throw new LumenError('UNAVAILABLE', 'The TV’s player takes none of the stream formats this PC can encode');
     if (!rate || rate.index >= ladder.length) rate = createRateControl({ ladder, startIndex: startIndexOf(ladder, startLower), probeAfter: settings.probeAfterSec });
     const step = rate.step;
     await feature.setTvScale(step.scale);
     // Edge picks the tab to capture by its title: the page carries the capture title for a moment.
-    const main = await connectCdp(`ws://127.0.0.1:${dt.port}/devtools/page/${dt.targetId}`);
+    const main = await connectCdp(`ws://127.0.0.1:${dt.port}/devtools/page/${dt.targetId}`, settings.browserTimeoutMs);
     let started;
     try {
-      const saved = await evaluate(main, 'document.title');
-      await evaluate(main, `document.title = ${JSON.stringify(CAPTURE_TITLE)}`);
+      const saved = await ev(main, 'document.title');
+      await ev(main, `document.title = ${JSON.stringify(CAPTURE_TITLE)}`);
       let pickTimer = null;
       try {
         started = await Promise.race([
-          evaluate(cdp, `lumenStart(${JSON.stringify(captureRequest(step))})`, { gesture: true }),
-          new Promise((_, reject) => { pickTimer = setTimeout(() => reject(new Error('the tab capture did not start')), PICK_TIMEOUT_MS); }),
+          ev(cdp, `lumenStart(${JSON.stringify(captureRequest(step))})`, { gesture: true }),
+          new Promise((_, reject) => { pickTimer = setTimeout(() => reject(new Error('the tab capture did not start')), settings.pickTimeoutMs); }),
         ]);
       } finally {
         clearTimeout(pickTimer);
-        await evaluate(main, `document.title = ${JSON.stringify(saved ?? '')}`).catch(() => {});
+        await ev(main, `document.title = ${JSON.stringify(saved ?? '')}`).catch(() => {});
       }
     } finally {
       main.close();
@@ -690,10 +989,15 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     const wasRunning = !!muxer;
     stopCapture();
     if (!wasRunning || stopped || !viewers.size) return;
-    const delay = RETRY_MS[Math.min(retry, RETRY_MS.length - 1)];
+    const delay = settings.retryMs[Math.min(retry, settings.retryMs.length - 1)];
     retry += 1;
     log.info('live video lost; restarting', { reason, inMs: delay });
     publishState('restarting');
+    // The TV hears nothing until the new stream's init: its silence does not count until then.
+    for (const v of viewers.values()) {
+      restartWatch(v);
+      try { v.onRestart?.(reason); } catch (err) { log.debug('viewer restart hook failed', { message: err.message }); }
+    }
     retryTimer = setTimeout(() => { ensureCapture().catch(startFailed); }, delay);
   }
 
@@ -702,8 +1006,8 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   function startFailed(err) {
     if (stopped || !viewers.size) return;
     const hopeless = err instanceof LumenError && /none of the stream formats|turned off/.test(err.message);
-    if (!hopeless && retry < RETRY_MS.length) {
-      const delay = RETRY_MS[retry];
+    if (!hopeless && retry < settings.retryMs.length) {
+      const delay = settings.retryMs[retry];
       retry += 1;
       publishState('restarting');
       retryTimer = setTimeout(() => { ensureCapture().catch(startFailed); }, delay);
@@ -728,44 +1032,101 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
 
   // ---- rate control: once a second ----
 
+  // A rate change: a new step (the page's scale and the encoder's config), a new bitrate, a fresh
+  // player for `viewer`, or back to frames when nothing is left (that viewer, or all of them).
+  // → true when the viewers went back to frames.
+  function applyChange(change, why, viewer = null, exhaustedReason = 'The TV could not play the live video') {
+    if (!change) return false;
+    if (change.exhausted) {
+      const list = viewer ? [viewers.get(viewer)].filter(Boolean) : [...viewers.values()];
+      for (const v of list) v.onFallback?.(exhaustedReason);
+      return true;
+    }
+    if (change.resync && viewer) fanout.resync(viewer);
+    if (change.step !== undefined) {
+      const step = rate.step;
+      log.info('live video step', { step: step.name, codec: step.codec.family, bitrate: rate.bitrate, cause: change.cause ?? null, why });
+      browser()?.setTvScale?.(step.scale);
+      sendPage(stepConfig(step, rate.bitrate));
+    } else if (change.bitrate) {
+      log.debug('live video bitrate', { bitrate: rate.bitrate, why });
+      sendPage({ t: 'bitrate', bitrate: rate.bitrate });
+    }
+    return false;
+  }
+
+  const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
+  const rise = (cur, prev, key) => (cur && prev && num(cur[key]) !== null && num(prev[key]) !== null ? Math.max(0, cur[key] - prev[key]) : 0);
+
+  // The TV's player starts over (attach, resume, a refusal or error, a capture restart): its silence
+  // counts from the next init, and its counters start again.
+  function restartWatch(v) {
+    v.since = Date.now();
+    v.lastStatsAt = null;
+    v.prevTv = null;
+    v.lagRun = 0;
+    v.stallHist = [];
+  }
+
   function controlTick() {
     if (!rate) { publishState(); return; }
     for (const [viewer, v] of viewers) {
       if (v.paused) continue;
       const sent = fanout.takeStats(viewer);
+      // A refusal or a player error is acted on at once: the stream that follows comes from it.
+      if (v.refused || v.runtimeError) {
+        const signals = { refused: v.refused, refusedIndex: v.refusedIndex, runtimeError: v.runtimeError, tvFresh: false };
+        v.refused = v.runtimeError = false;
+        v.refusedIndex = null;
+        applyChange(rate.tick(signals), signals, viewer);
+        continue;
+      }
       const tv = v.tvStats;
       v.tvStats = null;
-      const decodedDelta = tv && v.prevTv ? tv.decoded - v.prevTv.decoded : 0;
-      const droppedDelta = tv && v.prevTv ? tv.dropped - v.prevTv.dropped : 0;
+      // Nothing counts before the TV has had an init since it (re)started: a start can take a while
+      // (a capture retried), and the TV reports only once it has a stream.
+      if (!sent?.initAt || sent.initAt < v.since) {
+        if (tv) v.prevTv = tv;
+        continue;
+      }
+      const prev = v.prevTv;
       if (tv) v.prevTv = tv;
-      const signals = {
-        drops: sent?.drops ?? 0,
-        queueSec: viewer.buffered ? viewer.buffered() / Math.max(1, rate.bitrate / 8) : 0,
-        stalls: tv && v.prevStalls !== undefined ? Math.max(0, tv.stalls - v.prevStalls) : 0,
-        dropRatio: decodedDelta > 20 ? droppedDelta / (decodedDelta + droppedDelta) : 0,
-        refused: v.refused,
-      };
-      if (tv) v.prevStalls = tv.stalls;
-      // The TV reports every 2 s once it plays (10 s allowed for the start). A TV that stops
+      const decodedDelta = rise(tv, prev, 'decoded');
+      const droppedDelta = rise(tv, prev, 'dropped');
+      const stalls = rise(tv, prev, 'stalls');
+      const lag = num(tv?.lag);
+      const resyncs = tv ? v.resyncs : 0;
+      if (tv) v.resyncs = 0;
+      if (tv) {
+        // Backstop for TV agents that still seek on stalls (their page gets killed soon after): far
+        // behind on 3 reports in a row, or stalls on 3 of the last 4, the TV goes back to frames.
+        v.lagRun = lag !== null && lag > BACKSTOP_LAG_SEC ? v.lagRun + 1 : 0;
+        v.stallHist = [...v.stallHist, stalls > 0].slice(-4);
+        if (v.lagRun >= 3 || v.stallHist.filter(Boolean).length >= 3) {
+          log.warn('the TV player is stuck on the live video', { lag, stalls: v.stallHist.filter(Boolean).length });
+          v.onFallback?.('the TV player is stuck');
+          continue;
+        }
+      }
+      // The TV reports every 2 s once it plays (statsGraceMs allowed after the init). A TV that stops
       // reporting is starved or frozen: the stream gets lighter, and then it goes back to frames.
-      const quietMs = Date.now() - (v.lastStatsAt ?? v.since + settings.statsGraceMs);
+      const quietMs = Date.now() - (v.lastStatsAt ?? sent.initAt + settings.statsGraceMs);
       if (quietMs > settings.statsGoneMs) { log.warn('the TV stopped reporting on the live video', { quietMs }); v.onFallback?.('the TV stopped reporting'); continue; }
-      signals.statsLate = quietMs > settings.statsLateMs;
-      v.refused = false;
-      v.last = { ...signals, kbps: sent ? Math.round((sent.sentBytes * 8) / 1000) : 0, lagMs: tv?.lag != null ? Math.round(tv.lag * 1000) : (v.last?.lagMs ?? null),
+      const signals = {
+        drops: sent.drops,
+        queueSec: viewer.buffered ? viewer.buffered() / Math.max(1, rate.bitrate / 8) : 0,
+        statsLate: quietMs > settings.statsLateMs,
+        tvFresh: !!tv,
+        stalls,
+        jumps: rise(tv, prev, 'jumps'),
+        resyncs,
+        lag,
+        dropRatio: decodedDelta > 20 ? droppedDelta / (decodedDelta + droppedDelta) : 0,
+      };
+      v.last = { ...signals, kbps: Math.round((sent.sentBytes * 8) / 1000), lagMs: lag !== null ? Math.round(lag * 1000) : (v.last?.lagMs ?? null),
         // Frames the TV decoded per second (it reports every 2 s).
         tvFps: tv && decodedDelta > 0 ? Math.round(decodedDelta / 2) : (v.last?.tvFps ?? null) };
-      const change = rate.tick(signals);
-      if (change?.exhausted) { v.onFallback?.('The TV could not play the live video'); continue; }
-      if (change?.step !== undefined) {
-        const step = rate.step;
-        log.info('live video step', { step: step.name, codec: step.codec.family, bitrate: rate.bitrate, why: signals });
-        browser()?.setTvScale?.(step.scale);
-        sendPage(stepConfig(step, rate.bitrate));
-      } else if (change?.bitrate) {
-        log.debug('live video bitrate', { bitrate: rate.bitrate, why: signals });
-        sendPage({ t: 'bitrate', bitrate: rate.bitrate });
-      }
+      applyChange(rate.tick(signals), signals, viewer);
     }
     publishState();
   }
@@ -787,10 +1148,12 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
   // ---- API ----
 
   /**
-   * A TV viewer: { send(buf, { key, limit }) → boolean, buffered() → bytes, onFallback(reason) }.
+   * A TV viewer: { send(buf, { key, limit }) → boolean, buffered() → bytes, onFallback(reason),
+   * onRestart(reason) (optional: the capture is being restarted, the TV will get a new stream) }.
    * tvCaps: { [tv codec string]: boolean } from the TV's MediaSource.isTypeSupported.
    * options.lower: start this many steps below the usual start (the TV's page died on live video before).
-   * → { pause(), resume(), resync(), report(stats), refused(), detach() }.
+   * → { pause(), resume(), resync(), report(stats), refused() (the TV cannot play this format),
+   *     error() (its player failed while playing: started over; twice, a step down), detach() }.
    */
   function attach(viewer, tvCaps = {}, options = {}) {
     if (!settings.enabled) throw new LumenError('UNAVAILABLE', 'Live video is turned off');
@@ -799,23 +1162,42 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     const changedCaps = JSON.stringify(tvCaps) !== JSON.stringify(caps);
     caps = { ...tvCaps };
     const lower = Math.max(0, Number(options.lower) || 0);
-    const rechoose = changedCaps || lower !== startLower;
+    const rechoose = changedCaps || lower !== startLower || rechooseNext;
+    rechooseNext = false;
     if (rechoose) rate = null;
     startLower = lower;
-    // New caps (another TV, an agent update) or a lower start choose the ladder again.
+    // New caps (another TV, an agent update), a lower start or live video turned on again choose the
+    // ladder again.
     if (rechoose && page) stopCapture();
-    viewers.set(viewer, { tvStats: null, refused: false, onFallback: viewer.onFallback, since: Date.now(), lastStatsAt: null });
+    viewers.set(viewer, { tvStats: null, prevTv: null, refused: false, refusedIndex: null, runtimeError: false, resyncs: 0, lagRun: 0, stallHist: [],
+      onFallback: viewer.onFallback, onRestart: viewer.onRestart, since: Date.now(), lastStatsAt: null });
     fanout.add(viewer);
-    statsTimer ??= setInterval(controlTick, 1000);
+    statsTimer ??= setInterval(controlTick, settings.controlMs);
     ensureCapture().catch(startFailed);
     // A capture still running (the TV came straight back) is already streaming.
     publishState(page && muxer?.initSent ? 'streaming' : 'starting');
     return {
       pause: () => { const v = viewers.get(viewer); if (v) v.paused = true; fanout.pause(viewer); },
-      resume: () => { const v = viewers.get(viewer); if (v) { v.paused = false; v.since = Date.now(); v.lastStatsAt = null; } fanout.resume(viewer); },
-      resync: () => fanout.resync(viewer),
-      report: (stats) => { const v = viewers.get(viewer); if (v) { v.tvStats = stats; v.lastStatsAt = Date.now(); } },
-      refused: () => { const v = viewers.get(viewer); if (v) { v.refused = true; v.since = Date.now(); v.lastStatsAt = null; } },
+      resume: () => { const v = viewers.get(viewer); if (v) { v.paused = false; restartWatch(v); } fanout.resume(viewer); },
+      // The TV's player asked to start over (stuck, behind, a full buffer): counted as trouble.
+      resync: () => { const v = viewers.get(viewer); if (v) v.resyncs += 1; fanout.resync(viewer); },
+      report: (stats) => {
+        const v = viewers.get(viewer);
+        if (!v) return;
+        v.tvStats = stats;
+        v.lastStatsAt = Date.now();
+        // Well behind: this viewer skips ahead to a key frame (no seek on the TV).
+        if (fanout.noteLag(viewer, stats?.lag)) log.debug('the TV is behind on the live video; skipping ahead', { lag: stats.lag });
+      },
+      // The step the refusal came in on is the one blamed (not whatever the step is at the next tick).
+      refused: () => { const v = viewers.get(viewer); if (v) { v.refused = true; v.refusedIndex = rate?.index ?? null; restartWatch(v); } },
+      error: () => {
+        const v = viewers.get(viewer);
+        if (!v) return;
+        v.runtimeError = true;
+        restartWatch(v);
+        fanout.resync(viewer);
+      },
       detach: () => detach(viewer),
     };
   }
@@ -826,6 +1208,10 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     if (viewers.size) return;
     clearInterval(statsTimer);
     statsTimer = null;
+    // A capture retry still pending is for nobody now (it would start the browser again).
+    clearTimeout(retryTimer);
+    retryTimer = null;
+    retry = 0;
     publishState('off');
     // A viewer that comes straight back (the TV's player closed, the agent reconnected) finds the
     // capture still running.
@@ -837,8 +1223,20 @@ export function createLiveVideo({ config, log: rootLog, store, browser }) {
     attach,
     enabled: () => settings.enabled === true,
     codecProbes: () => TV_CODEC_PROBES.slice(),
-    /** Wall-clock ms of media time 0 of the current stream (diagnostics: latency measurements). */
-    timeline: () => ({ baseWallMs: pageClock !== null && muxer?.base != null ? pageClock + muxer.base / 1000 : null }),
+    /**
+     * Diagnostics (latency measurements): baseWallMs, the wall-clock ms of media time 0 on the first
+     * viewer's timeline (skips move it back: shiftSec, cumulative, ≤ 0); streamBaseWallMs, that of
+     * the stream itself.
+     */
+    timeline: () => {
+      const streamBaseWallMs = pageClock !== null && muxer?.base != null ? pageClock + muxer.base / 1000 : null;
+      const first = viewers.keys().next().value;
+      const shift = first ? fanout.shifts(first) : null;
+      const shiftSec = shift ? shift.video / VIDEO_TIMESCALE : 0;
+      return { baseWallMs: streamBaseWallMs !== null ? streamBaseWallMs - shiftSec * 1000 : null, streamBaseWallMs, shiftSec, lagSkips: shift?.sheds ?? 0 };
+    },
+    /** The next viewer starts on a new rate controller (live video turned on again: blocks forgotten). */
+    resetRate() { rechooseNext = true; },
     start() { publish({ state: 'off' }); },
     async stop() {
       stopped = true;
