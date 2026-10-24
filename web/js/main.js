@@ -125,6 +125,31 @@ function presence() {
   if (live.post('view', next)) reported = next;
 }
 
+// The phone's real screen measurements, so the Home Screen app's layout on iOS can be checked from
+// the PC (logged as "phone screen"): window, screen, visual viewport, safe areas, app frame, mode.
+function screenMetrics() {
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)';
+  document.body.append(probe);
+  const cs = getComputedStyle(probe);
+  const safe = [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft].map((v) => Math.round(parseFloat(v) || 0));
+  probe.remove();
+  const app = document.querySelector('.app')?.getBoundingClientRect();
+  const nav = document.querySelector('.nav')?.getBoundingClientRect();
+  return {
+    inner: [innerWidth, innerHeight], screen: [screen.width, screen.height], client: [document.documentElement.clientWidth, document.documentElement.clientHeight],
+    vv: window.visualViewport ? [Math.round(visualViewport.width), Math.round(visualViewport.height)] : null,
+    safe, app: app ? [Math.round(app.top), Math.round(app.height)] : null, navBottom: nav ? Math.round(nav.bottom) : null,
+    appH: document.documentElement.style.getPropertyValue('--app-h') || null, dpr: devicePixelRatio,
+    standalone: navigator.standalone ?? null, displayStandalone: !!matchMedia('(display-mode: standalone)').matches,
+    ios: (/OS (\d+)_(\d+)/.exec(navigator.userAgent) || []).slice(1).join('.') || null,
+  };
+}
+let metricsTimer = 0;
+const reportMetrics = () => { clearTimeout(metricsTimer); metricsTimer = setTimeout(() => live.post('ui.metrics', screenMetrics()), 800); };
+window.addEventListener('resize', reportMetrics);
+live.on('status', (st) => { if (st === 'open') reportMetrics(); });
+
 function show(view) {
   const known = VIEWS.some((v) => v.id === view);
   const name = known ? view : 'remote';

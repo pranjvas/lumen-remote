@@ -818,6 +818,20 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
     view,
 
+    // The phone's screen measurements (Home Screen app layout on iOS), logged when they change.
+    'ui.metrics': (m, client) => {
+      const clean = {};
+      for (const [k, v] of Object.entries(m ?? {}).filter(([k]) => !['t', 'id', 'cmd', 'args'].includes(k)).slice(0, 16)) {
+        if (typeof v === 'number' || typeof v === 'boolean' || v === null) clean[k] = v;
+        else if (typeof v === 'string') clean[k] = v.slice(0, 40);
+        else if (Array.isArray(v)) clean[k] = v.slice(0, 4).map((x) => (typeof x === 'number' ? x : null));
+      }
+      const presence = clients.get(client);
+      const sig = JSON.stringify(clean);
+      if (presence && presence.metrics !== sig) { presence.metrics = sig; log.info('phone screen', clean); }
+      return {};
+    },
+
     // A relay URL the TV can play a stream from (fetched through the VPN when it is on).
     'stream.relay': async ({ url, referer }) => {
       text(url, 'url', { max: 4096 });
