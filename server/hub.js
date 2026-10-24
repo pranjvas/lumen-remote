@@ -12,6 +12,7 @@ import { createQueue } from './util/queue.js';
 import { KEYS } from './catalog/keys.js';
 import { SETTINGS } from './catalog/settings.js';
 import { APPS } from './catalog/apps.js';
+import { BT_MENU } from './adapters/eyes.js';
 
 const SETTING_BY_KEY = new Map(SETTINGS.map((entry) => [entry.key, entry]));
 const KEY_BY_NAME = new Map(KEYS.map((entry) => [entry.key, entry]));
@@ -30,6 +31,9 @@ const APP_ID = /^[\w.-]{1,64}$/;
 const SOURCE = /^[A-Z][A-Z0-9]{0,15}$/;
 const VIEW_NAME = /^[a-z][a-z-]{0,23}$/;
 const ITEM_ID = /^[\w-]{1,64}$/;
+const BT_ADDRESS = /^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$/;
+// The TV's Settings app (live app list 2026-10-21; also in the Tizen 5.5 TV emulator image).
+const TV_SETTINGS_APP = 'com.samsung.tv.coba.setting';
 const READ_SOURCES = new Set(['live', 'agent']);
 // Commands that stream while the user moves a pointer: they share the roomier pointer rate bucket.
 // browser.ack (one per frame received) has a bucket of its own (safety.js), so a fast trackpad
@@ -783,6 +787,41 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     'bluetooth.refresh': async () => {
       requireTvOn();
       return { value: await call('eyes', 'bluetooth') };
+    },
+
+    // Pairing and connecting through Lumen Eyes (Tizen.Network.Bluetooth). Found devices stream into
+    // bluetooth.scan while the scan runs; pair/connect/disconnect refresh bluetooth.state afterwards.
+    'bluetooth.scan': async ({ secs }) => {
+      requireTvOn();
+      return { value: await call('eyes', 'scanBluetooth', { secs: secs === undefined ? 15 : integer(secs, 'secs', 4, 30) }) };
+    },
+    'bluetooth.stopScan': async () => ({ value: await call('eyes', 'stopBluetoothScan') }),
+    'bluetooth.pair': async ({ address }) => {
+      requireTvOn();
+      return { value: await call('eyes', 'pairBluetooth', text(address, 'address', { max: 17, pattern: BT_ADDRESS })) };
+    },
+    'bluetooth.connect': async ({ address }) => {
+      requireTvOn();
+      return { value: await call('eyes', 'connectBluetooth', text(address, 'address', { max: 17, pattern: BT_ADDRESS })) };
+    },
+    'bluetooth.disconnect': async ({ address }) => {
+      requireTvOn();
+      return { value: await call('eyes', 'disconnectBluetooth', text(address, 'address', { max: 17, pattern: BT_ADDRESS })) };
+    },
+
+    // The fallback when the TV will not pair from Lumen: the TV's own menu, where the owner (or Ask
+    // Lumen, by sight) finishes. The Settings app declares no deep link to its Bluetooth lists (its
+    // manifest has no app-control), so this opens the menu with the remote's Menu key, or, when the
+    // remote channel is down, the Settings app through the agent; menuPath says where to go from there.
+    'bluetooth.openTv': async ({ kind = 'audio' }) => {
+      oneOf(kind, 'kind', ['audio', 'other']);
+      requireTvOn();
+      const menuPath = kind === 'audio' ? BT_MENU.audio : BT_MENU.other;
+      const method = await firstWorking([
+        valueOf('conn.remote') === 'paired' && (async () => { await call('remote', 'click', 'KEY_MENU'); return 'menu-key'; }),
+        valueOf('conn.agent') === 'online' && (async () => { await call('agent', 'request', 'launch', { appId: TV_SETTINGS_APP }); return 'settings-app'; }),
+      ]);
+      return { value: { method, menuPath, menuPaths: BT_MENU } };
     },
 
     // The TV's memory: totals, running apps and readable processes (largest first), via Lumen Eyes.

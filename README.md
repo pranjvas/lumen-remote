@@ -9,7 +9,7 @@ Build, install and deploy steps for every part (server, TV agent, Lumen Eyes, VP
 | Area | What you get |
 |---|---|
 | **Remote** | D-pad, volume with the TV's real level, channels, Back / Home / Menu, power and Wake-on-LAN, inputs, number pad, colour and media keys, text entry, a trackpad for the TV pointer. |
-| **Live dashboard** | Every picture and sound setting read live from the TV and changeable; which app is on screen; firmware, inputs, network, Bluetooth; system health with **Free memory** (closes apps idling in the background). |
+| **Live dashboard** | Every picture and sound setting read live from the TV and changeable; which app is on screen; firmware, inputs, network, Bluetooth (pair new devices, connect or disconnect paired ones); system health with **Free memory** (closes apps idling in the background). |
 | **Screen** | A live picture of what the TV shows, via Lumen Eyes. |
 | **Ask Lumen** | Natural-language control from any screen (header **Ask** button, ask bar, or the Ask view): "play Friends on Netflix", "cinema mode", "free up memory". It can see the TV screen, plays titles in any app using learned *app skills*, and finds which service has a title (JustWatch). Runs on the Claude Agent SDK. |
 | **Browser** | A full Chromium (Edge) on the PC, optionally behind Lumen's own WireGuard VPN, shown on the phone and **On TV**. Taps, swipes, the keyboard and a trackpad drive it; sign-in pop-ups work. On the TV it plays as **live video with sound** (1080p30, stepping down when needed) or as still frames. A page's video can be handed to the TV's own player: YouTube in the YouTube app, other streams through Lumen's relay with AVPlay / hls.js, DRM through the TV's own Widevine / PlayReady. |
@@ -44,7 +44,7 @@ Only one copy runs at a time. Logs go to `data/logs/` (`lumen.log`, `stdout.log`
 | Samsung IP Control (https 1516, paired) | every picture and sound setting, input, power |
 | DIAL (8080) | YouTube / Netflix / Prime launches |
 | **Lumen Agent** on the TV (`lumenrmt01.LumenAgent`) | app list and icons, channel, firmware, inputs, network; app-control launches (Netflix titles); the browser screen, live video and the TV's video player; connects back to the PC on port 8791 |
-| **Lumen Eyes** on the TV (`org.lumen.eyes`, Tizen .NET) | screen capture, Bluetooth, memory; connects back on port 8791 |
+| **Lumen Eyes** on the TV (`org.lumen.eyes`, Tizen .NET) | screen capture, Bluetooth (read, scan, pair, connect), memory; connects back on port 8791 |
 
 Tokens and secrets live in `data/` (git-ignored). Port 8791 only accepts the TV's address and a shared secret.
 

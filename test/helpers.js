@@ -378,6 +378,91 @@ export function connectAgent({
 }
 
 /**
+ * A scripted TV Bluetooth stack for the fake Eyes below. `bonded` are paired devices, `nearby` the ones in
+ * pairing mode a scan finds. `refuse` (an Eyes error string, e.g. 'NotSupportedException: Unsupported')
+ * makes every action fail the way a TV that refuses the API would; `failPair` / `failConnect` map an
+ * address to the error that one device gives.
+ */
+export function fakeBluetooth({
+  powered = true,
+  bonded = [
+    { address: '00:1A:7D:DA:71:13', name: 'Samsung Smart Remote', kind: 'Peripheral', minor: 'PeripheralRemoteControl', connected: true },
+    { address: 'F4:4E:FD:00:11:22', name: 'Living Room Soundbar', kind: 'AudioVideo', minor: 'AudioVideoLoudspeaker', connected: false },
+  ],
+  nearby = [
+    { address: 'ac:80:0a:12:34:56', name: 'WH-1000XM4', kind: 'AudioVideo', minor: 'AudioVideoHeadphones', rssi: -52 },
+    { address: '9C:2E:A1:65:43:21', name: 'Xbox Wireless Controller', kind: 'Peripheral', minor: 'PeripheralGamePad', rssi: -71 },
+  ],
+  refuse = null, failPair = {}, failConnect = {}, scanMs = 150,
+} = {}) {
+  const key = (a) => String(a).toUpperCase();
+  return {
+    powered,
+    bonded: bonded.map((d) => ({ ...d, address: key(d.address) })),
+    nearby: nearby.map((d) => ({ ...d })),
+    refuse, failPair, failConnect, scanMs,
+    find(address) { return this.bonded.find((d) => d.address === key(address)); },
+  };
+}
+
+/**
+ * A fake org.lumen.eyes: dials the URL Lumen passed at launch, says hello with `version` and answers the
+ * Bluetooth protocol (bluetooth, bt-scan with bt-found as it goes, bt-scan-stop, bt-pair, bt-connect,
+ * bt-disconnect) from `bt` (fakeBluetooth()). Every text message it received is in `received`.
+ */
+export function connectEyes(url, { version = '0.4.0', bt = fakeBluetooth() } = {}) {
+  const ws = new WebSocket(url);
+  const received = [];
+  const send = (msg) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); };
+  const device = (d, extra = {}) => ({ address: d.address, name: d.name, kind: d.kind, minor: d.minor, rssi: d.rssi ?? 0, paired: !!d.paired, connected: !!d.connected, ...extra });
+  let scanTimer = null;
+  let scanEnd = null;
+  ws.on('open', () => send({ t: 'hello', version }));
+  ws.on('message', (raw, isBinary) => {
+    if (isBinary) return;
+    const msg = JSON.parse(String(raw));
+    received.push(msg);
+    const { t, id } = msg;
+    if (t === 'bluetooth') {
+      send({ t, id, ok: true, powered: bt.powered, name: '[TV] Samsung Q95T',
+        devices: bt.bonded.map((d) => ({ name: d.name, connected: d.connected, bonded: true, kind: d.kind, minor: d.minor, address: d.address })) });
+    } else if (t === 'bt-scan') {
+      if (bt.refuse) { send({ t, id, ok: false, error: bt.refuse }); return; }
+      const found = bt.nearby.map((d) => device(d, { paired: Boolean(bt.find(d.address)) }));
+      found.forEach((d, i) => setTimeout(() => send({ t: 'bt-found', id, device: d }), 20 + i * 20));
+      scanEnd = () => { clearTimeout(scanTimer); scanEnd = null; send({ t, id, ok: true, devices: found }); };
+      scanTimer = setTimeout(() => scanEnd?.(), bt.scanMs);
+    } else if (t === 'bt-scan-stop') {
+      scanEnd?.();
+    } else if (t === 'bt-pair' || t === 'bt-connect' || t === 'bt-disconnect') {
+      if (bt.refuse) { send({ t, id, ok: false, error: bt.refuse }); return; }
+      const address = String(msg.address).toUpperCase();
+      let known = bt.find(address);
+      if (t === 'bt-pair') {
+        if (bt.failPair[address]) { send({ t, id, ok: false, error: bt.failPair[address] }); return; }
+        if (!known) {
+          const seen = bt.nearby.find((d) => d.address.toUpperCase() === address);
+          if (!seen) { send({ t, id, ok: false, error: 'RemoteDeviceNotFound: the device is not in pairing mode or is out of range' }); return; }
+          known = { ...seen, address, connected: false };
+          bt.bonded.push(known);
+        }
+      }
+      if (!known) { send({ t, id, ok: false, error: 'RemoteDeviceNotBonded: pair the device first' }); return; }
+      if (t !== 'bt-disconnect' && bt.failConnect[address]) {
+        if (t === 'bt-pair') { send({ t, id, ok: true, paired: true, connected: false, connectError: bt.failConnect[address], device: device(known, { paired: true }) }); return; }
+        send({ t, id, ok: false, error: bt.failConnect[address] });
+        return;
+      }
+      known.connected = t !== 'bt-disconnect';
+      send({ t, id, ok: true, ...(t === 'bt-pair' ? { paired: true } : {}), connected: known.connected,
+        ...(known.connected ? { profile: known.kind === 'AudioVideo' ? 'a2dp' : 'hid' } : {}), device: device(known, { paired: true }) });
+    }
+  });
+  ws.on('error', () => {});
+  return { ws, received, bt, close: () => ws.terminate() };
+}
+
+/**
  * A stand-in for `server/lan.js` with the same surface (`ready`, `address`, `port`, `route`, `stop`),
  * bound to 127.0.0.1 — for adapter tests that should not depend on the core listener.
  */

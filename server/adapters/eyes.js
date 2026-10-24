@@ -15,7 +15,73 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES = 1024;
 const WATCH_RETRY_MS = 5000;
 
+// Bluetooth actions (Eyes 0.4.0+): scan, pair, connect, disconnect through Tizen.Network.Bluetooth.
+const BT_ACTIONS_VERSION = '0.4.0';
+const BT_ADDRESS = /^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$/i;
+const BT_TIMEOUT_MS = { 'bt-pair': 90000, 'bt-connect': 35000, 'bt-disconnect': 25000 };
+const BT_REPLIES = new Set(['bluetooth', 'procs', 'bt-scan', 'bt-pair', 'bt-connect', 'bt-disconnect']);
+// An Eyes error that means the TV refused the Bluetooth API itself, not that one device failed.
+const BT_REFUSED = /permission|privilege|notsupported|not supported|unsupported|unauthori[sz]ed|security/i;
+const BT_REASONS = [
+  [/AuthRejected/i, 'the device turned the pairing down'],
+  [/AuthFailed/i, 'the code did not match, or the device left pairing mode'],
+  [/TimedOut/i, 'the device did not answer in time; keep it in pairing mode and near the TV'],
+  [/RemoteDeviceNotFound/i, 'the device was not found; put it in pairing mode and keep it near the TV'],
+  [/RemoteDeviceNotBonded/i, 'the device is not paired with the TV'],
+  [/Cancelled/i, 'pairing was cancelled'],
+  [/ResourceBusy|NowInProgress/i, "the TV's Bluetooth is busy; try again in a moment"],
+  [/OperationFailed|refused the connection/i, 'the device refused; make sure it is on and not connected to a phone or PC'],
+];
+/** Where the TV's own menu pairs devices (Samsung 2020 e-Manual, Tizen 5.5). */
+export const BT_MENU = Object.freeze({
+  audio: 'Settings → Sound → Sound Output → Bluetooth Speaker List',
+  other: 'Settings → General → External Device Manager → Input Device Manager → Bluetooth Device List',
+});
+
 const digest = (s) => createHash('sha256').update(s).digest();
+
+// '0.4.0' ≥ '0.3.3': numeric, part by part.
+function atLeast(version, min) {
+  const a = String(version ?? '').split('.').map((n) => Number.parseInt(n, 10) || 0);
+  const b = min.split('.').map(Number);
+  for (let i = 0; i < b.length; i += 1) if ((a[i] ?? 0) !== b[i]) return (a[i] ?? 0) > b[i];
+  return true;
+}
+
+const cleanWord = (v) => (typeof v === 'string' && v ? v.replace(/[^A-Za-z_]/g, '').slice(0, 40) || null : null);
+
+/** A device as Eyes reports it → { address, name, kind, minor, rssi, paired, connected } (nothing else). */
+export function btDevice(d) {
+  if (!d || typeof d !== 'object') return null;
+  return {
+    address: typeof d.address === 'string' && BT_ADDRESS.test(d.address) ? d.address.toUpperCase() : null,
+    name: typeof d.name === 'string' && d.name.trim() ? d.name.trim().slice(0, 60) : null,
+    kind: cleanWord(d.kind),
+    minor: cleanWord(d.minor),
+    rssi: Number.isInteger(d.rssi) && d.rssi < 0 && d.rssi > -128 ? d.rssi : null,
+    paired: d.paired === true || d.bonded === true,
+    connected: d.connected === true,
+  };
+}
+
+/** True for the TV's own remote (a Bluetooth remote control); Lumen never disconnects it. */
+export function isTvRemote(d) {
+  return Boolean(d && ((d.kind === 'Peripheral' && /RemoteControl/i.test(d.minor ?? '')) || /\bremote\b|smart control/i.test(d.name ?? '')));
+}
+
+// The TV menu list for a device: audio unless it is known to be something else (most pairing is headphones).
+const menuFor = (d) => (d?.kind && d.kind !== 'AudioVideo' ? BT_MENU.other : BT_MENU.audio);
+
+/** An Eyes Bluetooth error → LumenError: UNAVAILABLE when the TV refuses the API (finish on the TV), else FAILED. */
+export function btError(raw, verb, device) {
+  const text = String(raw ?? 'unknown').replace(/\s+/g, ' ').slice(0, 160);
+  const menu = menuFor(device);
+  if (/NotEnabled|is off/i.test(text)) return new LumenError('UNAVAILABLE', `Bluetooth is off on the TV. Turn it on in ${menu.split(' → ').slice(0, 2).join(' → ')}`);
+  if (/Lumen (dis)?connects/.test(text)) return new LumenError('FAILED', `${text.replace(/^\w+: /, '')}.`.replace(/^\w/, (c) => c.toUpperCase()));
+  if (BT_REFUSED.test(text)) return new LumenError('UNAVAILABLE', `The TV does not let Lumen ${verb} Bluetooth devices (${text}). Finish on the TV: ${menu}`);
+  const reason = BT_REASONS.find(([re]) => re.test(text))?.[1] ?? text.replace(/^\w+Exception: /, '');
+  return new LumenError('FAILED', `Could not ${verb} ${device?.name ?? (verb === 'scan for' ? 'devices' : 'the device')}: ${reason}`);
+}
 
 export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   const log = rootLog.child('eyes');
@@ -35,6 +101,8 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   let watchBusy = false;
   const btPending = new Map(); // id → { resolve, reject, timer }
   let btAt = 0;
+  let scan = null; // the last Bluetooth scan: { id, startedAt, until, devices: Map(address → device) }
+  let scanRunning = null; // its promise while it runs
 
   function setConn(state) {
     store.set('conn.eyes', state, { src: 'derived', via: 'eyes:link' });
@@ -100,7 +168,14 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
       log.info('eyes connected', { version });
       for (const resolve of waiters) resolve();
       waiters.clear();
-    } else if (msg?.t === 'bluetooth' || msg?.t === 'procs') {
+    } else if (msg?.t === 'bt-found') {
+      // A device seen while a scan runs: shown at once (bluetooth.scan), before the scan ends.
+      const device = btDevice(msg.device);
+      if (scan && String(msg.id) === scan.id && device?.address) {
+        scan.devices.set(device.address, device);
+        publishScan('scanning');
+      }
+    } else if (BT_REPLIES.has(msg?.t)) {
       const entry = btPending.get(String(msg.id));
       if (entry) { btPending.delete(String(msg.id)); clearTimeout(entry.timer); entry.resolve(msg); }
     } else if (msg?.t === 'frame' && msg.ok === false) {
@@ -242,15 +317,141 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     const value = {
       name: typeof msg.name === 'string' ? msg.name.slice(0, 60) : null,
       powered: msg.powered === true,
-      devices: Array.isArray(msg.devices) ? msg.devices.slice(0, 20).map((d) => ({
-        name: typeof d?.name === 'string' && d.name ? d.name.slice(0, 60) : 'Unnamed device',
-        connected: d?.connected === true, bonded: d?.bonded !== false,
-        kind: typeof d?.kind === 'string' ? d.kind.replace(/[^A-Za-z_]/g, '').slice(0, 30) : null,
-      })) : [],
+      // address and minor come from Eyes 0.4.0; Connect / Disconnect need the address.
+      devices: Array.isArray(msg.devices) ? msg.devices.slice(0, 20).map((d) => {
+        const device = btDevice(d) ?? {};
+        return {
+          name: device.name ?? 'Unnamed device',
+          connected: d?.connected === true, bonded: d?.bonded !== false,
+          kind: typeof d?.kind === 'string' ? d.kind.replace(/[^A-Za-z_]/g, '').slice(0, 30) : null,
+          minor: device.minor ?? null,
+          address: device.address ?? null,
+        };
+      }) : [],
     };
     store.set('bluetooth.state', value, { src: 'live', via: 'eyes:bluetooth', ttlMs: 10 * 60 * 1000 });
     return value;
   }
+
+  // ---- Bluetooth actions (Eyes 0.4.0): scan, pair, connect, disconnect ----
+
+  async function requireBtActions() {
+    await ensureOnline();
+    if (!atLeast(version, BT_ACTIONS_VERSION)) {
+      throw new LumenError('UNAVAILABLE', `Pairing from Lumen needs Lumen Eyes ${BT_ACTIONS_VERSION} on the TV (it has ${version}). Reinstall Eyes, or pair on the TV: ${BT_MENU.audio}`);
+    }
+  }
+
+  // One request/answer over the Eyes link, answered by a text message with the same id.
+  function btRequest(t, fields, timeoutMs, what) {
+    const id = randomUUID();
+    const answer = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { btPending.delete(id); reject(new LumenError('FAILED', `Lumen Eyes did not answer about ${what} in time`)); }, timeoutMs);
+      btPending.set(id, { resolve, reject, timer });
+      active.send(JSON.stringify({ t, id, ...fields }), (err) => {
+        if (err && btPending.has(id)) { btPending.delete(id); clearTimeout(timer); reject(new LumenError('UNAVAILABLE', 'Lumen Eyes connection dropped')); }
+      });
+    });
+    return { id, answer };
+  }
+
+  function publishScan(state, error = null) {
+    if (!scan) return;
+    store.set('bluetooth.scan', {
+      state, id: scan.id, startedAt: scan.startedAt, until: scan.until,
+      devices: [...scan.devices.values()].slice(0, 40),
+      error: error ? { code: error.code ?? 'FAILED', message: String(error.message ?? error).slice(0, 240) } : null,
+    }, { src: 'derived', via: 'eyes:bt-scan' });
+  }
+
+  /**
+   * Looks for discoverable devices for `secs` (4-30) seconds. Devices appear in bluetooth.scan as they
+   * are found; resolves with { devices } when the scan ends. A second call joins the running scan.
+   */
+  function scanBluetooth({ secs = 15 } = {}) {
+    if (scanRunning) return scanRunning;
+    const seconds = Math.max(4, Math.min(30, Number.isInteger(secs) ? secs : 15));
+    scanRunning = (async () => {
+      await requireBtActions();
+      const { id, answer } = btRequest('bt-scan', { secs: seconds }, seconds * 1000 + 15000, 'the Bluetooth scan');
+      scan = { id, startedAt: Date.now(), until: Date.now() + seconds * 1000, devices: new Map() };
+      publishScan('scanning');
+      let msg;
+      try {
+        msg = await answer;
+      } catch (err) {
+        publishScan('error', err);
+        throw err;
+      }
+      if (msg.ok === false) {
+        const err = btError(msg.error, 'scan for', null);
+        log.info('bluetooth scan failed', { error: String(msg.error ?? '').slice(0, 120) });
+        publishScan('error', err);
+        throw err;
+      }
+      for (const raw of Array.isArray(msg.devices) ? msg.devices : []) {
+        const device = btDevice(raw);
+        if (device?.address && !scan.devices.has(device.address)) scan.devices.set(device.address, device);
+      }
+      publishScan('done');
+      return { devices: [...scan.devices.values()] };
+    })().finally(() => { scanRunning = null; });
+    return scanRunning;
+  }
+
+  /** Ends a running scan early (the pairing sheet was closed). */
+  function stopBluetoothScan() {
+    const running = Boolean(scanRunning);
+    if (running && online()) active.send(JSON.stringify({ t: 'bt-scan-stop' }));
+    return { stopped: running };
+  }
+
+  // The device behind an address, as last seen by a scan or in the paired list.
+  function knownDevice(address) {
+    const fromScan = scan?.devices.get(address);
+    const paired = (store.get('bluetooth.state')?.v?.devices ?? []).find((d) => d.address === address);
+    return fromScan ?? (paired ? { ...paired, paired: true } : null);
+  }
+
+  async function btAction(t, address, verb) {
+    if (typeof address !== 'string' || !BT_ADDRESS.test(address)) throw new LumenError('INVALID', 'That is not a Bluetooth device address');
+    const addr = address.toUpperCase();
+    const known = knownDevice(addr);
+    if (t === 'bt-disconnect' && isTvRemote(known)) throw new LumenError('INVALID', 'Lumen leaves the TV’s own remote connected');
+    await requireBtActions();
+    const msg = await btRequest(t, { address: addr }, BT_TIMEOUT_MS[t], 'Bluetooth').answer;
+    const device = btDevice(msg.device) ?? known ?? { address: addr };
+    if (msg.ok === false) {
+      log.info(`bluetooth ${verb} failed`, { error: String(msg.error ?? '').slice(0, 120) });
+      throw btError(msg.error, verb, { ...known, ...device, name: device.name ?? known?.name });
+    }
+    const name = device.name ?? known?.name ?? null;
+    const result = {
+      address: addr, name, kind: device.kind ?? known?.kind ?? null,
+      paired: t === 'bt-pair' ? true : (msg.paired ?? true) === true,
+      connected: msg.connected === true,
+      profile: typeof msg.profile === 'string' && msg.profile ? msg.profile.slice(0, 10) : null,
+    };
+    // Paired, but the audio/input link did not come up: still a success, with the reason.
+    if (msg.connectError) result.connectError = btError(msg.connectError, 'connect', { ...device, name }).message;
+    if (scan?.devices.has(addr)) {
+      scan.devices.set(addr, { ...scan.devices.get(addr), name: name ?? scan.devices.get(addr).name, paired: result.paired, connected: result.connected });
+      publishScan(scanRunning ? 'scanning' : 'done');
+    }
+    try {
+      await bluetooth();
+    } catch (err) {
+      log.debug('bluetooth refresh after an action failed', { message: err.message });
+    }
+    return result;
+  }
+
+  /** Pairs a discoverable device, then connects it when it is an audio or input device. */
+  const pairBluetooth = (address) => btAction('bt-pair', address, 'pair');
+  /** Connects an already paired device (A2DP for audio, HID for input). */
+  const connectBluetooth = (address) => btAction('bt-connect', address, 'connect');
+  /** Disconnects a paired device (never the TV's own remote); it stays paired. */
+  const disconnectBluetooth = (address) => btAction('bt-disconnect', address, 'disconnect');
 
   // ---- memory (TV web apps see only totals; Eyes reads apps and processes through Tizen .NET) ----
 
@@ -360,6 +561,11 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
     },
     capture,
     bluetooth,
+    scanBluetooth,
+    stopBluetoothScan,
+    pairBluetooth,
+    connectBluetooth,
+    disconnectBluetooth,
     processes,
     latest: () => latest,
     status: () => ({ online: online(), version, lastCaptureAt: latest?.at ?? null }),
