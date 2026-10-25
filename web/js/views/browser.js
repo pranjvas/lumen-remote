@@ -8,7 +8,7 @@ import { toast } from '../ui/toast.js';
 import { openSheet } from '../ui/sheet.js';
 import { haptic } from '../ui/haptics.js';
 import { accelerate, bindTrackpad, readGain } from '../ui/trackpad.js';
-import { fitFrame, sizeDiffers, viewportFor } from './browser-fit.js';
+import { clampZoom, fitFrame, panZoom, pinchZoom, sizeDiffers, viewportFor } from './browser-fit.js';
 
 const RATE_MS = 33;          // moves and wheel deltas coalesce to ~30 messages/s
 const VIEWPORT_MS = 250;     // resize settle before browser.viewport
@@ -91,7 +91,9 @@ export function mountBrowser(root, ctx) {
   });
   const overlay = h('div', { class: 'browser-overlay' });
   const pointerEl = h('div', { class: 'browser-pointer', hidden: true, 'aria-hidden': 'true' }, icon('cursor'));
-  const stage = h('div', { class: 'browser-stage' }, canvas, typer, pointerEl, overlay);
+  // Pinch zoom's way back: shows the zoom, a tap returns to the whole page.
+  const zoomBtn = h('button', { class: 'browser-zoom', type: 'button', hidden: true, 'aria-label': 'Zoom back out to the whole page' });
+  const stage = h('div', { class: 'browser-stage' }, canvas, typer, pointerEl, zoomBtn, overlay);
   const pad = h('div', {
     class: 'touchpad browser-pad', role: 'application', 'aria-roledescription': 'trackpad', hidden: true,
     'aria-label': 'Trackpad. Drag to move the pointer over the page, tap to click, long press to right-click, two-finger drag to scroll.',
@@ -694,6 +696,7 @@ export function mountBrowser(root, ctx) {
     painted += 1;
     if (frame.w !== canvas.width || frame.h !== canvas.height) {
       frame = { w: canvas.width, h: canvas.height };
+      setZoom(null); // another page size (the TV took the page, or gave it back): the whole page again
       fit();
     }
     if (!hasFrame) {
@@ -714,7 +717,46 @@ export function mountBrowser(root, ctx) {
     if (!size) return;
     canvas.style.width = `${size.w}px`;
     canvas.style.height = `${size.h}px`;
+    setZoom(zoom); // the stage changed size: the zoom stays, kept inside it
+  }
+
+  /* ---------- pinch zoom ---------- */
+
+  // The phone's own magnifier: the canvas is scaled and moved on the phone only (the page, its layout
+  // and the TV are untouched). A page laid out for the TV (1280×720) is shown about a quarter of its
+  // size on a phone, too small to read; its frames hold detail for about 3.5× of zoom. Taps and drags
+  // land right, as they are measured against the canvas's box on screen, zoom included.
+  let zoom = { z: 1, tx: 0, ty: 0 };
+  const canvasBox = () => ({ left: canvas.offsetLeft, top: canvas.offsetTop, w: canvas.offsetWidth, h: canvas.offsetHeight });
+  const stageSize = () => { const r = stageBox(); return { w: r.width, h: r.height }; };
+  // A point on screen → the stage's content box (its border is not part of it).
+  const inStage = (pt) => {
+    const r = stage.getBoundingClientRect();
+    return { x: pt.clientX - r.left - stage.clientLeft, y: pt.clientY - r.top - stage.clientTop };
+  };
+  function setZoom(next) {
+    zoom = next ? clampZoom(next, canvasBox(), stageSize()) : { z: 1, tx: 0, ty: 0 };
+    canvas.style.transformOrigin = '0 0';
+    canvas.style.transform = zoom.z > 1 ? `translate(${zoom.tx}px, ${zoom.ty}px) scale(${zoom.z})` : '';
+    zoomBtn.hidden = zoom.z <= 1;
+    if (zoom.z > 1) zoomBtn.textContent = `${zoom.z.toFixed(1)}× · Reset`;
     placePointer();
+  }
+  zoomBtn.addEventListener('click', () => { haptic('key'); setZoom(null); });
+
+  let pinch = null; // two fingers down: { start, from, d0 }
+  let afterPinch = false; // a finger left over from a pinch: it neither taps nor scrolls until lifted
+  const between = (a, b) => ({ clientX: (a.clientX + b.clientX) / 2, clientY: (a.clientY + b.clientY) / 2 });
+  const spread = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1;
+  function startPinch(a, b) {
+    // The finger already down was the start of a pinch, not a tap or a scroll.
+    clearTimeout(longTimer);
+    touch = null;
+    wheels.flush();
+    pinch = { start: { ...zoom }, from: inStage(between(a, b)), d0: spread(a, b) };
+  }
+  function movePinch(a, b) {
+    setZoom(pinchZoom(pinch.start, pinch.from, inStage(between(a, b)), spread(a, b) / pinch.d0, canvasBox(), stageSize()));
   }
 
   ctx.live.on('browser.frame', onFrame);
@@ -820,9 +862,17 @@ export function mountBrowser(root, ctx) {
     if (!touch.moved && Math.hypot(pt.clientX - touch.x, pt.clientY - touch.y) < TAP_SLOP) return;
     touch.moved = true;
     clearTimeout(longTimer);
-    // Dragging a finger scrolls the page under it, like a touch screen.
+    // Dragging a finger scrolls the page under it, like a touch screen; zoomed in, it first moves the
+    // magnified view, and only what the view's edge stops scrolls the page.
     const s = scale();
-    wheels.push({ kind: 'wheel', ...at(pt), deltaX: Math.round(-dx * s), deltaY: Math.round(-dy * s), modifiers: 0 });
+    let rest = { dx, dy };
+    if (zoom.z > 1) {
+      const panned = panZoom(zoom, dx, dy, canvasBox(), stageSize());
+      setZoom(panned.view);
+      rest = panned.rest;
+    }
+    if (Math.abs(rest.dx) < 0.5 && Math.abs(rest.dy) < 0.5) return;
+    wheels.push({ kind: 'wheel', ...at(pt), deltaX: Math.round(-rest.dx * s), deltaY: Math.round(-rest.dy * s), modifiers: 0 });
   }
 
   function touchEnd(id, pt, cancelled, when) {
@@ -843,23 +893,34 @@ export function mountBrowser(root, ctx) {
 
   if (TOUCH_EVENTS) {
     const ours = (e) => (touch ? [...e.changedTouches].find((t) => t.identifier === touch.id) : null);
+    // Two fingers pinch and move the phone's magnified view (see pinch zoom); one finger works the page.
+    const twoFingersOff = (e) => {
+      if (e.touches.length < 2) pinch = null;
+      afterPinch = e.touches.length > 0;
+    };
     canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
       reclaim();
+      if (e.touches.length >= 2) { if (!pinch) startPinch(e.touches[0], e.touches[1]); return; }
+      if (pinch || afterPinch) return;
       const t = e.changedTouches[0];
       if (t) touchStart(t.identifier, t, e.timeStamp);
     }, { passive: false });
     canvas.addEventListener('touchmove', (e) => {
       e.preventDefault();
+      if (pinch) { if (e.touches.length >= 2) movePinch(e.touches[0], e.touches[1]); return; }
+      if (afterPinch) return;
       const t = ours(e);
       if (t) touchMove(t.identifier, t);
     }, { passive: false });
     canvas.addEventListener('touchend', (e) => {
       e.preventDefault();
+      if (pinch || afterPinch) { twoFingersOff(e); return; }
       const t = ours(e);
       if (t) touchEnd(t.identifier, t, false, e.timeStamp);
     }, { passive: false });
     canvas.addEventListener('touchcancel', (e) => {
+      if (pinch || afterPinch) { twoFingersOff(e); return; }
       const t = ours(e);
       if (t) touchEnd(t.identifier, t, true, e.timeStamp);
     });
@@ -922,6 +983,12 @@ export function mountBrowser(root, ctx) {
   canvas.addEventListener('wheel', (e) => {
     if (!frame.w) return;
     e.preventDefault();
+    // A laptop trackpad's pinch arrives as Ctrl + wheel: the same magnifier, around the pointer.
+    if (e.ctrlKey) {
+      const around = inStage(e);
+      setZoom(pinchZoom(zoom, around, around, Math.exp(-e.deltaY * 0.01), canvasBox(), stageSize()));
+      return;
+    }
     reclaim();
     const unit = e.deltaMode === 1 ? WHEEL_LINE_PX : 1;
     const s = scale();

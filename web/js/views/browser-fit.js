@@ -41,3 +41,44 @@ export function sizeDiffers(frame, sent, slop = 2) {
   if (!frame || !sent || !frame.w || !frame.h) return false;
   return Math.abs(frame.w - sent.w) > slop || Math.abs(frame.h - sent.h) > slop;
 }
+
+// ---------- pinch zoom: the phone's own magnifier over the page (the page and the TV are untouched) ----------
+
+export const ZOOM_MAX = 4;
+
+/**
+ * A zoom `view` { z, tx, ty } (scale, then a translation in stage px, applied to the canvas from its
+ * top-left corner) kept sensible: at 1× nothing moves; zoomed, a canvas larger than the stage on an
+ * axis may not leave an empty band on that side, and one smaller stays centred on it. `box` is the
+ * canvas's unzoomed { left, top, w, h } in the stage, `stage` its content { w, h }.
+ */
+export function clampZoom({ z, tx, ty }, box, stage) {
+  if (!(z > 1)) return { z: 1, tx: 0, ty: 0 };
+  const zoom = Math.min(z, ZOOM_MAX);
+  const axis = (t, start, size, room) => {
+    const scaled = size * zoom;
+    if (scaled <= room) return (room - scaled) / 2 - start;
+    return Math.min(-start, Math.max(room - start - scaled, t));
+  };
+  return { z: zoom, tx: axis(tx, box.left, box.w, stage.w), ty: axis(ty, box.top, box.h, stage.h) };
+}
+
+/**
+ * Two fingers moving: the view from `start` scaled by `ratio` (finger distance now / at the start),
+ * with the point of the page that was between the fingers (`from`, stage px) kept between them (`to`).
+ */
+export function pinchZoom(start, from, to, ratio, box, stage) {
+  const z = Math.min(ZOOM_MAX, Math.max(1, start.z * ratio));
+  const px = (from.x - box.left - start.tx) / start.z;
+  const py = (from.y - box.top - start.ty) / start.z;
+  return clampZoom({ z, tx: to.x - box.left - px * z, ty: to.y - box.top - py * z }, box, stage);
+}
+
+/**
+ * One finger dragging a zoomed view by dx/dy stage px: it pans first, and what the edge stops (the
+ * rest) scrolls the page. → { view, rest: { dx, dy } }.
+ */
+export function panZoom(view, dx, dy, box, stage) {
+  const next = clampZoom({ z: view.z, tx: view.tx + dx, ty: view.ty + dy }, box, stage);
+  return { view: next, rest: { dx: dx - (next.tx - view.tx), dy: dy - (next.ty - view.ty) } };
+}

@@ -2,7 +2,7 @@
 // stage's shape inside the server's 320..1280 × 320..800 box, and the canvas fits the stage's content box.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { VIEWPORT_MAX, VIEWPORT_MIN, fitFrame, sizeDiffers, viewportFor } from '../web/js/views/browser-fit.js';
+import { VIEWPORT_MAX, VIEWPORT_MIN, ZOOM_MAX, clampZoom, fitFrame, panZoom, pinchZoom, sizeDiffers, viewportFor } from '../web/js/views/browser-fit.js';
 import { clampViewport } from '../server/features/browser.js';
 
 test('a stage inside the box asks for its own CSS size', () => {
@@ -60,4 +60,38 @@ test('a frame laid out for another device is told apart from rounding', () => {
   assert.equal(sizeDiffers({ w: 436, h: 330 }, { w: 436, h: 320 }), true);
   assert.equal(sizeDiffers(null, { w: 436, h: 320 }), false);
   assert.equal(sizeDiffers({ w: 436, h: 320 }, null), false);
+});
+
+// Pinch zoom on the phone: a 1280×720 TV page shown 368×207 in a 370×460 stage (centred: top 126).
+const BOX = { left: 1, top: 126, w: 368, h: 207 };
+const STAGE = { w: 370, h: 460 };
+
+test('pinch zoom keeps the point between the fingers under them, between 1× and 4×', () => {
+  const start = { z: 1, tx: 0, ty: 0 };
+  const from = { x: 100, y: 200 };
+  const view = pinchZoom(start, from, from, 2, BOX, STAGE);
+  assert.equal(view.z, 2);
+  // The page point under the fingers: (100 - 1) / 1 = 99 across the canvas, still at x 100 on screen.
+  assert.ok(Math.abs(BOX.left + view.tx + 99 * view.z - 100) < 1e-9);
+  assert.equal(pinchZoom(start, from, from, 10, BOX, STAGE).z, ZOOM_MAX);
+  assert.deepEqual(pinchZoom({ z: 2, tx: -50, ty: -100 }, from, from, 0.3, BOX, STAGE), { z: 1, tx: 0, ty: 0 }, 'pinched below 1×: the whole page');
+});
+
+test('a zoomed canvas never leaves an empty band; a side smaller than the stage stays centred', () => {
+  // 2×: 736 wide (wider than the stage), 414 high (lower than the stage's 460).
+  const far = clampZoom({ z: 2, tx: 500, ty: 900 }, BOX, STAGE);
+  assert.equal(far.tx, -BOX.left, 'its left edge stays at the stage edge');
+  assert.equal(far.ty, (STAGE.h - BOX.h * 2) / 2 - BOX.top, 'centred top to bottom');
+  const other = clampZoom({ z: 2, tx: -5000, ty: 0 }, BOX, STAGE);
+  assert.equal(BOX.left + other.tx + BOX.w * 2, STAGE.w, 'its right edge stays at the stage edge');
+});
+
+test('one finger on a zoomed view pans it first; what its edge stops scrolls the page', () => {
+  const view = clampZoom({ z: 2, tx: -100, ty: -150 }, BOX, STAGE);
+  const inside = panZoom(view, -30, 0, BOX, STAGE);
+  assert.deepEqual([inside.view.tx, inside.rest.dx], [view.tx - 30, 0], 'all of it moves the view');
+  const edge = panZoom({ ...view, tx: -BOX.left }, 40, 0, BOX, STAGE);
+  assert.deepEqual([edge.view.tx, edge.rest.dx], [-BOX.left, 40], 'at the edge: all of it scrolls the page');
+  const tall = panZoom(view, 0, 25, BOX, STAGE);
+  assert.equal(tall.rest.dy, 25, 'a side that fits the stage does not move: the page scrolls');
 });
