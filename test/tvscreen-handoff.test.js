@@ -61,6 +61,7 @@ function fakePage() {
     frames: [],
     media: [], // the browser feature's media list: [{ url, kind, headers, role?, audioOnly?, variants?, renditions? }]
     drm: null, // what DRM_SCRIPT finds in window.playerConfig
+    onEval: null, // (script) → a result for scripts a test handles itself (undefined: not handled)
   };
 }
 
@@ -96,6 +97,8 @@ async function handOffStack(config) {
     async evaluate(expression) {
       const src = String(expression);
       const page = env.page;
+      const own = page.onEval?.(src);
+      if (own !== undefined) return own;
       if (src.includes('v.pause()')) { page.pauses += 1; page.playing = false; return undefined; }
       if (src.includes('.play()')) { page.resumes += 1; page.playing = true; return 1; } // the hand-off's own videos play again
       if (src.includes('playerConfig')) return page.drm;
@@ -1148,5 +1151,105 @@ describe('tvscreen: the conversion beside the keys, conversion jobs and the play
     }
     await waitFor(() => playMsgs().at(-1).fromStart === true, { timeout: 3000, message: 'the converted copy on the TV' });
     await env.stopPlayer();
+  });
+});
+
+describe('tvscreen: the TV player\'s controls on the phone', () => {
+  let env, b, agent, page, up, setPage, bigVideo, playMsgs, tvVideo, fromAgent, ok;
+  const playback = () => env.stack.server.store.get('tvscreen.playback')?.v ?? null;
+  const controls = () => agent.screen.filter((m) => m.t === 'screen-video-control');
+
+  before(async () => {
+    env = await handOffStack();
+    ({ b, agent, up, setPage, bigVideo, playMsgs, tvVideo, fromAgent, ok } = env);
+  });
+  after(async () => { await env?.stop(); });
+  beforeEach(() => { page = env.page = fakePage(); });
+
+  async function handOver(name) {
+    setPage(up(`/watch/${name}`), name);
+    page.videos = [bigVideo(up(`/ts.m3u8?${name}`))];
+    page.playing = true;
+    const n = playMsgs().length;
+    ok(await b.send('tvscreen.playVideo', {}, { timeout: 15000 }));
+    return (await env.played(n)).id;
+  }
+
+  test('the TV player\'s clock and length reach the phone (tvscreen.playback), and go when the video stops', async () => {
+    const id = await handOver('clock');
+    fromAgent({ t: 'screen-video', state: 'playing', mode: 'avplay', position: 5000, duration: 600000, id });
+    await waitFor(() => playback()?.position === 5000, { timeout: 3000, message: 'the first position' });
+    assert.equal(playback().state, 'playing');
+    assert.equal(playback().duration, 600000);
+    assert.equal(typeof playback().at, 'number');
+    // Heartbeats move it on.
+    fromAgent({ t: 'screen-video', state: 'playing', mode: 'avplay', position: 10000, duration: 600000, heartbeat: true, id });
+    await waitFor(() => playback()?.position === 10000, { timeout: 3000, message: 'the heartbeat position' });
+    fromAgent({ t: 'screen-video', state: 'paused', mode: 'avplay', position: 11000, duration: 600000, id });
+    await waitFor(() => playback()?.state === 'paused' && playback().position === 11000, { timeout: 3000, message: 'paused' });
+    // A report about an older stream changes nothing.
+    fromAgent({ t: 'screen-video', state: 'playing', mode: 'avplay', position: 99000, duration: 1000, id: id - 1 });
+    await sleep(200);
+    assert.equal(playback().position, 11000);
+    await env.stopPlayer();
+    assert.equal(playback(), null, 'cleared once the player stopped');
+  });
+
+  test('play/pause, skip and seek go to the TV\'s player while it has the video; the phone sees the new position at once', async () => {
+    const id = await handOver('control');
+    fromAgent({ t: 'screen-video', state: 'playing', mode: 'avplay', position: 60000, duration: 600000, id });
+    await waitFor(() => playback()?.position === 60000, { timeout: 3000, message: 'playing' });
+
+    let value = ok(await b.send('tvscreen.control', { action: 'skip', by: 10 }));
+    assert.equal(value.target, 'tv');
+    assert.deepEqual(controls().at(-1), { t: 'screen-video-control', action: 'skip', by: 10000, id });
+    assert.ok(playback().position >= 70000 && playback().position < 71000, `moved on at once (${playback().position})`);
+
+    ok(await b.send('tvscreen.control', { action: 'skip', by: -30 }));
+    assert.deepEqual(controls().at(-1), { t: 'screen-video-control', action: 'skip', by: -30000, id });
+
+    value = ok(await b.send('tvscreen.control', { action: 'seek', position: 120.5 }));
+    assert.deepEqual(controls().at(-1), { t: 'screen-video-control', action: 'seek', position: 120500, id });
+    assert.equal(playback().position, 120500);
+
+    ok(await b.send('tvscreen.control', { action: 'toggle' }));
+    assert.deepEqual(controls().at(-1), { t: 'screen-video-control', action: 'toggle', id });
+
+    // Never past the end, never before the start.
+    ok(await b.send('tvscreen.control', { action: 'seek', position: 9999 }));
+    assert.equal(controls().at(-1).position, 600000 - 1000, 'a second before the end');
+    for (const bad of [{ action: 'seek', position: -1 }, { action: 'skip', by: 0 }, { action: 'skip' }, { action: 'rewind' }]) {
+      const ack = await b.send('tvscreen.control', bad);
+      assert.equal(ack.ok, false, JSON.stringify(bad));
+    }
+    await env.stopPlayer();
+  });
+
+  test('without the TV\'s player, the controls act on the page\'s own video (live video on the TV); with the screen closed they say so', async () => {
+    const scripts = [];
+    page.onEval = (src) => {
+      if (!src.includes('lumen:control')) return undefined;
+      scripts.push(src);
+      return { found: true, paused: false, t: 42, duration: 300 };
+    };
+    setPage(up('/watch/live'), 'Live');
+    const sent = controls().length;
+    const value = ok(await b.send('tvscreen.control', { action: 'skip', by: 10 }));
+    assert.equal(value.target, 'page');
+    assert.equal(value.position, 42);
+    assert.equal(controls().length, sent, 'nothing went to the TV player');
+    assert.match(scripts.at(-1), /"skip"/);
+    assert.match(scripts.at(-1), /10/);
+
+    page.onEval = (src) => (src.includes('lumen:control') ? { found: false } : undefined);
+    const none = await b.send('tvscreen.control', { action: 'toggle' });
+    assert.equal(none.ok, false);
+    assert.match(none.error.message, /no video/i);
+
+    ok(await b.send('tvscreen.close', {}, { timeout: 10000 }));
+    const closed = await b.send('tvscreen.control', { action: 'toggle' });
+    assert.equal(closed.ok, false);
+    assert.match(closed.error.message, /not on the TV/i);
+    ok(await b.send('tvscreen.open', {}, { timeout: 15000 }));
   });
 });

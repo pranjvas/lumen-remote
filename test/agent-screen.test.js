@@ -32,7 +32,8 @@ function setup({ hlsSupported = true, suspend = true } = {}) {
     play() { this.calls.push(['play']); },
     stop() { this.calls.push(['stop']); },
     close() { this.calls.push(['close']); },
-    seekTo(ms) { this.calls.push(['seekTo', ms]); },
+    seek: null, // { ms, ok, fail }: the last seekTo, answered by the test
+    seekTo(ms, ok, fail) { this.calls.push(['seekTo', ms]); this.seek = { ms, ok, fail }; },
     pause() { this.calls.push(['pause']); this.state = 'PAUSED'; },
     restore() { this.calls.push(['restore']); },
     state: 'PLAYING',
@@ -532,4 +533,124 @@ test('the hello and the heartbeat say what the screen shows; reports carry the s
   t.play('http://pc/relay/tok/a.m3u8', { engine: 'hls', drm: { 'com.widevine.alpha': { licenseUrl: 'x' } } });
   assert.ok(t.states().includes('error'));
   assert.equal(t.els.toast.textContent, 'first');
+});
+
+// ---- seeking: the remote's ◀ ▶ and the phone's controls ----
+
+const seeks = (s) => s.avplay.calls.filter((c) => c[0] === 'seekTo').map((c) => c[1]);
+const lastReport = (s) => s.sent.filter((m) => m.t === 'screen-video').at(-1);
+
+test('◀ ▶ seek AVPlay with seekTo and its callbacks; the TV shows where it went; the PC hears the new position', () => {
+  const s = setup();
+  s.play('http://pc/relay/tok/film.mp4', { id: 7 });
+  s.avplay.prepare.ok();
+  s.avplay.time = 5000;
+  s.key(39); // ▶
+  assert.deepEqual(seeks(s), [15000]);
+  assert.equal(typeof s.avplay.seek.ok, 'function', 'a success callback');
+  assert.equal(typeof s.avplay.seek.fail, 'function', 'an error callback: AVPlay\'s refusals were lost without one');
+  assert.match(s.els.hint.textContent, /0:15 \/ 1:00/);
+  s.avplay.time = 15000;
+  s.avplay.seek.ok();
+  const r = lastReport(s);
+  assert.equal(r.position, 15000);
+  assert.equal(r.duration, 60000);
+  assert.equal(r.id, 7);
+  assert.equal(r.heartbeat, true, 'reported like a heartbeat (no log line per press)');
+  s.key(37); // ◀
+  assert.deepEqual(seeks(s), [15000, 5000]);
+  s.avplay.seek.ok();
+  s.avplay.time = 2000;
+  s.key(412); // rewind: never before the start
+  assert.deepEqual(seeks(s).at(-1), 0);
+});
+
+test('presses while a seek runs add up to one more seek; never past the end', () => {
+  const s = setup();
+  s.play('http://pc/relay/tok/film.mp4');
+  s.avplay.prepare.ok();
+  s.avplay.time = 5000;
+  s.key(39);
+  s.key(39);
+  s.key(417); // ff
+  assert.deepEqual(seeks(s), [15000], 'one seek at a time');
+  assert.match(s.els.hint.textContent, /0:35/);
+  s.avplay.seek.ok();
+  assert.deepEqual(seeks(s), [15000, 35000]);
+  s.avplay.seek.ok();
+  s.avplay.time = 35000;
+  for (let i = 0; i < 5; i++) s.key(39);
+  s.avplay.seek.ok();
+  assert.equal(seeks(s).at(-1), 59000, 'a second before the end');
+});
+
+test('AVPlay refusing a seek: the PC is told, and the video goes on in the page\'s own player from there', () => {
+  const s = setup();
+  s.play('http://pc/relay/tok/film.mp4');
+  s.avplay.prepare.ok();
+  s.avplay.listener.oncurrentplaytime(5000);
+  s.avplay.time = 5000;
+  s.key(39);
+  s.avplay.seek.fail({ name: 'InvalidStateError', message: 'PLAYER_ERROR_INVALID_STATE' });
+  const note = s.sent.find((m) => m.t === 'screen-video' && /seek refused/.test(m.error || ''));
+  assert.ok(note, 'the refusal reaches the PC');
+  assert.match(note.error, /PLAYER_ERROR_INVALID_STATE/);
+  assert.ok(s.avplay.calls.some((c) => c[0] === 'close'), 'AVPlay let go');
+  assert.match(s.mse.src, /film\.mp4#t=15$/, 'the in-page <video> starts at the seek target');
+  // There, ◀ ▶ seek the <video> itself.
+  s.mse.currentTime = 15;
+  s.key(39);
+  assert.equal(s.mse.currentTime, 25);
+  assert.equal(lastReport(s).position, 25000);
+
+  // An HLS stream goes to hls.js at the target.
+  const h = setup();
+  h.play('http://pc/relay/tok/a.m3u8', { engine: 'avplay', kind: 'hls' });
+  h.avplay.prepare.ok();
+  h.avplay.listener.oncurrentplaytime(5000);
+  h.avplay.time = 5000;
+  h.key(37);
+  h.avplay.seek.fail({ name: 'InvalidStateError', message: 'x' });
+  assert.equal(h.hlsInstances.at(-1).config.startPosition, undefined, 'from the start (0 s)');
+  // A seek with no answer at all is let go after a while (later presses are not stuck behind it).
+  const n = setup();
+  n.play('http://pc/relay/tok/film.mp4');
+  n.avplay.prepare.ok();
+  n.avplay.time = 5000;
+  n.key(39);
+  n.advance(16000);
+  n.avplay.time = 15000;
+  n.key(39);
+  assert.deepEqual(seeks(n), [15000, 25000]);
+});
+
+test('the phone\'s controls: play/pause, skip and seek reach the player; a control for another stream is dropped', () => {
+  const s = setup();
+  s.play('http://pc/relay/tok/film.mp4', { id: 3 });
+  s.avplay.prepare.ok();
+  s.avplay.time = 20000;
+  s.screen.message({ t: 'screen-video-control', action: 'seek', position: 30000, id: 3 });
+  assert.deepEqual(seeks(s), [30000]);
+  s.avplay.seek.ok();
+  s.avplay.time = 30000;
+  s.screen.message({ t: 'screen-video-control', action: 'skip', by: -10000, id: 3 });
+  assert.deepEqual(seeks(s), [30000, 20000]);
+  s.avplay.seek.ok();
+  s.screen.message({ t: 'screen-video-control', action: 'toggle', id: 3 });
+  assert.equal(s.avplay.state, 'PAUSED');
+  assert.equal(lastReport(s).state, 'paused');
+  s.screen.message({ t: 'screen-video-control', action: 'play', id: 3 });
+  assert.equal(s.avplay.calls.at(-1)[0], 'play');
+  s.screen.message({ t: 'screen-video-control', action: 'seek', position: 1000, id: 2 });
+  assert.deepEqual(seeks(s), [30000, 20000], 'another stream\'s control changes nothing');
+
+  // The in-page player takes them too.
+  const m = setup();
+  m.play('http://pc/relay/tok/a.m3u8', { engine: 'hls', id: 4 });
+  m.mse.currentTime = 50;
+  m.screen.message({ t: 'screen-video-control', action: 'seek', position: 12000, id: 4 });
+  assert.equal(m.mse.currentTime, 12);
+  m.mse.paused = false;
+  m.screen.message({ t: 'screen-video-control', action: 'toggle', id: 4 });
+  assert.equal(m.mse.paused, true);
 });

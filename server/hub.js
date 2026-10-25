@@ -979,6 +979,17 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
       boolean(on, 'on');
       return feature('tvscreen', 'setLive', { on });
     },
+    // The phone's controls for the video on the TV: the TV's player while it has the video, else the
+    // page's own video (live video). position and by in seconds.
+    'tvscreen.control': async ({ action, position, by }) => {
+      oneOf(action, 'action', ['toggle', 'play', 'pause', 'seek', 'skip']);
+      if (action === 'seek') number(position, 'position', 0, 24 * 3600);
+      if (action === 'skip') {
+        number(by, 'by', -3600, 3600);
+        if (by === 0) throw invalid('by must not be 0');
+      }
+      return feature('tvscreen', 'control', { action, position, by });
+    },
     'tvscreen.playVideo': async ({ url, convert }) => {
       requireTvOn();
       if (convert !== undefined) boolean(convert, 'convert');

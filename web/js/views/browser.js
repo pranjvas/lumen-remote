@@ -9,6 +9,7 @@ import { openSheet } from '../ui/sheet.js';
 import { haptic } from '../ui/haptics.js';
 import { accelerate, bindTrackpad, readGain } from '../ui/trackpad.js';
 import { clampZoom, fitFrame, panZoom, pinchZoom, sizeDiffers, viewportFor } from './browser-fit.js';
+import { mountTvPlayback } from './tvplayback.js';
 
 const RATE_MS = 33;          // moves and wheel deltas coalesce to ~30 messages/s
 const VIEWPORT_MS = 250;     // resize settle before browser.viewport
@@ -286,6 +287,10 @@ export function mountBrowser(root, ctx) {
   let chipRun = null;
   chipAction.addEventListener('click', () => { haptic('key'); chipRun?.(chipAction); });
 
+  // While a video from the page plays on the TV: its controls (views/tvplayback.js).
+  const tvPlaybackHost = h('div', { class: 'browser-tvplayback' });
+  mountTvPlayback(tvPlaybackHost, ctx, { className: 'card' });
+
   root.append(
     h('header', { class: 'view-head browser-head' },
       h('div', null,
@@ -295,6 +300,7 @@ export function mountBrowser(root, ctx) {
       h('div', { class: 'browser-navgroup' }, desktopNav.back, desktopNav.forward, desktopNav.reload, padButtons[0]),
       form, vpnButtons[0], tvButton('primary'), tvExtra('browser-tvx', 'Video → TV', 'play', 'tvscreen.playVideo', 'Sent to the TV'), tvExtra('browser-tvx', 'Close TV', 'close', 'tvscreen.close', 'Closed on the TV'), closeButtons[0]),
     h('div', { class: 'browser-status' }, dot, statusText, meta, chip, clearButton, closeButtons[1]),
+    tvPlaybackHost,
     vpnRow,
     stage,
     pad,

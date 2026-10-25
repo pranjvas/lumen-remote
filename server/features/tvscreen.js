@@ -24,6 +24,9 @@ const FRONT_EVERY_MS = 5000; // at most this often, the trackpad brings Lumen's 
 const AUTO_MIN_AREA = 0.18; // fraction of the page: a watch page's player (Dailymotion's is ~23% beside its sidebar) counts; previews and thumbnails stay
 const AUTO_MIN_AREA_YOUTUBE = 0.15; // a YouTube video page: Shorts' portrait player is about a third of a 16:9 page
 const TV_VIDEO_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
+// The TV's player has the video (not Lumen converting it): its clock is tvscreen.playback.
+const PLAYER_STATES = new Set(['loading', 'playing', 'paused']);
+const SEEK_END_MARGIN_MS = 1000; // a seek lands at least this far before the end
 // The big videos playing on the page, each by a key that stays the same while it plays (its stream,
 // or its place in the page): a video counts as started when its key was not playing at the last
 // check, so a click on a player that already plays (full screen, volume, a seek) starts nothing.
@@ -225,7 +228,15 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
 
   const meta = { src: 'derived', via: 'tvscreen' };
   const setState = (value) => store.set('tvscreen.on', value, meta);
-  const setVideo = (value) => store.set('tvscreen.video', value, meta);
+  // tvscreen.playback = { state, position, duration, mode, at } (ms; position as of `at`) while the
+  // TV's player has a video: the phone's controls show and move it.
+  const setPlayback = (value) => { if (value || store.get('tvscreen.playback')?.v) store.set('tvscreen.playback', value, meta); };
+  const setVideo = (value) => {
+    store.set('tvscreen.video', value, meta);
+    const pb = store.get('tvscreen.playback')?.v ?? null;
+    if (!PLAYER_STATES.has(value)) setPlayback(null);
+    else if (pb && pb.state !== value) setPlayback({ ...pb, position: positionNow(pb), state: value, at: Date.now() });
+  };
   const setHandoff = (stage, converting = false) => store.set('tvscreen.handoff', stage ? { stage, converting } : null, meta);
   const setLiveBlocked = (value) => { if (value || store.get('tvscreen.liveBlocked')?.v) store.set('tvscreen.liveBlocked', value, meta); };
   const videoActive = () => TV_VIDEO_ACTIVE.has(store.get('tvscreen.video')?.v);
@@ -452,6 +463,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
       if (current?.converting) return;
     }
     setVideo(state);
+    notePlayback(msg);
     syncLivePause();
     if (TV_VIDEO_ACTIVE.has(state)) {
       cancelJobGrace();
@@ -472,6 +484,10 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
   // Every 5 s while a video is in front (agents 0.8.7+): a clock that moves is a video that plays,
   // even when its 'playing' report was lost; a clock stuck at 0 for long is one that failed.
   function onHeartbeat(msg, state) {
+    try { heartbeat(msg, state); } finally { notePlayback(msg); }
+  }
+
+  function heartbeat(msg, state) {
     const position = num(msg.position);
     const now = store.get('tvscreen.video')?.v ?? null;
     const moved = position !== null && lastBeat?.position != null && position !== lastBeat.position;
@@ -1066,6 +1082,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     lastVideoReportAt = Date.now();
     lastBeat = null;
     stuckSince = null;
+    setPlayback(null);
     setVideo('loading');
     syncLivePause();
     adapter.sendScreen({ ...msg, id: playSeq });
@@ -1340,6 +1357,88 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     jobGraceTimer.unref?.();
   }
 
+  // ---------- the TV player's controls (the phone's play/pause, skip and seek bar) ----------
+
+  // Where the clock of a tvscreen.playback value is now (it runs on while playing).
+  function positionNow(pb) {
+    if (!pb || pb.position == null) return null;
+    return pb.state === 'playing' ? pb.position + Math.max(0, Date.now() - pb.at) : pb.position;
+  }
+
+  // A report from the TV's player (its clock and the video's length, agents 0.8.7+): the phone's view of it.
+  function notePlayback(msg) {
+    const state = store.get('tvscreen.video')?.v ?? null;
+    if (!PLAYER_STATES.has(state)) return;
+    const pb = store.get('tvscreen.playback')?.v ?? null;
+    const position = num(msg.position);
+    const duration = num(msg.duration);
+    setPlayback({
+      state,
+      position: position ?? positionNow(pb),
+      duration: duration > 0 ? duration : pb?.duration ?? null,
+      mode: typeof msg.mode === 'string' ? msg.mode.slice(0, 10) : pb?.mode ?? null,
+      at: Date.now(),
+    });
+  }
+
+  // The page's own video (live video shows the page on the TV): the playing one, else the biggest.
+  const pageControlScript = (action, position, by) => `/* lumen:control */ (() => {
+    const area = (v) => v.clientWidth * v.clientHeight;
+    const all = [...document.querySelectorAll('video')].filter((v) => area(v) > 0).sort((p, q) => area(q) - area(p));
+    const v = all.find((x) => !x.paused) || all[0];
+    if (!v) return { found: false };
+    const action = ${JSON.stringify(action)};
+    const end = isFinite(v.duration) && v.duration > 0 ? v.duration : null;
+    const to = (t) => { v.currentTime = Math.max(0, end ? Math.min(t, end - 1) : t); };
+    if (action === 'seek') to(${Number(position) || 0});
+    else if (action === 'skip') to(v.currentTime + (${Number(by) || 0}));
+    else if (action === 'play' || (action === 'toggle' && v.paused)) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+    else v.pause();
+    return { found: true, paused: v.paused, t: v.currentTime, duration: end };
+  })()`;
+
+  /**
+   * The phone's controls: action toggle | play | pause | seek (position, s) | skip (by, s). While the
+   * TV's player has the video they go to it; otherwise (live video, frames) to the page's own video.
+   * → { value: { target: 'tv' | 'page', position (s, as far as known) } }
+   */
+  async function control({ action, position, by }) {
+    if (!on) throw new LumenError('UNAVAILABLE', 'Lumen’s browser is not on the TV');
+    const adapter = agent();
+    if (PLAYER_STATES.has(store.get('tvscreen.video')?.v) && adapter?.sendScreen && agentOnline()) {
+      const pb = store.get('tvscreen.playback')?.v ?? null;
+      const end = pb?.duration > 0 ? pb.duration - SEEK_END_MARGIN_MS : null;
+      const clamp = (ms) => Math.max(0, end != null ? Math.min(ms, end) : ms);
+      const msg = { t: 'screen-video-control', action };
+      let target = null;
+      if (action === 'seek') target = msg.position = clamp(Math.round(position * 1000));
+      if (action === 'skip') {
+        msg.by = Math.round(by * 1000);
+        const now = positionNow(pb);
+        if (now != null) target = clamp(now + msg.by);
+      }
+      msg.id = playSeq;
+      adapter.sendScreen(msg);
+      // What the phone shows until the player's own report (sent right after it acted) comes in.
+      if (pb && target != null) setPlayback({ ...pb, position: target, at: Date.now() });
+      else if (pb && (action === 'toggle' || action === 'play' || action === 'pause')) {
+        const state = action === 'play' ? 'playing' : action === 'pause' ? 'paused' : pb.state === 'playing' ? 'paused' : 'playing';
+        setPlayback({ ...pb, position: positionNow(pb), state, at: Date.now() });
+      }
+      const shown = positionNow(store.get('tvscreen.playback')?.v ?? null);
+      return { value: { target: 'tv', position: shown != null ? shown / 1000 : null } };
+    }
+    const feature = b();
+    const script = pageControlScript(action, position, by);
+    let result = await feature.evaluate(script).catch(() => null);
+    if (!result?.found && feature.evaluateFrames) {
+      const inFrames = await feature.evaluateFrames(script).catch(() => []);
+      result = (Array.isArray(inFrames) ? inFrames : []).find((r) => r?.found) ?? result;
+    }
+    if (!result?.found) throw new LumenError('UNAVAILABLE', 'There is no video on the page to control');
+    return { value: { target: 'page', position: num(result.t), duration: num(result.duration), paused: result.paused === true } };
+  }
+
   // ---------- live video ----------
 
   // From the moment the TV takes the live stream (its 'ready'), no JPEG frame goes to it (it would
@@ -1569,6 +1668,7 @@ export function createTvScreen({ config, log: rootLog, store, agent, rest, brows
     open,
     close,
     playVideo,
+    control,
     pointer,
     setLive,
     forgetHistory,

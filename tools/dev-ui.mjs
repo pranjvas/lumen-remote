@@ -8,6 +8,7 @@
 //   POST /dev/ime?open=1|0   opens/closes the TV keyboard (IME) for every connected tab.
 //   POST /dev/browser?url=<page> | ?close=1 | ?error=<message>   drives the fake Lumen browser.
 //   GET  /dev/commands       the last 300 commands received over /live (for UI protocol checks).
+//   POST /dev/state?key=<store key>&value=<JSON>   sets a store value for every tab (e.g. tvscreen.playback).
 //
 // The Browser view (spec §11.3) gets a fake session: wireframe pages rendered here as PNG frames
 // (no Edge involved), with links, scrolling, a search box that takes typed text, and ack gating.
@@ -363,6 +364,26 @@ const BROWSER_COMMANDS = {
     browser.tv = false;
     patch([['tvscreen.on', false, { src: 'derived', via: 'tvscreen' }]]);
     return { value: { on: false } };
+  },
+  // The phone's controls for the video on the TV (server/features/tvscreen.js control()): the fake
+  // TV player's clock (tvscreen.playback, set through POST /dev/state) moves, else the page's video.
+  'tvscreen.control': ({ action, position, by }) => {
+    if (records.get('tvscreen.on')?.v !== true) throw Object.assign(new Error('Lumen’s browser is not on the TV'), { code: 'UNAVAILABLE' });
+    const pb = records.get('tvscreen.playback')?.v;
+    if (!pb) {
+      if (!(records.get('browser.media')?.v > 0)) throw Object.assign(new Error('There is no video on the page to control'), { code: 'UNAVAILABLE' });
+      return { value: { target: 'page', position: null } };
+    }
+    const nowPos = pb.state === 'playing' ? pb.position + (Date.now() - pb.at) : pb.position;
+    const end = pb.duration > 0 ? pb.duration - 1000 : Infinity;
+    const clamp = (ms) => Math.max(0, Math.min(ms, end));
+    const next = { ...pb, at: Date.now(), position: nowPos };
+    if (action === 'seek') next.position = clamp(position * 1000);
+    if (action === 'skip') next.position = clamp(nowPos + by * 1000);
+    if (action === 'play' || action === 'pause') next.state = action === 'play' ? 'playing' : 'paused';
+    if (action === 'toggle') next.state = pb.state === 'playing' ? 'paused' : 'playing';
+    patch([['tvscreen.playback', next, { src: 'derived', via: 'tvscreen' }]]);
+    return { value: { target: 'tv', position: next.position / 1000 } };
   },
   // The trackpad's shared pointer, in fractions of the page (server/features/tvscreen.js pointer()).
   'browser.pointer': ({ dx = 0, dy = 0, x, y, action = 'move', button = 'left', deltaX = 0, deltaY = 0 }) => {
@@ -855,6 +876,12 @@ const server = http.createServer(async (req, res) => {
     return reply(res, 201, { fileId: randomBytes(16).toString('hex'), name, size, mime: req.headers['content-type'] || 'application/octet-stream' });
   }
   if (p === '/dev/commands') return reply(res, 200, received);
+  if (p === '/dev/state' && req.method === 'POST') {
+    let value;
+    try { value = JSON.parse(url.searchParams.get('value') ?? 'null'); } catch { return reply(res, 400, { error: 'value is not JSON' }); }
+    patch([[url.searchParams.get('key'), value, { src: 'derived', via: 'dev' }]]);
+    return reply(res, 200, { ok: true });
+  }
   if (p === '/dev/ime' && req.method === 'POST') {
     const open = url.searchParams.get('open') !== '0';
     patch([['ime', { open, type: 'text', text: open ? 'friends' : '', limit: -1 }, {}]]);

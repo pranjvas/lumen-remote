@@ -646,6 +646,36 @@ describe('relay ranges', () => {
       s.close();
     }
   });
+
+  test('a video file is seekable through the relay: Accept-Ranges is announced, and a range from mid-file has its own length', async () => {
+    const film = Buffer.alloc(3 * 1024 * 1024, 0x21);
+    // An upstream like archive.org's: its 206 replies carry no Accept-Ranges.
+    const s = await relayStack(ranged({ '/film.mp4': { type: 'video/mp4', body: film } }));
+    try {
+      const url = s.relay.register(`${s.up}/film.mp4`).url;
+      // AVPlay's first request: the whole file as a range.
+      const first = await fetch(url, { headers: { range: 'bytes=0-' } });
+      assert.equal(first.status, 206);
+      assert.equal(first.headers.get('accept-ranges'), 'bytes', 'the player is told it can seek');
+      assert.equal(first.headers.get('content-length'), String(film.length));
+      await first.arrayBuffer();
+      // A seek: from the middle to the end.
+      const from = 1_000_000;
+      const mid = await fetch(url, { headers: { range: `bytes=${from}-` } });
+      assert.equal(mid.status, 206);
+      assert.equal(mid.headers.get('content-range'), `bytes ${from}-${film.length - 1}/${film.length}`);
+      assert.equal(mid.headers.get('content-length'), String(film.length - from));
+      assert.equal(mid.headers.get('accept-ranges'), 'bytes');
+      assert.equal((await mid.arrayBuffer()).byteLength, film.length - from);
+      // Without a range: the whole file with the server's own headers (it said nothing about ranges).
+      const plain = await fetch(url);
+      assert.equal(plain.status, 200);
+      assert.equal(plain.headers.get('accept-ranges'), null);
+      assert.equal((await plain.arrayBuffer()).byteLength, film.length);
+    } finally {
+      s.close();
+    }
+  });
 });
 
 describe('transcode', () => {

@@ -971,6 +971,9 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     }
     const out = {};
     for (const name of PASS_RESPONSE) if (up.headers[name]) out[name] = up.headers[name];
+    // A range answered with 206 is a file that can be seeked: say so even where the server leaves
+    // Accept-Ranges out of its 206s (archive.org does). The TV's AVPlay judges a stream's seeking by it.
+    if (up.statusCode === 206 && !out['accept-ranges']) out['accept-ranges'] = 'bytes';
     res.writeHead(up.statusCode, { ...CORS, ...out });
     if (req.method === 'HEAD') { up.resume(); res.end(); return; }
     if (sniffed) {

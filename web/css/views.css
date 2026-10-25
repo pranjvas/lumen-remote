@@ -1322,3 +1322,13 @@
   -webkit-user-select: all;
   user-select: all;
 }
+
+/* The video on the TV from Lumen's browser (views/tvplayback.js): Browser view and Send to TV. */
+.tv-playback { display: grid; gap: 4px; padding: 8px 14px 10px; flex: none; }
+.tv-playback-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12.5px; }
+.tv-playback .scrubber { margin-top: 2px; gap: 10px; }
+.tv-playback .transport { margin-top: 2px; gap: 14px; }
+.tv-playback .transport .key { width: 44px; height: 44px; }
+.tv-playback .transport .key.hero { width: 54px; height: 54px; }
+.browser-tvplayback:not(.has-tv-playback) { display: none; }
+.send-playback .tv-playback { padding: 0; }

@@ -9,6 +9,7 @@ import { h, icon, fill } from '../ui/dom.js';
 import { openSheet } from '../ui/sheet.js';
 import { toast } from '../ui/toast.js';
 import { classifyLink } from './cast.js';
+import { mountTvPlayback } from './tvplayback.js';
 
 const SENT_KEY = 'lumen.sent'; // the last link sent from this tab: a reload does not send it again
 
@@ -17,7 +18,10 @@ export function mountSend(root, ctx) {
   const sub = h('p', { class: 'view-sub' });
   const status = h('div', { class: 'send-status' });
   const actions = h('div', { class: 'send-actions' });
-  root.append(h('header', { class: 'view-head' }, h('div', null, title, sub)), h('section', { class: 'card card-pad send-card' }, status, actions));
+  const playbackHost = h('div', { class: 'send-playback' });
+  root.append(h('header', { class: 'view-head' }, h('div', null, title, sub)), h('section', { class: 'card card-pad send-card' }, status, playbackHost, actions));
+  // Once the page's video plays on the TV: its play/pause, ±10 s and seek bar.
+  mountTvPlayback(playbackHost, ctx);
 
   let link = null; // classifyLink() of the link being sent
   let phase = 'idle'; // sending · page · app · failed

@@ -470,26 +470,134 @@
     video.reported = true;
     // Yellow on a video: Lumen converts it on the PC (a black picture, a refusal the TV did not report).
     if (key === 'yellow') { send({ t: 'screen-input', key: 'convert' }); return undefined; }
+    if (key === 'back' || key === 'stop') return stopVideo(true);
+    if (key === 'enter' || key === 'playpause') return playPause('toggle');
+    if (key === 'play' || key === 'pause') return playPause(key);
+    if (key === 'left' || key === 'rewind') return seekBy(-SEEK_MS);
+    if (key === 'right' || key === 'ff') return seekBy(SEEK_MS);
+    return undefined;
+  }
+
+  // action: toggle | play | pause (Pause on a paused video leaves it paused).
+  function playPause(action) {
+    if (!video) return undefined;
     if (video.mode !== 'avplay') {
-      if (key === 'back' || key === 'stop') return stopVideo(true);
-      if (key === 'enter' || key === 'playpause' || key === 'play' || key === 'pause') {
-        if (!mse.paused && key !== 'play') mse.pause(); else mse.play().catch(function () {});
-        return undefined;
-      }
-      if (key === 'left' || key === 'rewind') { mse.currentTime = Math.max(0, mse.currentTime - SEEK_MS / 1000); return undefined; }
-      if (key === 'right' || key === 'ff') { mse.currentTime = mse.currentTime + SEEK_MS / 1000; return undefined; }
+      if (action === 'play' || (action === 'toggle' && mse.paused)) mse.play().catch(function () {});
+      else mse.pause();
       return undefined;
     }
-    const state = read(function () { return webapis.avplay.getState(); }, '');
-    if (key === 'back' || key === 'stop') return stopVideo(true);
-    if (key === 'enter' || key === 'playpause' || key === 'play' || key === 'pause') {
-      if (state === 'PLAYING' && key !== 'play') read(function () { webapis.avplay.pause(); });
-      else read(function () { webapis.avplay.play(); });
-      return report(state === 'PLAYING' ? 'paused' : 'playing');
+    const playing = read(function () { return webapis.avplay.getState(); }, '') === 'PLAYING';
+    if (action === 'play' || (action === 'toggle' && !playing)) {
+      read(function () { webapis.avplay.play(); });
+      return report('playing');
     }
-    if (key === 'left' || key === 'rewind') return read(function () { webapis.avplay.jumpBackward(SEEK_MS); });
-    if (key === 'right' || key === 'ff') return read(function () { webapis.avplay.jumpForward(SEEK_MS); });
+    read(function () { webapis.avplay.pause(); });
+    return report('paused');
+  }
+
+  // ---- seeking: the remote's ◀ ▶ (⏪ ⏩) and the phone's controls ----
+
+  // AVPlay answers a seek through callbacks and takes one at a time. Called without them (jumpForward
+  // bare, as before 0.9.4) its refusals were lost: on 25 Oct this TV answered every seekTo and
+  // jumpForward on a relayed MP4 with PLAYER_ERROR_INVALID_STATE while it played, and ◀ ▶ did
+  // nothing. A refused seek now goes on in the page's own player from the target (it seeks over HTTP
+  // ranges itself), and the PC is told. Presses while a seek runs add up to one more seek.
+  const SEEK_ANSWER_MS = 15000; // a seek with no answer by then is let go
+  let seeking = null; // { mine, target, next, timer }
+
+  function clock(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    const two = function (n) { return n < 10 ? '0' + n : String(n); };
+    return h > 0 ? h + ':' + two(m) + ':' + two(sec) : m + ':' + two(sec);
+  }
+
+  function errorText(e) {
+    return String(e && e.name ? e.name + ' ' + (e.message || '') : e).trim().slice(0, 120);
+  }
+
+  // The video's length in ms (0: unknown).
+  function durationNow() {
+    if (!video) return 0;
+    if (video.mode !== 'avplay') {
+      const d = read(function () { return mse.duration; }, 0);
+      return isFinite(d) && d > 0 ? Math.round(d * 1000) : 0;
+    }
+    const d = read(function () { return webapis.avplay.getDuration(); }, 0);
+    return d > 0 ? d : 0;
+  }
+
+  // Where the player is, for the PC (like a heartbeat: the phone's seek bar follows it, nothing is logged).
+  function reportClock() {
+    if (!video) return;
+    sendVideo({ state: video.state, mode: video.mode, position: positionNow(), duration: durationNow() || null, heartbeat: true });
+  }
+
+  function seekBy(deltaMs) {
+    if (!video) return undefined;
+    const pending = seeking && seeking.mine === video ? (seeking.next !== null ? seeking.next : seeking.target) : null;
+    return seekTo((pending !== null ? pending : positionNow() || 0) + deltaMs);
+  }
+
+  function seekTo(ms) {
+    if (!video) return undefined;
+    const mine = video;
+    const duration = durationNow();
+    const target = Math.max(0, duration > 0 ? Math.min(ms, duration - 1000) : ms);
+    const from = seeking && seeking.mine === mine ? (seeking.next !== null ? seeking.next : seeking.target) : positionNow() || 0;
+    showHint((target < from ? '◀◀ ' : '▶▶ ') + clock(target) + (duration > 0 ? ' / ' + clock(duration) : ''), 2500);
+    if (mine.mode !== 'avplay') {
+      read(function () { mse.currentTime = target / 1000; });
+      mine.position = target;
+      reportClock();
+      return undefined;
+    }
+    if (seeking && seeking.mine === mine) { seeking.next = target; return undefined; }
+    avplaySeek(mine, target);
     return undefined;
+  }
+
+  function avplaySeek(mine, target) {
+    const op = { mine: mine, target: target, next: null, timer: null };
+    seeking = op;
+    function settle(ok, why) {
+      if (seeking !== op) return;
+      clearTimeout(op.timer);
+      seeking = null;
+      if (video !== mine || mine.mode !== 'avplay') return;
+      if (ok === false) { seekRefused(mine, op.next !== null ? op.next : target, why); return; }
+      if (ok) mine.position = target;
+      if (op.next !== null && op.next !== target) { avplaySeek(mine, op.next); return; }
+      reportClock();
+    }
+    op.timer = setTimeout(function () { settle(null); }, SEEK_ANSWER_MS);
+    try {
+      webapis.avplay.seekTo(target, function () { settle(true); }, function (e) { settle(false, errorText(e)); });
+    } catch (e) {
+      settle(false, errorText(e));
+    }
+  }
+
+  // AVPlay will not seek this stream: the page's own player (hls.js or <video>) takes it from the target.
+  function seekRefused(mine, target, why) {
+    sendVideo({ state: mine.state, mode: 'avplay', error: 'seek refused: ' + why, position: positionNow() });
+    mine.played = true;
+    mine.position = target;
+    showHint('▶▶ ' + clock(target) + ' · switching player', 3000);
+    refused('seek refused: ' + why, mine);
+  }
+
+  // The phone's controls (Lumen's tvscreen.control): { action: toggle | play | pause | seek | skip,
+  // position (ms) | by (ms), id }. A control meant for another stream is dropped.
+  function control(msg) {
+    if (!active || !video) return;
+    if (typeof msg.id === 'number' && typeof video.id === 'number' && msg.id !== video.id) return;
+    video.reported = true;
+    if (msg.action === 'seek' && typeof msg.position === 'number' && isFinite(msg.position)) seekTo(msg.position);
+    else if (msg.action === 'skip' && typeof msg.by === 'number' && isFinite(msg.by)) seekBy(msg.by);
+    else if (msg.action === 'toggle' || msg.action === 'play' || msg.action === 'pause') playPause(msg.action);
   }
 
   // ---- this page in the background (another app in front): the TV's one decoder is let go ----
@@ -650,6 +758,8 @@
         else send({ t: 'screen-live', state: 'unsupported', reason: 'no live player' });
       } else if (msg.t === 'screen-toast') {
         toast(String(msg.text || '').slice(0, 140));
+      } else if (msg.t === 'screen-video-control') {
+        control(msg);
       }
     },
   };
