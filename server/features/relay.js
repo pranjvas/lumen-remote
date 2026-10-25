@@ -31,6 +31,21 @@ const PASS_REQUEST = ['range', 'accept', 'accept-encoding', 'if-range'];
 const CORS = { 'access-control-allow-origin': '*', 'access-control-expose-headers': 'content-length, content-range, accept-ranges' };
 const PASS_RESPONSE = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag', 'cache-control'];
 
+// The TV's player (AVPlay, and <video>, which plays through it) reads response header names
+// case-sensitively. Sent lowercase as Node writes them when given so (content-length), it never
+// learns the stream's size and refuses every seek with PLAYER_ERROR_INVALID_STATE (the Q95T, 26 Oct:
+// the same file and server seek once the names are capitalised). Every reply here spells them as usual.
+const HEADER_SPELLING = { etag: 'ETag' };
+export function canonicalHeaderName(name) {
+  const lower = String(name).toLowerCase();
+  return HEADER_SPELLING[lower] ?? lower.replace(/(^|-)([a-z])/g, (_, dash, c) => dash + c.toUpperCase());
+}
+function writeHead(res, status, headers = {}) {
+  const out = {};
+  for (const [name, value] of Object.entries(headers)) out[canonicalHeaderName(name)] = value;
+  res.writeHead(status, out);
+}
+
 const b64url = (s) => Buffer.from(s, 'utf8').toString('base64url');
 const bareHost = (host) => String(host ?? '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
 
@@ -828,19 +843,19 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
   function serveConverted(req, res, job, name) {
     const file = transcoder()?.file(job, name);
     if (name.endsWith('.m3u8')) log.debug('converted playlist requested', { job, found: Boolean(file) });
-    if (!file) { res.writeHead(404, { ...CORS, 'content-type': 'text/plain' }); res.end('not found'); return; }
+    if (!file) { writeHead(res, 404, { ...CORS, 'content-type': 'text/plain' }); res.end('not found'); return; }
     const playlist = name.endsWith('.m3u8');
     if (playlist) {
       // The playlist grows while ffmpeg works, so players treat it as live and join near the end;
       // EXT-X-START tells them to start at the beginning.
       const text = fs.readFileSync(file, 'utf8').replace(/^#EXTM3U\r?\n/, '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n');
       const body = Buffer.from(text, 'utf8');
-      res.writeHead(200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
+      writeHead(res, 200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
       res.end(req.method === 'HEAD' ? undefined : body);
       return;
     }
     const size = fs.statSync(file).size;
-    res.writeHead(200, { ...CORS, 'content-type': 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
+    writeHead(res, 200, { ...CORS, 'content-type': 'video/mp2t', 'content-length': size, 'cache-control': 'no-cache' });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(file).pipe(res);
   }
@@ -873,7 +888,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     try {
       body = await readBody(req, MAX_LICENCE_BYTES, { drain: true });
     } catch {
-      res.writeHead(413, { ...CORS, 'content-type': 'text/plain', connection: 'close' });
+      writeHead(res, 413, { ...CORS, 'content-type': 'text/plain', connection: 'close' });
       res.end('too large');
       return;
     }
@@ -888,11 +903,11 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
       if (up.statusCode >= 400) {
         log.warn('licence server refused', { status: up.statusCode, type: up.headers['content-type'] ?? null, sentType: headers['content-type'] ?? null, reply: reply.toString('utf8').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 300) });
       }
-      res.writeHead(up.statusCode, { ...CORS, 'content-type': up.headers['content-type'] ?? 'application/octet-stream', 'content-length': reply.length });
+      writeHead(res, up.statusCode, { ...CORS, 'content-type': up.headers['content-type'] ?? 'application/octet-stream', 'content-length': reply.length });
       res.end(reply);
     } catch (err) {
       log.warn('licence request failed', { host: target.hostname, message: err.message });
-      res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
+      writeHead(res, 502, { ...CORS, 'content-type': 'text/plain' });
       res.end('licence server failed');
     }
   }
@@ -900,7 +915,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
   async function onRequest(req, res) {
     if (req.method === 'OPTIONS') {
       const asked = String(req.headers['access-control-request-headers'] ?? '').slice(0, 300).replace(/[^\w, -]/g, '');
-      res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET, HEAD, POST', 'access-control-allow-headers': asked || 'range, if-range', 'access-control-max-age': '600' });
+      writeHead(res, 204, { ...CORS, 'access-control-allow-methods': 'GET, HEAD, POST', 'access-control-allow-headers': asked || 'range, if-range', 'access-control-max-age': '600' });
       res.end();
       return;
     }
@@ -909,14 +924,14 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     const session = live(parts[1]); // also drops expired blobs
     if (parts[1] === 'b' && parts.length === 3 && blobs.has(parts[2])) {
       const blob = blobs.get(parts[2]);
-      res.writeHead(200, { ...CORS, 'content-type': blob.type, 'content-length': blob.body.length });
+      writeHead(res, 200, { ...CORS, 'content-type': blob.type, 'content-length': blob.body.length });
       res.end(req.method === 'HEAD' ? undefined : blob.body);
       return;
     }
     const target = parts[2] ? webUrl((() => { try { return unb64url(parts[2]); } catch { return ''; } })()) : null;
     if (session && target && req.method === 'POST' && session.licence && target.href === session.target) return relayLicence(req, res, session, target);
     if (!session || !target || (req.method !== 'GET' && req.method !== 'HEAD')) {
-      res.writeHead(404, { ...CORS, 'content-type': 'text/plain' });
+      writeHead(res, 404, { ...CORS, 'content-type': 'text/plain' });
       res.end('not found');
       return;
     }
@@ -933,7 +948,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
       upstream = await fetchFollow(target.href, upstreamOptions({ method: req.method, headersFor: (u) => upstreamHeaders(session, u, passed) }));
     } catch (err) {
       log.warn('relay fetch failed', { host: target.hostname, message: err.message });
-      res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
+      writeHead(res, 502, { ...CORS, 'content-type': 'text/plain' });
       res.end('upstream failed');
       return;
     }
@@ -951,7 +966,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
       } catch (err) {
         log.warn('relay fetch failed', { host: target.hostname, message: err.message });
         up.destroy();
-        res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
+        writeHead(res, 502, { ...CORS, 'content-type': 'text/plain' });
         res.end('upstream failed');
         return;
       }
@@ -961,10 +976,10 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
         const rest = sniffed?.ended ? Buffer.alloc(0) : await readBody(up, MAX_PLAYLIST_BYTES - (sniffed?.head.length ?? 0));
         const text = Buffer.concat([sniffed?.head ?? Buffer.alloc(0), rest]).toString('utf8');
         const body = Buffer.from(rewritePlaylist(text, finalUrl, (abs) => relayUrl(parts[1], abs)), 'utf8');
-        res.writeHead(200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
+        writeHead(res, 200, { ...CORS, 'content-type': 'application/vnd.apple.mpegurl', 'content-length': body.length, 'cache-control': 'no-cache' });
         res.end(body);
       } catch (err) {
-        res.writeHead(502, { ...CORS, 'content-type': 'text/plain' });
+        writeHead(res, 502, { ...CORS, 'content-type': 'text/plain' });
         res.end(err.message);
       }
       return;
@@ -974,7 +989,7 @@ export function createRelay({ log: rootLog, lan, config = {}, vpn = () => null, 
     // A range answered with 206 is a file that can be seeked: say so even where the server leaves
     // Accept-Ranges out of its 206s (archive.org does). The TV's AVPlay judges a stream's seeking by it.
     if (up.statusCode === 206 && !out['accept-ranges']) out['accept-ranges'] = 'bytes';
-    res.writeHead(up.statusCode, { ...CORS, ...out });
+    writeHead(res, up.statusCode, { ...CORS, ...out });
     if (req.method === 'HEAD') { up.resume(); res.end(); return; }
     if (sniffed) {
       if (sniffed.ended) { res.end(sniffed.head); return; }

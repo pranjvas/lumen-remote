@@ -4,7 +4,7 @@ import { describe, test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import {
-  avcLevel, chooseVariant, createRelay, levelTooLow, parseHlsMaster, parseSps, readMp4Sps, readTsSps, relayRefusal, rewritePlaylist, siteOf,
+  avcLevel, canonicalHeaderName, chooseVariant, createRelay, levelTooLow, parseHlsMaster, parseSps, readMp4Sps, readTsSps, relayRefusal, rewritePlaylist, siteOf,
 } from '../server/features/relay.js';
 import { createTestLog } from './helpers.js';
 
@@ -642,6 +642,40 @@ describe('relay ranges', () => {
       assert.equal(whole.status, 206);
       assert.equal(whole.headers.get('content-range'), `bytes 0-${big.length - 1}/${big.length}`);
       assert.equal((await whole.arrayBuffer()).byteLength, big.length);
+    } finally {
+      s.close();
+    }
+  });
+
+  test('header names go out in their usual spelling: the TV\'s player reads them case-sensitively and will not seek without Content-Length', async () => {
+    // Measured on the Q95T (26 Oct): the same file and server, with lowercase content-length /
+    // content-range, gets PLAYER_ERROR_INVALID_STATE for every seek; capitalised, seeks work.
+    assert.equal(canonicalHeaderName('content-length'), 'Content-Length');
+    assert.equal(canonicalHeaderName('access-control-expose-headers'), 'Access-Control-Expose-Headers');
+    assert.equal(canonicalHeaderName('etag'), 'ETag');
+    const film = Buffer.alloc(256 * 1024, 0x22);
+    const s = await relayStack(ranged({
+      '/film.mp4': { type: 'video/mp4', body: film },
+      '/list.m3u8': { type: 'application/vnd.apple.mpegurl', body: '#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST\n' },
+    }));
+    // The names as they are on the wire (fetch lowercases them).
+    const rawNames = (url, headers = {}) => new Promise((resolve, reject) => {
+      const req = http.get(url, { headers }, (res) => {
+        const names = res.rawHeaders.filter((_, i) => i % 2 === 0);
+        res.resume();
+        resolve(names);
+      });
+      req.on('error', reject);
+    });
+    try {
+      const media = await rawNames(s.relay.register(`${s.up}/film.mp4`).url, { range: 'bytes=1000-' });
+      for (const name of ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'Access-Control-Allow-Origin']) {
+        assert.ok(media.includes(name), `${name} in ${media.join(', ')}`);
+      }
+      assert.deepEqual(media.filter((n) => /^[a-z]/.test(n)), [], 'no lowercase names');
+      const playlist = await rawNames(s.relay.register(`${s.up}/list.m3u8`).url);
+      assert.ok(playlist.includes('Content-Type') && playlist.includes('Content-Length'), playlist.join(', '));
+      assert.deepEqual(playlist.filter((n) => /^[a-z]/.test(n)), []);
     } finally {
       s.close();
     }

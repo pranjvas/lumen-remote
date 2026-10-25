@@ -54,6 +54,7 @@
   let linkDown = false;
   let linkTimer = null;
   let pendingPlay = null; // a screen-play that came while this page was in the background
+  let mseResume = false; // the in-page player was paused for a seek: it plays again once the seek is done
 
   const root = document.getElementById('screen');
   const frame = document.getElementById('frame');
@@ -328,7 +329,12 @@
     root.className = 'screen video mse';
     mse.style.display = 'block';
     mse.onplaying = function () { mine.started = true; mine.reported = true; clearTimeout(startTimer); startTimer = null; report('playing'); };
-    mse.onpause = function () { if (video) report('paused'); };
+    mse.onpause = function () { if (video && !mseResume) report('paused'); };
+    mse.onseeked = function () {
+      if (!mseResume || video !== mine) return;
+      mseResume = false;
+      mse.play().catch(function () {});
+    };
     mse.onended = function () { report('ended'); stopVideo(true); };
     mse.ontimeupdate = function () {
       const t = read(function () { return mse.currentTime; }, 0);
@@ -339,8 +345,7 @@
       // A network error after the video played: load it again once, where it was.
       if (mode === 'video' && code === 2 && mine.played && !mine.reloaded && video === mine) {
         mine.reloaded = true;
-        mse.src = String(mine.url).split('#')[0] + '#t=' + mine.position / 1000;
-        mse.play().catch(function () {});
+        startElementAt(mine.url, mine.position);
         return;
       }
       failed(mode + ': ' + String(code));
@@ -424,9 +429,23 @@
 
   function playVideoElement(url, reason, at) {
     useMse('video');
-    mse.src = at > 0 ? String(url).split('#')[0] + '#t=' + at / 1000 : url;
-    mse.play().catch(function () {});
+    startElementAt(url, at);
     sendVideo({ state: 'loading', error: 'AVPlay refused (' + reason.slice(0, 60) + '), using <video>' });
+  }
+
+  // The <video> plays url from at (ms). This TV ignores a #t= start, so the position is set once the
+  // metadata is in, and it plays from there (onseeked).
+  function startElementAt(url, at) {
+    const mine = video;
+    mse.onloadedmetadata = null;
+    mse.src = String(url).split('#')[0];
+    if (!(at > 0)) { mse.play().catch(function () {}); return; }
+    mse.onloadedmetadata = function () {
+      mse.onloadedmetadata = null;
+      if (video !== mine) return;
+      mseResume = true;
+      read(function () { mse.currentTime = at / 1000; });
+    };
   }
 
   function positionNow() {
@@ -453,7 +472,8 @@
       read(function () { webapis.avplay.close(); });
     } else {
       if (hls) { read(function () { hls.destroy(); }); hls = null; }
-      mse.onplaying = mse.onpause = mse.onended = mse.onerror = mse.ontimeupdate = null;
+      mse.onplaying = mse.onpause = mse.onended = mse.onerror = mse.ontimeupdate = mse.onseeked = mse.onloadedmetadata = null;
+      mseResume = false;
       read(function () { mse.pause(); });
       mse.removeAttribute('src');
       read(function () { mse.load(); });
@@ -486,6 +506,11 @@
       else mse.pause();
       return undefined;
     }
+    // During a seek AVPlay is paused for it: only what happens once it is done changes.
+    if (seeking && seeking.mine === video) {
+      seeking.resume = action === 'play' || (action === 'toggle' && !seeking.resume);
+      return report(seeking.resume ? 'playing' : 'paused');
+    }
     const playing = read(function () { return webapis.avplay.getState(); }, '') === 'PLAYING';
     if (action === 'play' || (action === 'toggle' && !playing)) {
       read(function () { webapis.avplay.play(); });
@@ -500,8 +525,10 @@
   // AVPlay answers a seek through callbacks and takes one at a time. Called without them (jumpForward
   // bare, as before 0.9.4) its refusals were lost: on 25 Oct this TV answered every seekTo and
   // jumpForward on a relayed MP4 with PLAYER_ERROR_INVALID_STATE while it played, and ◀ ▶ did
-  // nothing. A refused seek now goes on in the page's own player from the target (it seeks over HTTP
-  // ranges itself), and the PC is told. Presses while a seek runs add up to one more seek.
+  // nothing. So a playing video is paused for the seek and plays again once it is done (CineHD's
+  // order, which seeks MP4 on this TV); the in-page player does the same. A refused seek goes on in
+  // the page's own player from the target, and the PC is told. Presses while a seek runs add up to
+  // one more seek.
   const SEEK_ANSWER_MS = 15000; // a seek with no answer by then is let go
   let seeking = null; // { mine, target, next, timer }
 
@@ -549,18 +576,23 @@
     const from = seeking && seeking.mine === mine ? (seeking.next !== null ? seeking.next : seeking.target) : positionNow() || 0;
     showHint((target < from ? '◀◀ ' : '▶▶ ') + clock(target) + (duration > 0 ? ' / ' + clock(duration) : ''), 2500);
     if (mine.mode !== 'avplay') {
+      if (!mse.paused) { mseResume = true; mse.pause(); }
       read(function () { mse.currentTime = target / 1000; });
       mine.position = target;
       reportClock();
       return undefined;
     }
     if (seeking && seeking.mine === mine) { seeking.next = target; return undefined; }
-    avplaySeek(mine, target);
+    if (!mine.started) { showHint('Starting the video…', 2000); return undefined; }
+    const playing = read(function () { return webapis.avplay.getState(); }, '') === 'PLAYING';
+    if (playing) read(function () { webapis.avplay.pause(); });
+    avplaySeek(mine, target, playing);
     return undefined;
   }
 
-  function avplaySeek(mine, target) {
-    const op = { mine: mine, target: target, next: null, timer: null };
+  // resume: AVPlay was playing before the seek (paused for it): it plays again once the seeks are done.
+  function avplaySeek(mine, target, resume) {
+    const op = { mine: mine, target: target, next: null, timer: null, resume: resume };
     seeking = op;
     function settle(ok, why) {
       if (seeking !== op) return;
@@ -569,7 +601,8 @@
       if (video !== mine || mine.mode !== 'avplay') return;
       if (ok === false) { seekRefused(mine, op.next !== null ? op.next : target, why); return; }
       if (ok) mine.position = target;
-      if (op.next !== null && op.next !== target) { avplaySeek(mine, op.next); return; }
+      if (op.next !== null && op.next !== target) { avplaySeek(mine, op.next, op.resume); return; }
+      if (op.resume) read(function () { webapis.avplay.play(); });
       reportClock();
     }
     op.timer = setTimeout(function () { settle(null); }, SEEK_ANSWER_MS);
