@@ -1297,3 +1297,28 @@
 .bt-fallback-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .bt-error { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 16px; color: var(--danger); font-size: 14px; line-height: 1.45; }
 .bt-error .icon { width: 18px; height: 18px; flex: none; margin-top: 1px; }
+
+/* ---------- Send to TV (views/send.js) ---------- */
+.send-card { display: grid; gap: 16px; }
+.send-status { display: grid; gap: 10px; }
+.send-line { display: flex; align-items: flex-start; gap: 10px; margin: 0; color: var(--ink); line-height: 1.4; }
+.send-line .icon { flex: none; width: 20px; height: 20px; margin-top: 1px; color: var(--ink-2); }
+.send-line.is-good .icon { color: var(--live); }
+.send-line.is-bad .icon { color: var(--danger); }
+.send-line.is-busy .icon { color: var(--accent); animation: send-pulse 1.4s ease-in-out infinite; }
+@keyframes send-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .send-line.is-busy .icon { animation: none; } }
+.send-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.send-sheet h3 { margin: 18px 0 6px; font-size: 14px; }
+.send-code-row { list-style: none; margin-left: -1.2em; display: flex; align-items: center; gap: 8px; }
+.send-code {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--ink) 7%, transparent);
+  font: 12px/1.35 var(--font-mono);
+  overflow-wrap: anywhere;
+  -webkit-user-select: all;
+  user-select: all;
+}

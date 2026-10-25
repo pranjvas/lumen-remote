@@ -21,6 +21,7 @@ import { mountKeys } from './views/keys.js';
 import { mountTouch } from './views/touch.js';
 import { mountMouse } from './views/mouse.js';
 import { mountCast } from './views/cast.js';
+import { mountSend } from './views/send.js';
 import { mountBrowser } from './views/browser.js';
 import { mountScenes } from './views/scenes.js';
 import { mountScreen } from './views/screen.js';
@@ -104,6 +105,7 @@ const panels = {
   mouse: mountInto('mouse', mountMouse),
   cast: mountInto('cast', mountCast),
   browser: mountInto('browser', mountBrowser),
+  send: mountInto('send', mountSend),
   scenes: mountInto('scenes', mountScenes),
   ask: mountInto('ask', (root) => ask.mountView(root)),
 };
@@ -168,8 +170,11 @@ function show(view) {
 }
 
 function route() {
-  // /browser is the Browser view's own home-screen app: it opens there.
-  show(location.hash.replace(/^#\/?/, '') || (location.pathname === '/browser' ? 'browser' : 'remote'));
+  // /browser is the Browser view's own home-screen app: it opens there. A view may carry parameters
+  // (#/send?url=…): they are in ctx.route.params while it shows.
+  const [name, query = ''] = location.hash.replace(/^#\/?/, '').split('?');
+  ctx.route = { params: new URLSearchParams(query) };
+  show(name || (location.pathname === '/browser' ? 'browser' : 'remote'));
 }
 
 ctx.on('navigate', (view) => {

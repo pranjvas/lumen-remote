@@ -11,7 +11,8 @@ const MEDIA_EXT = /\.(mp4|m4v|mkv|webm|mov|avi|ts|m2ts|mts|mpg|mpeg|wmv|3gp|mp3|
 const AUDIO_EXT = /\.(mp3|m4a|aac|flac|wav|ogg|oga|opus|wma)(?:$|[?#])/i;
 const IMAGE_EXT = /\.(jpe?g|png|gif|bmp|webp)(?:$|[?#])/i;
 
-function classifyLink(raw) {
+/** A link → how it plays on the TV: { kind, url, icon, title, detail, ... } (kind invalid / page / youtube / netflix / prime / media). */
+export function classifyLink(raw) {
   const text = String(raw || '').trim();
   if (!text) return null;
   let url;

@@ -11,6 +11,7 @@ import { openSheet } from '../ui/sheet.js';
 import { toast, whisper } from '../ui/toast.js';
 import { bytes, prettySource, stamp, titleCase } from '../ui/format.js';
 import { RESTART_STEP, devModeStatus, startDeveloperMode } from './devmode.js';
+import { showSendSetup } from './send.js';
 
 const GROUPS = [
   { id: 'picture', title: 'Picture', short: 'Picture' },
@@ -587,13 +588,20 @@ function latencyOf(ctx, which) {
 }
 
 function phoneRows() {
-  return [['app', 'Lumen', 'The whole remote'], ['browser', 'Lumen Browser', 'Opens straight into the browser']].map(([kind, label, hint]) => {
+  const rows = [['app', 'Lumen', 'The whole remote'], ['browser', 'Lumen Browser', 'Opens straight into the browser']].map(([kind, label, hint]) => {
     const add = h('button', { class: 'btn ghost sm', type: 'button' }, icon('plus'), 'Add to Home Screen');
     add.addEventListener('click', () => showInstallSteps(kind));
     return h('div', { class: 'row row-readonly' },
       h('div', { class: 'row-label' }, h('span', { class: 'label', text: label }), h('span', { class: 'hint', text: hint })),
       h('div', { class: 'row-control' }, add), h('div', { class: 'row-badge' }));
   });
+  // Browsing in Brave or Safari, one tap sends the page to the TV (views/send.js).
+  const setup = h('button', { class: 'btn ghost sm', type: 'button' }, icon('cast'), 'Set up');
+  setup.addEventListener('click', () => showSendSetup());
+  rows.push(h('div', { class: 'row row-readonly' },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Send to TV from Brave or Safari' }), h('span', { class: 'hint', text: 'Share → Play on TV, or a ▶ TV bookmark' })),
+    h('div', { class: 'row-control' }, setup), h('div', { class: 'row-badge' })));
+  return rows;
 }
 
 function connectionRows(ctx, { watch, on, own }) {

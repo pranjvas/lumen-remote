@@ -22,6 +22,8 @@ export const VIEWS = [
   { id: 'keys', label: 'Keys', icon: 'numpad', rank: 2, hint: 'Number pad' },
   { id: 'scenes', label: 'Scenes', icon: 'scenes', rank: 2, hint: 'Looks and sleep' },
   { id: 'ask', label: 'Ask', icon: 'spark', rank: 2, title: 'Ask Lumen', hint: 'Chat and skills' },
+  // Rank 0: reached by a link only (the phone's share sheet or bookmarklet), not in the navigation.
+  { id: 'send', label: 'Send to TV', icon: 'cast', rank: 0 },
 ];
 
 /* ---------- Power ---------- */
@@ -231,6 +233,7 @@ export function mountBanners(host, ctx) {
 export function mountNav(host, ctx) {
   host.append(h('div', { class: 'nav-logo', 'aria-hidden': 'true' }, icon('halo', 'lg')));
   for (const v of VIEWS) {
+    if (!v.rank) continue;
     host.append(h('a', { class: 'nav-item', href: `#/${v.id}`, dataset: { view: v.id, rank: String(v.rank) }, 'aria-label': v.title || v.label }, icon(v.icon), h('span', { text: v.label })));
   }
   const more = h('button', { class: 'nav-item', type: 'button', dataset: { rank: 'more' }, 'aria-label': 'More views' }, icon('more'), h('span', { text: 'More' }));
