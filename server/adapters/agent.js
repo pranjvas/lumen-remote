@@ -13,6 +13,9 @@ const STATE_TTL_MS = 3 * 5000;
 const OFFLINE_AFTER_MS = 15000;
 const STARTUP_GRACE_MS = 35000; // longer than the agent's longest reconnect backoff (30 s)
 const LAUNCH_TIMEOUT_MS = 20000;
+const AUTO_LAUNCH_GAP_MS = 10 * 60 * 1000; // the agent is started again by itself at most this often
+const AUTO_CHECK_GAP_MS = 30 * 1000; // after the TV did not answer, it is not asked again for this long
+const OFFLINE_RECHECK_MS = 8000; // an agent gone offline: how long before deciding to start it again
 const REQUEST_TIMEOUT_MS = 8000;
 const ICON_RETRY_MS = 10 * 60 * 1000;
 const MAX_ICON_BYTES = 512 * 1024;
@@ -189,6 +192,12 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
   function setConn(state) {
     connState = state;
     store.set('conn.agent', state, { src: 'derived', via: 'agent:link' });
+    // Gone while a phone shows Lumen and the TV is on (killed for memory): a moment later, so a TV
+    // that is going to sleep has said so first. Not when it was showing Lumen's browser: the TV screen
+    // feature recovers that agent itself, and leaves it closed behind another app.
+    if (state === 'offline' && store.get('tvscreen.on')?.v !== true) {
+      setTimeout(() => autoLaunch('the agent went offline'), OFFLINE_RECHECK_MS).unref?.();
+    }
   }
 
   function setNote(note) {
@@ -715,10 +724,61 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     await new Promise((resolve) => wss.close(() => resolve()));
   }
 
+  // ---- coming back by itself: the agent quits when the TV sleeps, and channel, input and app updates
+  // stop with it (seen 25 Oct: the phone's channel stayed on last night's). While a phone shows Lumen
+  // and the TV is on, an agent that is offline is started again (it steps aside on the TV in a moment),
+  // at most once per AUTO_LAUNCH_GAP_MS.
+  let watched = false; // a phone shows Lumen
+  let lastAutoLaunch = 0; // the last launch the TV accepted
+  let lastCheck = 0;
+  let checking = false;
+  async function autoLaunch(why) {
+    // 'unknown': the start-up grace, in which a running agent reconnects by itself (a launch then
+    // would only flash it on the TV). Lumen's browser on the TV recovers its agent itself (tvscreen).
+    if (checking || stopped || !started || !watched || connState !== 'offline') return;
+    if (store.get('conn.tv')?.v !== 'on' || store.get('tvscreen.on')?.v === true) return;
+    const now = Date.now();
+    if (now - lastAutoLaunch < AUTO_LAUNCH_GAP_MS || now - lastCheck < AUTO_CHECK_GAP_MS) return;
+    if (typeof rest?.foregroundSweep !== 'function') return;
+    checking = true;
+    try {
+      // Never over another app (Netflix, YouTube): the card would cover it. The polled foreground can
+      // lag minutes and misses apps outside the catalog, so every app Lumen knows is asked now; a TV
+      // that does not answer (going to sleep) gets no launch.
+      const front = await rest.foregroundSweep();
+      if (front) { log.debug('TV agent not started: an app is in front', { app: front.name ?? front.id }); return; }
+      if (stopped || !watched || connState !== 'offline' || store.get('tvscreen.on')?.v === true) return;
+      log.info('starting the TV agent again', { why });
+      await launch();
+      lastAutoLaunch = Date.now();
+    } catch (err) {
+      lastCheck = Date.now(); // the TV did not answer or refused: not asked again straight away
+      log.debug('TV agent auto-start skipped', { message: err.message });
+    } finally {
+      checking = false;
+    }
+  }
+  // The TV waking (conn.tv is published on every poll: only the change to 'on' counts).
+  let tvWas = store.get('conn.tv')?.v ?? null;
+  const unpatch = store.on?.('patch', (patch) => {
+    if (!('conn.tv' in patch)) return;
+    const now = patch['conn.tv']?.v ?? null;
+    const woke = now === 'on' && tvWas !== null && tvWas !== 'on';
+    tvWas = now;
+    if (woke) autoLaunch('the TV is on');
+  });
+
   return {
     start,
-    stop,
-    setDemand() {},
+    async stop() {
+      unpatch?.();
+      return stop();
+    },
+    setDemand({ visible = false } = {}) {
+      const opened = visible && !watched;
+      watched = visible;
+      if (opened) autoLaunch('a phone opened Lumen');
+    },
     launch,
     request,
     getIcon,

@@ -12,6 +12,8 @@
   const WATCH_EVERY_MS = 1000;
   const IDLE_EXIT_MS = 30 * 60 * 1000;
   const HIDE_AFTER_MS = 400;
+  const HIDE_RETRY_MS = 1500; // a hide the TV did not act on is tried again this often ...
+  const HIDE_TRIES = 8; // ... this many times in all
   const PROPERTY_TIMEOUT_MS = 3000;
   const ICON_TIMEOUT_MS = 5000;
   const ICON_MAX_PX = 256;
@@ -49,10 +51,22 @@
     statusEl.className = isError ? 'status error' : 'status';
   }
 
+  // Steps aside so the TV's own picture comes back (not while the browser screen is up). One hide()
+  // right after a launch can be lost: seen 25 Oct, the Lumen card stayed in front of the TV for minutes.
+  // So it is tried again until the TV reports the page hidden.
   function hideSoon() {
     if (window.LumenScreen && window.LumenScreen.isActive()) return;
     clearTimeout(hideTimer);
-    hideTimer = setTimeout(function () { read(function () { app.hide(); }); }, HIDE_AFTER_MS);
+    let tries = 0;
+    function tryHide() {
+      hideTimer = null;
+      if (document.hidden || (window.LumenScreen && window.LumenScreen.isActive())) return;
+      if (tries > 0 && window.LumenBox) window.LumenBox.note('hide-retry', tries);
+      tries += 1;
+      read(function () { app.hide(); });
+      if (tries < HIDE_TRIES) hideTimer = setTimeout(tryHide, HIDE_RETRY_MS);
+    }
+    hideTimer = setTimeout(tryHide, HIDE_AFTER_MS);
   }
 
   function quit() {

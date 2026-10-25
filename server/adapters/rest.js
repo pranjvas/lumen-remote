@@ -272,6 +272,23 @@ export function createRest({ config, data, log: rootLog, store, lan }) {
     return { value: foregroundPublished ?? null };
   }
 
+  /**
+   * Asks the TV now about every app Lumen knows (the catalog and the agent's list of installed apps):
+   * → the one in front, or null when none is. Throws when the TV does not answer (asleep, unreachable).
+   * The polled app.foreground can lag minutes behind and misses apps outside the catalog.
+   */
+  async function foregroundSweep() {
+    if (power !== 'on' || stopped) throw new LumenError('TV_OFF', 'The TV is off');
+    const installed = store.get('app.installed')?.v;
+    const ids = [...new Set([...candidates, ...(Array.isArray(installed) ? installed.map((a) => a?.id) : [])])]
+      .filter((id) => typeof id === 'string' && APP_ID.test(id));
+    for (const id of ids) {
+      const app = await fetchApp(id, 'user');
+      if (app?.visible) return app;
+    }
+    return null;
+  }
+
   async function getApp(id) {
     checkId(id);
     const app = await fetchApp(id, 'user');
@@ -350,6 +367,7 @@ export function createRest({ config, data, log: rootLog, store, lan }) {
     },
     getDevice,
     getApp,
+    foregroundSweep,
     launch,
     close,
     foregroundCheck,
