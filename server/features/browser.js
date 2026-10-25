@@ -4,13 +4,15 @@
 // first use, keeps its profile under data/browser-profile, listens on 127.0.0.1 only and closes
 // after idleMs without a viewer. The process-handling follows tools/screenshot.mjs. Clear history
 // (clearHistory, removeProfileData) closes Edge and deletes the chosen kinds of data from the profile.
-// Incognito (setIncognito) runs Edge on a throwaway profile in the temp folder instead.
+// Incognito (setIncognito) runs Edge on a throwaway profile in the temp folder instead. Ads, trackers
+// and pop-under networks (catalog/adblock.js) are refused in the page, its frames, pop-ups and new tabs.
 import { spawn, execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { createAdBlock } from '../catalog/adblock.js';
 import { LumenError } from '../errors.js';
 import { isLoopbackHost } from '../util/addr.js';
 
@@ -184,10 +186,15 @@ export function validateUrl(input, { allowLoopback = false } = {}) {
 // and every request whose URL looks like this PC (the patterns below, URLs as Edge writes them), from
 // a tab's very first request on; guardRequest refuses this PC's. The page's Network.setBlockedURLs
 // refuses the same subresources (and WebSockets, which Fetch does not see).
+//
+// Ad blocking (browser.adBlock) uses the same two: Network.setBlockedURLs refuses ad subresources in
+// the network stack, with no round trip to Lumen, in the page, its cross-site iframes, its pop-ups and
+// tabs Lumen does not show (blockRequests); it never stops a document, so the guard's Fetch pause,
+// which every document of every tab already goes through, refuses pages on ad hosts (refuseAd).
 const LOOPBACK_PATTERNS = ['*://localhost*', '*://*.localhost*', '*://127.*', '*://[::1]*', '*://0.0.0.0*', '*://[::]*',
   '*://[::ffff:7f*', '*://[::7f*', '*://[::ffff:0:0]*', '*://[64:ff9b::7f*'];
-const GUARD_PATTERNS = [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
-  ...LOOPBACK_PATTERNS.map((urlPattern) => ({ urlPattern, requestStage: 'Request' }))];
+const DOCUMENT_PATTERN = { urlPattern: '*', resourceType: 'Document', requestStage: 'Request' };
+const GUARD_PATTERNS = [DOCUMENT_PATTERN, ...LOOPBACK_PATTERNS.map((urlPattern) => ({ urlPattern, requestStage: 'Request' }))];
 // Child targets of the page (cross-site iframes, workers) start paused until they are set up.
 const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
 
@@ -723,6 +730,10 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // Subresource patterns refused in the page and its frames: this PC's own addresses, plus any the
   // config adds (browser.blockedUrls).
   const blockedPatterns = [...(allowLoopback ? [] : LOOPBACK_PATTERNS), ...(Array.isArray(settings.blockedUrls) ? settings.blockedUrls.map(String) : [])];
+  // Ads, trackers and pop-under networks (catalog/adblock.js plus browser.adBlockExtra), unless
+  // browser.adBlock is false. browser.adsBlocked counts what was refused for the page on show.
+  const adBlock = settings.adBlock === false ? null : createAdBlock(settings.adBlockExtra);
+  if (adBlock?.dropped) log.warn('some browser.adBlockExtra entries are not domains or would block a video or CDN host; left out', { count: adBlock.dropped });
   // Video streams the page and its frames loaded (createMediaTracker), fed by the page's Network events.
   const tracker = createMediaTracker({
     readBody: (requestId, sessionId) => (mainPage ?? page)?.send('Network.getResponseBody', { requestId }, sessionId),
@@ -818,6 +829,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   function clearPage() {
     mainUrl = null;
+    resetAdsBlocked();
     publish('url', null);
     publish('title', null);
     publish('loading', false);
@@ -1219,6 +1231,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       pcdp.send('Page.handleJavaScriptDialog', { accept: type === 'alert' || type === 'beforeunload' }).catch(() => {});
     });
     pcdp.on('Inspector.targetCrashed', () => onPopupCrashed(pcdp));
+    // Its cross-site iframes get the block list as the page's do (attachChild).
+    pcdp.on('Target.attachedToTarget', (params) => { attachChild(pcdp, params); });
+    watchAdRequests(pcdp);
     // This PC's pages are refused in the pop-up as everywhere (guardRequest, from its first request on),
     // and a pop-up that asks for one is closed. Should one show such a page anyway, it is closed too.
     const onThisPc = (address) => !allowLoopback && isLoopbackHost(hostOf(address));
@@ -1226,9 +1241,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     pcdp.on('Page.frameNavigated', ({ frame }) => { if (!frame.parentId && onThisPc(frame.url)) refuse(); });
     if (onThisPc(url)) { refuse(); return; }
     try {
-      if (blockedPatterns.length) {
+      // The block list from as soon as the pop-up is attached: a request in its very first moments
+      // (before Target.targetCreated reached Lumen) can come before it.
+      if (blockedPatterns.length || adBlock) {
         await pcdp.send('Network.enable');
-        await pcdp.send('Network.setBlockedURLs', { urls: blockedPatterns });
+        await blockRequests(pcdp);
+        await pcdp.send('Target.setAutoAttach', AUTO_ATTACH);
       }
       await pcdp.send('Inspector.enable').catch(() => {});
       await pcdp.send('Page.enable');
@@ -1377,15 +1395,16 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     for (const [key, ctx] of frameContexts) if (ctx.sessionId === sessionId) frameContexts.delete(key);
   }
 
-  // A child target of the page attached itself paused (AUTO_ATTACH): a cross-site iframe gets the
-  // page's Network watch (its streams) and block list, its frames' contexts and the same auto-attach
-  // for frames nested in it; then, and every other kind (workers) at once, it runs. (This PC's pages
-  // are refused in it by the browser-wide guard, guardRequest.)
+  // A child target of the page (or of a pop-up on show) attached itself paused (AUTO_ATTACH): a
+  // cross-site iframe gets the page's Network watch (its streams) and block list (ads included), its
+  // frames' contexts and the same auto-attach for frames nested in it; then, and every other kind
+  // (workers) at once, it runs. (This PC's pages, and pages on ad hosts, are refused in it by the
+  // browser-wide guard, guardRequest.)
   async function attachChild(cdp, { sessionId, targetInfo }) {
     try {
       if (targetInfo?.type !== 'iframe') return;
       await cdp.send('Network.enable', {}, sessionId);
-      if (blockedPatterns.length) await cdp.send('Network.setBlockedURLs', { urls: blockedPatterns }, sessionId);
+      await blockRequests(cdp, sessionId);
       await cdp.send('Runtime.enable', {}, sessionId);
       await cdp.send('Target.setAutoAttach', AUTO_ATTACH, sessionId);
     } catch (err) {
@@ -1402,12 +1421,19 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
   // request on (a pop-up's or a new tab's included: Target.targetCreated tells of those before their
   // address is known, so no check there could stop it). This PC's addresses are refused, the rest goes
   // on; Lumen's own tabs (openOwnTab) are let through. A tab or window whose own page is refused (a
-  // pop-up, a link opened in a new tab) is closed; the page itself shows Edge's error page.
+  // pop-up, a link opened in a new tab) is closed; the page itself shows Edge's error page. With
+  // allowLoopback on, only documents are paused, for the ad check alone. Pages on ad hosts: refuseAd.
   function guardRequest(conn, { requestId, request, frameId, resourceType }) {
     const url = request?.url;
-    const refused = isLoopbackHost(hostOf(url)) && !(resourceType === 'Document' && ownTabs.has(url));
-    conn.send(refused ? 'Fetch.failRequest' : 'Fetch.continueRequest', refused ? { requestId, errorReason: 'BlockedByClient' } : { requestId })
-      .catch((err) => log.debug('a paused request could not go on', { message: err.message }));
+    const host = hostOf(url);
+    const refused = !allowLoopback && isLoopbackHost(host) && !(resourceType === 'Document' && ownTabs.has(url));
+    // An address someone opened on an ad host (open sets mainUrl first) is theirs to see, and its reloads.
+    const opened = (!frameId || frameId === mainTargetId) && !!mainUrl && mainUrl.split('#')[0] === url;
+    const ad = !refused && resourceType === 'Document' && !opened && !!adBlock?.matches(host);
+    const [method, params] = refused ? ['Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }]
+      : ad ? ['Fetch.failRequest', { requestId, errorReason: 'Aborted' }] : ['Fetch.continueRequest', { requestId }];
+    conn.send(method, params).catch((err) => log.debug('a paused request could not go on', { message: err.message }));
+    if (ad) refuseAd(conn, url, frameId);
     if (!refused) return;
     // A subresource (a capture tab's favicon, say) is no news.
     if (resourceType !== 'Document') { log.debug('refused a request to this PC', { type: resourceType ?? null }); return; }
@@ -1424,6 +1450,101 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     log.info(why);
     browser?.send('Target.closeTarget', { targetId }).catch(() => {});
     if (popup?.id === targetId) closePopup();
+  }
+
+  // ---------- ads, trackers and pop-under networks (browser.adBlock) ----------
+
+  // What was refused for the page on show, its frames, pop-ups and the tabs it opened: browser.adsBlocked,
+  // from 0 at each new document of the page. Never logged with an address.
+  let adsBlocked = 0;
+  function adRefused() {
+    adsBlocked += 1;
+    publish('adsBlocked', adsBlocked);
+  }
+  function resetAdsBlocked() {
+    adsBlocked = 0;
+    publish('adsBlocked', 0);
+  }
+
+  // The block list on a connection or one of its child sessions (Network enabled there): this PC's
+  // addresses and browser.blockedUrls as wildcard patterns, the ad hosts as URL patterns (a host and
+  // everything under it, any scheme and port). An Edge that refuses URL patterns gets the ad hosts as
+  // wildcards instead (those also refuse an address that carries an ad address in its query).
+  // adsOnly: the ad hosts alone (tabs Lumen does not show, see blockInTab).
+  let adWildcards = false;
+  async function blockRequests(cdp, sessionId = undefined, { adsOnly = false } = {}) {
+    const urls = adsOnly ? [] : blockedPatterns;
+    if (!adBlock) {
+      if (urls.length) await cdp.send('Network.setBlockedURLs', { urls }, sessionId);
+      return;
+    }
+    if (!adWildcards) {
+      try {
+        await cdp.send('Network.setBlockedURLs', { urls, urlPatterns: adBlock.urlPatterns }, sessionId);
+        return;
+      } catch { /* tried again below with wildcards; a session that is gone fails there too */ }
+    }
+    await cdp.send('Network.setBlockedURLs', { urls: [...urls, ...adBlock.wildcards] }, sessionId);
+    if (!adWildcards) log.warn('the browser takes no URL patterns in its block list; ad hosts are blocked by wildcard');
+    adWildcards = true;
+  }
+
+  // Counts what Network.setBlockedURLs refused on `cdp` (any of its sessions): it fails a request with
+  // blockedReason 'inspector' and names no address, so the ad requests are noted as they are sent.
+  const AD_REQUESTS_MAX = 200;
+  function watchAdRequests(cdp) {
+    if (!adBlock) return;
+    const sent = new Set(); // `${sessionId}:${requestId}` of ad requests on their way
+    const key = (p, sessionId) => `${sessionId ?? ''}:${p.requestId}`;
+    cdp.on('Network.requestWillBeSent', (p, sessionId) => {
+      if (!adBlock.matchesUrl(p.request?.url)) return;
+      if (sent.size >= AD_REQUESTS_MAX) sent.clear();
+      sent.add(key(p, sessionId));
+    });
+    cdp.on('Network.loadingFinished', (p, sessionId) => sent.delete(key(p, sessionId)));
+    cdp.on('Network.loadingFailed', (p, sessionId) => {
+      if (sent.delete(key(p, sessionId)) && p.blockedReason === 'inspector') adRefused();
+    });
+  }
+
+  // A page on an ad host (paused by the guard, guardRequest): refused with Aborted, which leaves what
+  // asked for it as it was. The page itself (sent there by a click-jacking layer or an ad redirect)
+  // keeps what it showed, or opens a sponsored link's destination (adDestination); a pop-up or new tab
+  // whose own page it is (a pop-under) is closed; an ad frame stays empty.
+  function refuseAd(conn, url, frameId) {
+    adRefused();
+    if (!frameId || frameId === mainTargetId) {
+      const dest = adDestination(url);
+      const cdp = mainPage ?? page;
+      if (dest && cdp) openAdDestination(cdp, dest);
+      else log.debug('refused an ad page');
+      return;
+    }
+    // A tab's id is its main frame's: an ad in a frame of that id is the tab's own page.
+    conn.send('Target.getTargetInfo', { targetId: frameId })
+      .then(({ targetInfo }) => { if (targetInfo?.type === 'page') closeTab(frameId, 'a pop-up or new tab with an ad was closed'); }, () => {});
+  }
+
+  // A sponsored link's click went to an ad-redirect host: the page the ad points at opens instead.
+  function openAdDestination(cdp, dest) {
+    log.info('ad redirect blocked; opening its destination');
+    mainUrl = dest;
+    publish('url', dest);
+    cdp.send('Page.navigate', { url: dest }).catch(() => {});
+  }
+
+  // A tab or window Lumen does not show (a link the middle button opened, a pop-up's own pop-up): the
+  // ad block list applies in it too, from when it is known (its very first requests can come before).
+  // Lumen's own tabs (live video's capture page) are left alone. Its pages are guarded like every other.
+  async function blockInTab(conn, { targetId, url }) {
+    if (ownTabs.has(url) || isLoopbackHost(hostOf(url)) || /^(edge|chrome|devtools|chrome-extension):/i.test(url ?? '')) return;
+    try {
+      const { sessionId } = await conn.send('Target.attachToTarget', { targetId, flatten: true });
+      await conn.send('Network.enable', {}, sessionId);
+      await blockRequests(conn, sessionId, { adsOnly: true });
+    } catch (err) {
+      log.debug('a new tab could not be set up', { message: err.message });
+    }
   }
 
   // The page's renderer crashed (the connection stays open, so nothing else notices): calls waiting
@@ -1523,6 +1644,9 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
         '--disable-quic',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       ] : []),
+      // browser.hostResolverRules (tests: the names their pages use, ad hosts among them, all on this
+      // PC). Never with the VPN, whose rules above must be Edge's only ones.
+      ...(!proxyUrl && typeof settings.hostResolverRules === 'string' && settings.hostResolverRules ? [`--host-resolver-rules=${settings.hostResolverRules}`] : []),
       'about:blank',
     ], { stdio: 'ignore', windowsHide: true });
     launchedProxy = proxyUrl;
@@ -1543,21 +1667,26 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     } catch (err) {
       log.debug('browser process id unknown', { message: err.message });
     }
-    if (!allowLoopback) {
-      // This PC's pages, in every tab, window and frame from here on (guardRequest). Fail closed: no
-      // Edge without it.
+    if (!allowLoopback || adBlock) {
+      // This PC's pages, and pages on ad hosts, in every tab, window and frame from here on
+      // (guardRequest). Fail closed for this PC's: no Edge without it.
       conn.on('Fetch.requestPaused', (params, sessionId) => { if (!sessionId) guardRequest(conn, params); });
-      await conn.send('Fetch.enable', { patterns: GUARD_PATTERNS }).catch((err) => {
+      await conn.send('Fetch.enable', { patterns: allowLoopback ? [DOCUMENT_PATTERN] : GUARD_PATTERNS }).catch((err) => {
+        if (allowLoopback) { log.warn('pages on ad hosts cannot be refused', { message: err.message }); return; }
         throw new LumenError('UNAVAILABLE', `The browser could not keep pages on this PC out: ${err.message}`);
       });
     }
+    // Ad requests refused in tabs Lumen does not show (blockInTab: their sessions are on this connection).
+    watchAdRequests(conn);
     const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' })).json();
     mainTargetId = target.id;
-    // Pop-ups the page opens (sized windows, see PAGE_SCRIPT) are shown while they last.
+    // Pop-ups the page opens (sized windows, see PAGE_SCRIPT) are shown while they last; the ad block
+    // list applies in the other tabs and windows too.
     conn.on('Target.targetCreated', ({ targetInfo }) => {
-      if (targetInfo.type === 'page' && targetInfo.openerId && targetInfo.openerId === mainTargetId) {
+      if (targetInfo.type !== 'page' || targetInfo.targetId === mainTargetId) return;
+      if (targetInfo.openerId && targetInfo.openerId === mainTargetId && !popup) {
         openPopup(targetInfo.targetId, targetInfo.url).catch((err) => log.debug('pop-up attach failed', { message: err.message }));
-      }
+      } else if (adBlock) blockInTab(conn, targetInfo);
     });
     conn.on('Target.targetDestroyed', ({ targetId }) => { if (popup?.id === targetId) closePopup(); });
     // A renderer crash, the page's or a pop-up's (Inspector.targetCrashed on their own connections says it too).
@@ -1581,6 +1710,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
       if (frame.parentId) return;
       titleFromPage = null; // a new document; its script reports the title once it is parsed
       pageCrashed = false; // and a crash from now on is a new one
+      resetAdsBlocked(); // and what it blocks counts from 0
       refreshHistory(cdp);
     });
     onPage('Runtime.bindingCalled', ({ name, payload }) => {
@@ -1615,6 +1745,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     await cdp.send('Inspector.enable').catch((err) => log.debug('crash reports unavailable', { message: err.message }));
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable'); // bindingCalled needs the domain on
+    watchAdRequests(cdp);
     await cdp.send('Network.enable');
     tracker.reset();
     cdp.on('Network.requestWillBeSent', (p, sessionId) => tracker.requestWillBeSent(p, sessionId));
@@ -1624,16 +1755,12 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
     cdp.on('Network.loadingFailed', (p, sessionId) => {
       const r = tracker.loadingFailed(p, sessionId);
       if (sessionId) return; // an ad redirect is the page's own navigation
-      // A blocked ad redirect in the main frame: go to the page the ad points at instead.
+      // A blocked ad redirect in the main frame (the VPN's DNS refuses ad hosts too): go to the page the
+      // ad points at instead. (With the ad block list on, the guard refuses it first: refuseAd.)
       const dest = r?.type === 'Document' && r.frameId === mainFrameId && !p.canceled ? adDestination(r.url) : null;
-      if (dest && cdp === page) {
-        log.info('ad redirect blocked; opening its destination', { host: hostOf(dest) });
-        mainUrl = dest;
-        publish('url', dest);
-        cdp.send('Page.navigate', { url: dest }).catch(() => {});
-      }
+      if (dest && cdp === page) openAdDestination(cdp, dest);
     });
-    if (blockedPatterns.length) await cdp.send('Network.setBlockedURLs', { urls: blockedPatterns });
+    await blockRequests(cdp);
     // Cross-site iframes are targets of their own: attached (paused until set up, see attachChild) so
     // their streams are seen, their videos can be checked and paused, and the blocks apply in them too.
     await cdp.send('Target.setAutoAttach', AUTO_ATTACH);

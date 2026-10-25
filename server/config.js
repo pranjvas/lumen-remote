@@ -46,6 +46,10 @@ export const DEFAULTS = deepFreeze({
   browser: {
     // Pages on this PC (127.0.0.1/localhost) are blocked; tests that serve their own pages turn this on.
     allowLoopback: false,
+    // Ads, trackers and pop-under networks are refused in every page, frame, pop-up and new tab
+    // (server/catalog/adblock.js); adBlockExtra adds domains, each with everything under it.
+    adBlock: true,
+    adBlockExtra: [],
     edgePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
     idleMs: 1_200_000,
     maxFps: 24,
