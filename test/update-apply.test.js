@@ -1,9 +1,10 @@
 // The update helper (tools/update-apply.js) end to end on a throwaway repo: it waits for the old Lumen's process to
-// exit, checks the copy is still as Lumen planned, fast-forwards to the release, reinstalls only when the
-// dependencies changed (node_modules set aside first), starts Lumen and checks its health; on any failure it stops
-// what it started, goes back to the previous commit keeping local edits, puts node_modules back and starts the
-// previous version again. The "server" here is a tiny script answering /api/health with the version in its
-// package.json; "npm" is a stand-in that records calls and can fail, delete node_modules, edit a file or hang.
+// exit, checks the copy is still as Lumen planned, installs changed dependencies in a staging folder first (the
+// working node_modules stays until the new one is complete), fast-forwards to the release, swaps node_modules in,
+// starts Lumen and checks it comes up ready and stays up; on any failure it stops what it started, goes back to the
+// previous commit keeping local edits, puts node_modules back and starts the previous version again. The "server"
+// here is a tiny script answering /api/health with the version in its package.json; "npm" is a stand-in that
+// records calls and can fail, delete node_modules, edit a file or hang.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
@@ -24,9 +25,15 @@ const GOOD_SERVER = `const http = require('http'); const fs = require('fs');
 const v = JSON.parse(fs.readFileSync(__dirname + '/package.json', 'utf8')).version;
 fs.writeFileSync(__dirname + '/server.pid', String(process.pid));
 const fail = () => process.exit(1);
-http.createServer((q, s) => { s.end(JSON.stringify({ ok: true, app: 'lumen', version: v, pid: process.pid })); }).on('error', fail).listen(Number(process.argv[2]), '127.0.0.1');
+http.createServer((q, s) => { s.end(JSON.stringify({ ok: true, app: 'lumen', version: v, pid: process.pid, ready: true })); }).on('error', fail).listen(Number(process.argv[2]), '127.0.0.1');
 if (process.argv[3]) require('net').createServer().on('error', fail).listen(Number(process.argv[3]), '127.0.0.1');`;
 const BAD_SERVER = `process.exit(1);`;
+// Comes up ready, then dies (a release that crashes moments after start-up).
+const CRASHING_SERVER = `const v = JSON.parse(require('fs').readFileSync(__dirname + '/package.json', 'utf8')).version;
+require('http').createServer((q, s) => s.end(JSON.stringify({ ok: true, app: 'lumen', version: v, pid: process.pid, ready: true }))).listen(Number(process.argv[2]), '127.0.0.1');
+setTimeout(() => process.exit(1), 1200);`;
+// An old Lumen that hangs instead of exiting: answers, never stops. (node -e: arguments start at argv[1].)
+const HUNG_SERVER = `require('http').createServer((q, s) => s.end(JSON.stringify({ ok: true, app: 'lumen', version: 'old', pid: process.pid }))).listen(Number(process.argv[1]), '127.0.0.1');`;
 // Answers, but never as the version expected (a release that comes up wrong, or too slowly to count).
 const WRONG_SERVER = `require('fs').writeFileSync(__dirname + '/wrong.pid', String(process.pid));
 require('http').createServer((q, s) => s.end(JSON.stringify({ ok: true, app: 'lumen', version: '9.9.9', pid: process.pid }))).listen(Number(process.argv[2]), '127.0.0.1');`;
@@ -39,12 +46,16 @@ fs.appendFileSync(process.env.FAKE_NPM_LOG, process.argv.slice(2).join(' ') + '\
 console.log('fake npm output');
 if (process.env.FAKE_NPM_RM_MODULES) fs.rmSync(path.join(process.cwd(), 'node_modules'), { recursive: true, force: true });
 // The edit stands for the owner's, made once while the update runs (not again by a second npm run).
-if (process.env.FAKE_NPM_EDIT && fs.readFileSync(process.env.FAKE_NPM_LOG, 'utf8').trim().split('\\n').length === 1) fs.writeFileSync(path.join(process.cwd(), 'notes.txt'), process.env.FAKE_NPM_EDIT);
+if (process.env.FAKE_NPM_EDIT && fs.readFileSync(process.env.FAKE_NPM_LOG, 'utf8').trim().split('\\n').length === 1) fs.writeFileSync(process.env.FAKE_NPM_EDIT_FILE, process.env.FAKE_NPM_EDIT);
 if (process.env.FAKE_NPM_HANG) {
   const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   fs.writeFileSync(process.env.FAKE_NPM_HANG, String(c.pid));
   setInterval(() => {}, 1000);
-} else process.exit(process.env.FAKE_NPM_FAIL ? 1 : 0);`;
+} else if (process.env.FAKE_NPM_FAIL) process.exit(1);
+else {
+  fs.mkdirSync(path.join(process.cwd(), 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(process.cwd(), 'node_modules', 'installed.txt'), 'new install');
+}`;
 
 function freePort() {
   return new Promise((resolve) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
@@ -81,14 +92,26 @@ function plan(from, to, toVersion, extra = {}) {
 }
 const outcome = () => JSON.parse(fs.readFileSync(path.join(dataDir, 'update', 'state.json'), 'utf8'));
 const updateLog = () => fs.readFileSync(path.join(dataDir, 'logs', 'update.log'), 'utf8');
-function runHelper(port, { npm = {}, exitWaitMs = 2000, healthWaitMs = 4000, lanPort = null, npmTimeoutMs = null } = {}) {
+function runHelper(port, { npm = {}, exitWaitMs = 2000, healthWaitMs = 4000, stableMs = 300, lanPort = null, npmTimeoutMs = null, onStart = null } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [HELPER, dataDir, '--repo', repo, '--port', String(port), '--start', `node server.js ${port}${lanPort ? ` ${lanPort}` : ''}`,
-      '--npm', `node ${fakeNpm}`, '--exit-wait-ms', String(exitWaitMs), '--health-wait-ms', String(healthWaitMs),
+      '--npm', `node ${fakeNpm}`, '--exit-wait-ms', String(exitWaitMs), '--health-wait-ms', String(healthWaitMs), '--stable-ms', String(stableMs),
       ...(npmTimeoutMs ? ['--npm-timeout-ms', String(npmTimeoutMs)] : [])],
-    { env: { ...process.env, FAKE_NPM_LOG: npmLog, FAKE_NPM_FAIL: npm.fail ? '1' : '', FAKE_NPM_RM_MODULES: npm.rmModules ? '1' : '', FAKE_NPM_EDIT: npm.edit ?? '', FAKE_NPM_HANG: npm.hang ?? '' }, stdio: 'ignore' });
+    { env: { ...process.env, FAKE_NPM_LOG: npmLog, FAKE_NPM_FAIL: npm.fail ? '1' : '', FAKE_NPM_RM_MODULES: npm.rmModules ? '1' : '', FAKE_NPM_EDIT: npm.edit ?? '',
+      FAKE_NPM_EDIT_FILE: path.join(repo, 'notes.txt'), FAKE_NPM_HANG: npm.hang ?? '' }, stdio: 'ignore' });
+    onStart?.(child);
     child.on('close', (code) => resolve(code));
   });
+}
+// Holds `file` open the way an editor or a virus scanner does (others may read it, not replace or delete it) for
+// `ms`, resolving once the lock is in place.
+async function lockFile(file, ms) {
+  const marker = `${file}.locked`;
+  fs.rmSync(marker, { force: true });
+  const ps = spawn('powershell', ['-NoProfile', '-Command', `$f = [IO.File]::Open('${file}', 'Open', 'Read', 'Read'); Set-Content -LiteralPath '${marker}' x; Start-Sleep -Milliseconds ${ms}; $f.Close(); Remove-Item -LiteralPath '${marker}'`], { stdio: 'ignore', windowsHide: true });
+  for (let i = 0; i < 100 && !fs.existsSync(marker); i++) await sleep(100);
+  assert.ok(fs.existsSync(marker), 'the lock is in place');
+  return ps;
 }
 // Each test starts from where the previous one left the copy (the release it moved to, or the one it went back
 // to), clean.
@@ -110,7 +133,7 @@ before(() => {
   sh(repo, 'config', 'user.email', 't@example.invalid');
   sh(repo, 'config', 'user.name', 'T');
   sh(repo, 'checkout', '-q', '-B', 'master');
-  fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\nnode_modules.*/\n*.pid\n');
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\nnode_modules.*/\n.lumen-update/\n*.pid\n*.locked\n');
   fs.writeFileSync(path.join(repo, 'notes.txt'), 'original');
   release('0.1.0', { lock: '{"v":0}' });
 });
@@ -140,7 +163,7 @@ test('happy path: waits for the old Lumen to stop, moves to the release, no rein
   }
 });
 
-test('a changed package-lock.json reinstalls with npm ci (output in update.log), node_modules set aside and dropped once healthy', async () => {
+test('a changed package-lock.json reinstalls with npm ci in a staging folder (output in update.log), swapped in, the old install dropped once healthy', async () => {
   try {
     const port = await freePort();
     const from = atNewest();
@@ -155,6 +178,9 @@ test('a changed package-lock.json reinstalls with npm ci (output in update.log),
     assert.match(fs.readFileSync(npmLog, 'utf8'), /^ci/m);
     assert.match(updateLog(), /fake npm output/, "npm's output is in update.log");
     assert.equal(fs.existsSync(path.join(repo, 'node_modules.lumen-prev')), false, 'the set-aside copy is gone after a good update');
+    assert.equal(fs.readFileSync(path.join(repo, 'node_modules', 'installed.txt'), 'utf8'), 'new install', 'the new install is in place');
+    assert.equal(fs.existsSync(path.join(repo, 'node_modules', 'marker.txt')), false, 'the old install is gone');
+    assert.equal(fs.existsSync(path.join(repo, '.lumen-update')), false, 'the staging folder is cleaned up');
   } finally {
     killServer();
   }
@@ -257,18 +283,21 @@ test('npm ci that hangs is stopped with everything it started, and rolled back',
   }
 });
 
-test('going back keeps a local edit made while the update ran', async () => {
+test('going back keeps a local edit made while the update ran, and the previous node_modules', async () => {
   try {
     const port = await freePort();
     const from = atNewest();
-    release('0.6.3', { lock: '{"v":6}' });
+    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'node_modules', 'marker.txt'), 'previous install');
+    release('0.6.3', { lock: '{"v":6}', server: BAD_SERVER });
     sh(repo, 'reset', '-q', '--hard', from);
     fs.writeFileSync(npmLog, '');
     plan(from, 'v0.6.3', '0.6.3');
-    assert.equal(await runHelper(port, { npm: { fail: true, edit: 'edited during the update' } }), 0);
+    assert.equal(await runHelper(port, { npm: { edit: 'edited during the update' } }), 0);
     assert.equal(outcome().phase, 'failed');
     assert.equal(sh(repo, 'rev-parse', 'HEAD'), from);
     assert.equal(fs.readFileSync(path.join(repo, 'notes.txt'), 'utf8'), 'edited during the update', 'the edit survives the rollback');
+    assert.equal(fs.readFileSync(path.join(repo, 'node_modules', 'marker.txt'), 'utf8'), 'previous install', 'the previous install is back');
   } finally {
     sh(repo, 'checkout', '-q', '--', 'notes.txt');
     killServer();
@@ -355,5 +384,127 @@ test('an old Lumen that never stops: nothing is moved, no second Lumen is starte
     assert.equal(fs.existsSync(path.join(repo, 'server.pid')), false, 'no second server started');
   } finally {
     stuck.close();
+  }
+});
+
+test('the PC switched off while npm ci runs: the working node_modules is still in place and the copy has not moved', async () => {
+  const grandchild = path.join(root, 'grandchild2.pid');
+  try {
+    const from = atNewest();
+    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'node_modules', 'marker.txt'), 'previous install');
+    release('0.10.0', { lock: '{"v":10}' });
+    sh(repo, 'reset', '-q', '--hard', from);
+    plan(from, 'v0.10.0', '0.10.0');
+    const port = await freePort();
+    await runHelper(port, {
+      npm: { hang: grandchild },
+      onStart: (child) => {
+        // The helper is killed (shut-down, sign-out) once npm ci is under way.
+        const t = setInterval(() => {
+          if (!fs.existsSync(grandchild)) return;
+          clearInterval(t);
+          execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+        }, 100);
+      },
+    });
+    assert.equal(fs.readFileSync(path.join(repo, 'node_modules', 'marker.txt'), 'utf8'), 'previous install', 'Lumen can still start from this copy');
+    assert.equal(sh(repo, 'rev-parse', 'HEAD'), from, 'not moved before the new install was complete');
+  } finally {
+    try { process.kill(Number(fs.readFileSync(grandchild, 'utf8')), 'SIGKILL'); } catch { /* gone */ }
+    killServer();
+  }
+});
+
+test('a state file briefly locked by another program (a virus scanner) does not undo a good update', { skip: process.platform !== 'win32' }, async () => {
+  let ps;
+  try {
+    const port = await freePort();
+    const from = atNewest();
+    release('0.11.0');
+    sh(repo, 'reset', '-q', '--hard', from);
+    plan(from, 'v0.11.0', '0.11.0');
+    ps = await lockFile(path.join(dataDir, 'update', 'state.json'), 7000);
+    assert.equal(await runHelper(port), 0);
+    assert.equal(outcome().phase, 'updated', outcome().error);
+    assert.equal(sh(repo, 'rev-parse', 'HEAD'), sh(repo, 'rev-parse', 'v0.11.0^{commit}'));
+    assert.equal((await health(port))?.version, '0.11.0');
+  } finally {
+    ps?.kill();
+    killServer();
+  }
+});
+
+test('a release that comes up and then crashes is rolled back: it must stay up before it counts', async () => {
+  try {
+    const port = await freePort();
+    const from = atNewest();
+    const fromVersion = version();
+    release('0.12.0', { server: CRASHING_SERVER });
+    sh(repo, 'reset', '-q', '--hard', from);
+    plan(from, 'v0.12.0', '0.12.0');
+    assert.equal(await runHelper(port, { stableMs: 3000 }), 0);
+    assert.equal(outcome().phase, 'failed');
+    assert.match(outcome().error, /did not stay up|stopped/i);
+    assert.equal(sh(repo, 'rev-parse', 'HEAD'), from);
+    assert.equal((await health(port))?.version, fromVersion);
+  } finally {
+    killServer();
+  }
+});
+
+test('an old Lumen that hangs instead of exiting is stopped and started again, with nothing changed', async () => {
+  let old;
+  try {
+    const port = await freePort();
+    const from = atNewest();
+    const fromVersion = version();
+    release('0.13.0');
+    sh(repo, 'reset', '-q', '--hard', from);
+    old = spawn(process.execPath, ['-e', HUNG_SERVER, String(port)], { stdio: 'ignore' });
+    for (let i = 0; i < 50 && !(await health(port)); i++) await sleep(100);
+    plan(from, 'v0.13.0', '0.13.0', { pid: old.pid });
+    assert.equal(await runHelper(port, { exitWaitMs: 1500 }), 0);
+    assert.equal(outcome().phase, 'failed');
+    assert.match(outcome().error, /did not stop/i);
+    assert.equal(alive(old.pid), false, 'the hung Lumen was stopped');
+    assert.equal(sh(repo, 'rev-parse', 'HEAD'), from, 'nothing moved');
+    assert.equal((await health(port))?.version, fromVersion, 'Lumen is running again');
+  } finally {
+    old?.kill();
+    killServer();
+  }
+});
+
+test('a move stopped part-way by a locked file leaves nothing behind, so the next try can succeed', { skip: process.platform !== 'win32' }, async () => {
+  let ps;
+  try {
+    const port = await freePort();
+    const from = atNewest();
+    fs.writeFileSync(path.join(repo, 'zz-last.txt'), 'old');
+    sh(repo, 'add', 'zz-last.txt');
+    sh(repo, 'commit', '-q', '-m', 'a file the next release changes');
+    const base = sh(repo, 'rev-parse', 'HEAD');
+    const v = version();
+    fs.writeFileSync(path.join(repo, 'aa-added.txt'), 'added by the release');
+    fs.writeFileSync(path.join(repo, 'zz-last.txt'), 'new');
+    release('0.14.0');
+    sh(repo, 'reset', '-q', '--hard', base);
+    assert.equal(from !== base, true);
+    plan(base, 'v0.14.0', '0.14.0', { fromVersion: v });
+    ps = await lockFile(path.join(repo, 'zz-last.txt'), 5000);
+    assert.equal(await runHelper(port), 0);
+    assert.equal(outcome().phase, 'failed');
+    assert.equal(sh(repo, 'rev-parse', 'HEAD'), base, 'not moved');
+    assert.equal(fs.existsSync(path.join(repo, 'aa-added.txt')), false, "the release's new file is not left behind");
+    killServer();
+    await new Promise((r) => { if (ps.exitCode !== null) r(); else ps.on('exit', r); });
+    assert.equal(sh(repo, 'status', '--porcelain'), '', 'nothing left in the working tree');
+    plan(base, 'v0.14.0', '0.14.0', { fromVersion: v });
+    assert.equal(await runHelper(port), 0);
+    assert.equal(outcome().phase, 'updated', 'the next try succeeds');
+  } finally {
+    ps?.kill();
+    killServer();
   }
 });

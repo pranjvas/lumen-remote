@@ -179,3 +179,14 @@ test('what a failed move left in the working tree is set aside (git stash), not 
   assert.match(sh(dir, 'stash', 'list'), /Lumen update: left by a failed move/);
   assert.match(sh(dir, 'stash', 'show', '-p'), /half-written/);
 });
+
+test('a file as it is in a commit (null when it is not there), and the files a commit range adds', async () => {
+  const { dir, commit } = scratchRepo('files');
+  const a = commit({ 'package.json': '{"version":"0.1.0"}' }, 'one');
+  const b = commit({ 'package.json': '{"version":"0.2.0"}', 'new.txt': 'n', 'lib.js': 'x' }, 'two');
+  const git = createGit({ cwd: dir });
+  assert.equal(await git.fileAt(a, 'package.json'), '{"version":"0.1.0"}');
+  assert.equal(await git.fileAt(a, 'package-lock.json'), null);
+  assert.deepEqual((await git.addedFiles(a, b)).sort(), ['lib.js', 'new.txt']);
+  assert.deepEqual(await git.addedFiles(b, b), []);
+});

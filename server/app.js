@@ -147,6 +147,7 @@ export async function startServer(overrides = {}, seams = {}) {
       }
     }
     log.info('Lumen ready', { httpPort: http.port, lanPort: lan.port });
+    http.markReady();
 
     let stopping = null;
     return {

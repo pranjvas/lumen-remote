@@ -18,3 +18,7 @@ companion/eyes/obj/
 # agent worktrees and local Claude state; project skills are shared
 .claude/*
 !.claude/skills/
+
+# The updater's working folders (tools/update-apply.js)
+.lumen-update/
+node_modules.lumen-*/

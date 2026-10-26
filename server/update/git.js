@@ -90,6 +90,15 @@ export function createGit({ cwd, run = (args) => runGit(cwd, args) }) {
       };
       return (await deps(a)) !== (await deps(b));
     },
+    /** `file` as committed in `commit` (trimmed), or null when it is not there. */
+    async fileAt(commit, file) {
+      const r = await run(['show', `${commit}:${file}`]);
+      return r.code === 0 ? r.stdout : null;
+    },
+    /** The files commit b has that commit a does not (what moving from a to b creates). */
+    async addedFiles(a, b) {
+      return (await ok(['diff', '--name-only', '--diff-filter=A', a, b])).split('\n').map((f) => f.trim()).filter(Boolean);
+    },
     fastForward: (tag) => ok(['merge', '--ff-only', '--quiet', tag]),
     /** Back to `sha` keeping local edits; refuses (throws) rather than overwrite an edited file. */
     resetKeep: (sha) => ok(['reset', '--keep', '--quiet', sha]),

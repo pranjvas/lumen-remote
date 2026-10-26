@@ -254,3 +254,15 @@ test('hub: update.apply runs "Update now"', async () => {
     await stack.stop();
   }
 });
+
+test('/api/health says ready once start-up has finished (the update helper waits for it before counting a new version)', async () => {
+  const stack = await startStack({ seams: { updateGit: fakeGit({ releaseTags: async () => [] }) } });
+  try {
+    const h = await (await fetch(stack.url('/api/health'))).json();
+    assert.equal(h.ok, true);
+    assert.equal(h.ready, true);
+    assert.equal(h.pid, process.pid);
+  } finally {
+    await stack.stop();
+  }
+});

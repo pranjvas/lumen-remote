@@ -113,6 +113,7 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
   const files = loadStatic();
   if (!files.has('/')) log.warn('web/index.html not found; the UI will not load');
   const startedAt = Date.now();
+  let ready = false; // start-up finished (app.js): the update helper counts a new version only once it is
   const sockets = new Set();
   const alive = new WeakMap();
   let allowedHosts = new Set();
@@ -209,6 +210,7 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
       version: VERSION,
       pid: process.pid,
       uptimeS: Math.round((Date.now() - startedAt) / 1000),
+      ready,
       tv: store.get('conn.tv')?.v ?? 'unknown',
     });
   }
@@ -398,5 +400,5 @@ export async function createHttp({ config, log: rootLog, store, lan, hub, adapte
   }
 
   log.info(`listening on http://${hosts[0]}${lanUrl ? ` and ${lanUrl}` : ''}`);
-  return { port, lanUrl, server, stop };
+  return { port, lanUrl, server, stop, markReady: () => { ready = true; } };
 }
