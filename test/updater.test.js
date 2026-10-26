@@ -170,6 +170,7 @@ test('in use (Lumen on the TV, a TV video, live video, incognito, a file cast to
   }
   const busy = applyHarness({ features: { ai: { busy: () => true } } });
   await busy.updater.check();
+  await busy.updater.evaluate(); // an idle Lumen would start counting here
   busy.advance(10 * 60 * 1000);
   await busy.updater.evaluate();
   assert.equal(busy.spawned.length, 0, 'an Ask Lumen run blocks');
@@ -200,6 +201,8 @@ test('after the restart: updated, failed (not retried by itself, but by "Update 
   assert.equal(bad.status().state, 'failed');
   assert.match(bad.status().reason, /did not answer/);
   await bad.updater.check();
+  assert.equal(bad.status().state, 'failed');
+  assert.match(bad.status().reason ?? '', /did not answer/, 'a check keeps why it failed');
   bad.advance(10 * 60 * 1000);
   await bad.updater.evaluate();
   assert.equal(bad.spawned.length, 0, 'the failed release is not tried again by itself');
@@ -240,6 +243,49 @@ test('it checks again just before applying: local work begun while it waited, or
   assert.equal(bad.spawned.length, 0, '"Try again" does not install a withdrawn release');
   assert.equal(bad.status().state, 'up-to-date');
   await bad.updater.stop();
+});
+
+test('a DLNA cast the TV no longer plays does not hold updates back: Lumen asks the TV, at most once a minute', async () => {
+  let asks = 0;
+  let playing = true;
+  const h = applyHarness({ features: { cast: { refreshDlna: async () => {
+    asks += 1;
+    if (playing) return true;
+    setKey(h, 'cast.session', { kind: 'dlna', state: 'STOPPED' });
+    return false;
+  } } } });
+  setKey(h, 'cast.session', { kind: 'dlna', state: 'PLAYING' });
+  await h.updater.check();
+  await h.updater.evaluate();
+  await h.updater.evaluate();
+  assert.equal(asks, 1, 'asked once, not on every pass');
+  h.advance(10 * 60 * 1000);
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 0, 'still playing on the TV: it waits');
+  assert.equal(asks, 2);
+  playing = false; // the film ended while no phone watched
+  h.advance(61 * 1000);
+  await h.updater.evaluate();
+  assert.equal(asks, 3);
+  await h.updater.evaluate(); // the session now says STOPPED: the idle clock starts
+  h.advance(2 * 60 * 1000);
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 1, 'applied once the TV said it stopped');
+});
+
+test('someone starting to use Lumen while it checks one last time stops an automatic update (not "Update now")', async () => {
+  let h;
+  const git = fakeGit({ fetchTags: async () => { if (h.armed) setKey(h, 'tvscreen.on', true); } });
+  h = applyHarness({ git });
+  await h.updater.check();
+  await h.updater.evaluate();
+  h.advance(2 * 60 * 1000);
+  h.armed = true;
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 0, 'not shut down under them');
+  assert.equal(h.status().state, 'waiting');
+  await h.updater.applyNow();
+  assert.equal(h.spawned.length, 1, '"Update now" is asked for, so it goes ahead');
 });
 
 test('hub: update.apply runs "Update now"', async () => {

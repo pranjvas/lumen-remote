@@ -3,7 +3,7 @@
 // build and sign with the app's own build script, then push and install through sdb).
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { REPO_ROOT } from '../config.js';
 import { compareVersions, parseVersion } from './versions.js';
 
@@ -83,22 +83,41 @@ export function installArgs(app, tooling, { tvHost, repo = REPO_ROOT } = {}) {
     '-App', app, '-TizenCli', tooling.tizenCli, '-Sdb', tooling.sdb, '-TvHost', tvHost, ...(tooling.profile ? ['-SigningProfile', tooling.profile] : [])];
 }
 
-/** Builds, signs and installs `app` on the TV with tools/tvapp-install.ps1 → { ok, error? }. */
-export function installTvApp(app, tooling, { tvHost, repo = REPO_ROOT, log } = {}) {
+// A process and everything it started (the build, sdb).
+function killTree(pid) {
+  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+  else try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+}
+
+/** Builds, signs and installs `app` on the TV with tools/tvapp-install.ps1 → { ok, error? }. Ends with the script's
+ *  own exit (not its output pipes, which a daemon sdb starts can hold open); one that hangs is stopped with
+ *  everything it started after `timeoutMs`. */
+export function installTvApp(app, tooling, { tvHost, repo = REPO_ROOT, log, timeoutMs = INSTALL_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     const child = spawn('powershell', installArgs(app, tooling, { tvHost, repo }), { cwd: repo, windowsHide: true });
     let out = '';
+    let settled = false;
     const keep = (d) => { out = (out + d).slice(-4000); };
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!result.ok) log?.warn?.('TV app install failed', { app, error: result.error });
+      resolve(result);
+    };
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
-    const timer = setTimeout(() => child.kill(), INSTALL_TIMEOUT_MS);
-    child.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, error: err.message }); });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0) return resolve({ ok: true });
-      const last = out.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? `exit ${code}`;
-      log?.warn?.('TV app install failed', { app, error: last });
-      resolve({ ok: false, error: last });
+    const timer = setTimeout(() => {
+      killTree(child.pid);
+      settle({ ok: false, error: `the install did not finish within ${Math.round(timeoutMs / 1000)} s` });
+    }, timeoutMs);
+    child.on('error', (err) => settle({ ok: false, error: err.message }));
+    child.on('exit', (code) => {
+      // The last output may still be on its way.
+      setTimeout(() => {
+        if (code === 0) return settle({ ok: true });
+        settle({ ok: false, error: out.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? `exit ${code}` });
+      }, 200);
     });
   });
 }

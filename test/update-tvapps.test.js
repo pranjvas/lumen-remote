@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { findTooling, installArgs, repoVersions, tvAppUpdates } from '../server/update/tvapps.js';
+import { findTooling, installArgs, installTvApp, repoVersions, tvAppUpdates } from '../server/update/tvapps.js';
 import { createUpdater } from '../server/features/updater.js';
 import { createStore } from '../server/store.js';
 import { createDataStore, REPO_ROOT } from '../server/config.js';
@@ -60,28 +60,29 @@ const releaseGit = (over = {}) => ({
   isAncestor: async () => true, ...over,
 });
 
-function harness({ tooling, git = releaseGit(), tv = 'on', connected = { agent: '0.9.4', eyes: '0.4.0' } }) {
+function harness({ tooling, git = releaseGit(), tv = 'on', connected = { agent: '0.9.4', eyes: '0.4.0' }, install = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumen-tvapps-'));
   dirs.push(dir);
   let clock = 5_000_000;
   const installs = [];
   const launches = [];
+  const spawned = [];
   const store = createStore({ log: createTestLog() });
   const data = createDataStore(dir);
   const updater = createUpdater({
     config: { update: { enabled: false } }, data, log: createTestLog(), store, features: {},
     adapters: { agent: { launch: async () => { launches.push(Date.now()); return { value: 'online' }; } } },
-    git, version: '0.2.0', now: () => clock,
+    git, version: '0.2.0', now: () => clock, spawnHelper: (plan) => { spawned.push(plan); }, requestExit: () => {},
     tvApps: {
       repoVersions: () => ({ agent: '0.9.5', eyes: '0.4.0' }),
       connected: () => connected,
       tooling: () => tooling,
-      install: async (app) => { installs.push(app); return { ok: true }; },
+      install: async (app) => { installs.push(app); return install ? install(app) : { ok: true }; },
     },
   });
   const setTv = (v) => store.set('conn.tv', v, { src: 'live', via: 'test' });
   setTv(tv);
-  return { updater, store, data, installs, launches, setTv, advance: (ms) => { clock += ms; }, tv: () => store.get('update.tvApps')?.v ?? null };
+  return { updater, store, data, installs, launches, spawned, setTv, advance: (ms) => { clock += ms; }, tv: () => store.get('update.tvApps')?.v ?? null };
 }
 const TOOLING = { tizenCli: 'x', sdb: 'y', profile: 'Mine', dotnet: true };
 
@@ -145,4 +146,71 @@ test('an Eyes update needs dotnet to build: without it, it is shown with the man
   assert.deepEqual(h.tv().updates, [{ app: 'eyes', from: '0.3.0', to: '0.4.0' }]);
   assert.equal(h.tv().tooling, false, 'Settings shows how to install it');
   assert.deepEqual(h.installs, []);
+});
+
+// An install that finishes only when told to.
+function pendingInstall() {
+  let finish;
+  const done = new Promise((r) => { finish = () => r({ ok: true }); });
+  return { install: () => done, finish };
+}
+
+test('two idle-gate passes at once start one install, not two', async () => {
+  const p = pendingInstall();
+  const h = harness({ tooling: TOOLING, install: p.install });
+  await h.updater.check();
+  await h.updater.evaluate();
+  h.advance(3 * 60 * 1000);
+  const a = h.updater.evaluate();
+  const b = h.updater.evaluate();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(h.installs, ['agent']);
+  p.finish();
+  await Promise.all([a, b]);
+  assert.deepEqual(h.installs, ['agent']);
+});
+
+test('an update found while a TV app installs waits for the install (Lumen does not exit under it)', async () => {
+  const p = pendingInstall();
+  let tags = [{ tag: 'v0.2.0', version: '0.2.0' }];
+  const h = harness({ tooling: TOOLING, install: p.install, git: releaseGit({ releaseTags: async () => tags }) });
+  await h.updater.check();
+  await h.updater.evaluate();
+  h.advance(3 * 60 * 1000);
+  const installing = h.updater.evaluate();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(h.installs, ['agent'], 'the install is under way');
+  tags = [{ tag: 'v0.3.0', version: '0.3.0' }, ...tags];
+  await h.updater.check();
+  await h.updater.evaluate();
+  await h.updater.applyNow();
+  assert.equal(h.spawned.length, 0, 'neither the idle gate nor "Update now" exits during the install');
+  p.finish();
+  await installing;
+  h.advance(3 * 60 * 1000);
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 1, 'applied once the install is done');
+});
+
+test('an install that hangs (a stuck sdb) is stopped with everything it started, and reported', { skip: process.platform !== 'win32' }, async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'lumen-tvapp-hang-'));
+  dirs.push(repo);
+  fs.mkdirSync(path.join(repo, 'tools'));
+  const pidFile = path.join(repo, 'child.pid');
+  // A stand-in install script whose child (like a hung sdb) keeps the output pipes open.
+  fs.writeFileSync(path.join(repo, 'tools', 'tvapp-install.ps1'), `param($App, $TizenCli, $Sdb, $TvHost, $SigningProfile)
+$p = Start-Process -FilePath '${process.execPath}' -ArgumentList '-e', '"setInterval(() => {}, 1000)"' -NoNewWindow -PassThru
+Set-Content -LiteralPath '${pidFile}' $p.Id
+& '${process.execPath}' -e "setInterval(() => {}, 1000)"
+`);
+  const started = Date.now();
+  const r = await installTvApp('agent', { tizenCli: 'x', sdb: 'y', profile: 'P' }, { tvHost: '10.0.0.9', repo, timeoutMs: 3000 });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /did not finish/);
+  assert.ok(Date.now() - started < 20000, 'it gave up instead of waiting for the hung child');
+  await new Promise((res) => setTimeout(res, 500));
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  assert.equal(alive, false, 'the hung child was stopped too');
 });

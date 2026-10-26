@@ -22,7 +22,8 @@ const IDLE_MS = 2 * 60 * 1000; // idle this long before an update is applied
 const EVALUATE_EVERY_MS = 30_000;
 const STALE_APPLYING_MS = 10 * 60 * 1000; // an 'applying' older than this was interrupted
 const OUTCOME_POLL_MS = 5000;
-const TOOLING_TTL_MS = 10 * 60 * 1000; // the Tizen tooling probe (files on disk) is redone this often // while the helper still says 'applying' after Lumen came back
+const TOOLING_TTL_MS = 10 * 60 * 1000; // the Tizen tooling probe (files on disk) is redone this often
+const DLNA_ASK_EVERY_MS = 60_000; // a cast session that may be stale is checked with the TV this often // while the helper still says 'applying' after Lumen came back
 const IDLE_KEYS = ['tvscreen.on', 'tvscreen.video', 'tvscreen.live', 'browser.incognito', 'cast.session'];
 const PLAYER_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
 const DLNA_ACTIVE = new Set(['PLAYING', 'PAUSED_PLAYBACK', 'TRANSITIONING']); // a file Lumen serves to the TV
@@ -49,6 +50,9 @@ export function createUpdater({
   let idleSince = null;
   let applying = false;
   let failedVersion = null; // a release whose update failed here: not tried again by itself
+  let failedReason = null; // and why
+  let dlnaAskedAt = -Infinity;
+  let tvInstalling = false; // a TV app install is under way (set before its first await)
   let removeListener = null;
   // TV apps (update.tvApps = { updates, tooling, installing, lastResult }): the agent and Eyes of a copy that sits
   // exactly at its release (clean, on master) against the TV's; installed when Lumen is idle and the TV is on,
@@ -115,33 +119,42 @@ export function createUpdater({
     }
     const why = await blocker(newest.tag);
     if (why) return publish({ state: 'left-alone', latest: newest.version, reason: why, checkedAt: now() });
-    if (newest.version === failedVersion) return publish({ state: 'failed', latest: newest.version, tag: newest.tag, checkedAt: now() });
+    if (newest.version === failedVersion) return publish({ state: 'failed', latest: newest.version, tag: newest.tag, reason: failedReason, checkedAt: now() });
     log.info('update available', { from: version, to: newest.version });
     return publish({ state: 'available', latest: newest.version, tag: newest.tag, reason: null, checkedAt: now() });
   }
 
-  // Nobody is watching through Lumen: its browser is not on the TV, no video in the TV's player, no live
-  // video, no file cast to the TV (Lumen serves it), no incognito browsing, no Ask Lumen run. A phone merely
-  // having Lumen open does not count.
-  function inUse() {
+  // What has Lumen in use, or null: its browser on the TV, a video in the TV's player, live video, incognito
+  // browsing, an Ask Lumen run, or (checked last) a file cast to the TV (Lumen serves it). A phone merely having
+  // Lumen open does not count.
+  function inUseBy() {
     const v = (key) => store.get(key)?.v;
-    if (v('tvscreen.on') === true || PLAYER_ACTIVE.has(v('tvscreen.video')) || v('browser.incognito') === true) return true;
-    const cast = v('cast.session');
-    if (cast?.kind === 'dlna' && DLNA_ACTIVE.has(cast.state)) return true;
+    if (v('tvscreen.on') === true || PLAYER_ACTIVE.has(v('tvscreen.video')) || v('browser.incognito') === true) return 'tv';
     const live = v('tvscreen.live');
-    if (live && typeof live === 'object' && live.state && live.state !== 'off') return true;
-    return features.ai?.busy?.() === true;
+    if (live && typeof live === 'object' && live.state && live.state !== 'off') return 'live video';
+    if (features.ai?.busy?.() === true) return 'Ask Lumen';
+    const cast = v('cast.session');
+    if (cast?.kind === 'dlna' && DLNA_ACTIVE.has(cast.state)) return 'cast';
+    return null;
   }
+  const inUse = () => inUseBy() !== null;
 
   /** The idle gate: applies an available update once Lumen has been idle for 2 minutes, else installs a newer
    *  TV app where the tooling is here (→ the apply or install, if it starts one). */
   function evaluate() {
-    const busy = inUse();
+    const by = inUseBy();
+    const busy = by !== null;
     if (busy) idleSince = null;
     else idleSince ??= now();
     const idleLong = !busy && now() - idleSince >= (opts.idleMs ?? IDLE_MS);
+    // A cast session is polled only while a phone shows Lumen, so one that ended unseen still says PLAYING:
+    // when it is all that holds an update back, ask the TV (it marks the session stopped, which re-evaluates).
+    if (by === 'cast' && now() - dlnaAskedAt >= DLNA_ASK_EVERY_MS) {
+      dlnaAskedAt = now();
+      Promise.resolve(features.cast?.refreshDlna?.()).catch(() => {});
+    }
     refreshTvApps();
-    if (applying || !status.auto) return undefined;
+    if (applying || tvInstalling || !status.auto) return undefined;
     if (['available', 'waiting'].includes(status.state)) {
       if (!idleLong) {
         const reason = busy ? 'Lumen is in use' : 'until Lumen is not in use';
@@ -180,11 +193,20 @@ export function createUpdater({
   // One newer TV app at a time, once per version (a failed try is shown, not repeated), only while the TV is on
   // (a TV asleep would waste the try).
   async function installTvApps() {
-    if (tvState.installing || store.get('conn.tv')?.v !== 'on') return;
+    if (tvInstalling || applying || store.get('conn.tv')?.v !== 'on') return;
     const attempted = data.readJson(TV_APPS_FILE, {})?.attempted ?? {};
     const found = currentTooling();
     const next = tvState.updates.find((u) => !attempted[`${u.app}@${u.to}`] && canInstall(u.app, found));
-    if (!next || !(await atRelease())) return;
+    if (!next) return;
+    tvInstalling = true;
+    try {
+      if (await atRelease()) await runTvInstall(next, attempted, found);
+    } finally {
+      tvInstalling = false;
+    }
+  }
+
+  async function runTvInstall(next, attempted, found) {
     log.info('installing TV app update', next);
     publishTv({ installing: next.app });
     data.writeJson(TV_APPS_FILE, { attempted: { ...attempted, [`${next.app}@${next.to}`]: true } });
@@ -199,9 +221,11 @@ export function createUpdater({
   }
 
   // Applies the newest release, checking again first: local work begun while it waited, another branch or a
-  // release withdrawn meanwhile stops it. `retry` ("Try again") also applies a release that failed here.
-  async function apply({ retry = false } = {}) {
+  // release withdrawn meanwhile stops it, and so does someone starting to use Lumen meanwhile (unless asked for:
+  // `manual`). Never during a TV app install. `retry` ("Try again") also applies a release that failed here.
+  async function apply({ retry = false, manual = false } = {}) {
     if (applying) return status;
+    if (tvInstalling) return publish({ state: 'waiting', reason: 'a TV app is being installed' });
     applying = true;
     try {
       await check();
@@ -209,6 +233,11 @@ export function createUpdater({
       if (!ready || !status.tag) {
         applying = false;
         return status;
+      }
+      if (!manual && inUse()) {
+        applying = false;
+        idleSince = null;
+        return publish({ state: 'waiting', reason: 'Lumen is in use' });
       }
       // The helper waits for this process and port to go, and goes back to `fromVersion` on a failure.
       const plan = { from: await git.head(), to: status.tag, toVersion: status.latest, fromVersion: version, pid: process.pid, port: httpPort() };
@@ -228,7 +257,7 @@ export function createUpdater({
   async function applyNow() {
     if (!['available', 'waiting', 'failed'].includes(status.state) || !status.tag) await check();
     if (!['available', 'waiting', 'failed'].includes(status.state) || !status.tag) return status;
-    return apply({ retry: true });
+    return apply({ retry: true, manual: true });
   }
 
   // What the helper left in data/update/state.json (read at start, and while it still says 'applying').
@@ -240,6 +269,7 @@ export function createUpdater({
         const failed = { ...st, phase: 'failed', error: 'the update was interrupted' };
         data.writeJson(STATE_FILE, failed);
         failedVersion = st.toVersion ?? null;
+        failedReason = failed.error;
         publish({ state: 'failed', latest: st.toVersion ?? null, tag: st.to ?? null, reason: failed.error });
         return;
       }
@@ -252,7 +282,8 @@ export function createUpdater({
     if (st.phase === 'updated') publish({ state: 'updated', latest: st.toVersion ?? null, reason: null, updatedAt: st.at ?? null });
     if (st.phase === 'failed') {
       failedVersion = st.toVersion ?? null;
-      publish({ state: 'failed', latest: st.toVersion ?? null, tag: st.to ?? null, reason: st.error ?? 'the update failed' });
+      failedReason = st.error ?? 'the update failed';
+      publish({ state: 'failed', latest: st.toVersion ?? null, tag: st.to ?? null, reason: failedReason });
     }
   }
 
