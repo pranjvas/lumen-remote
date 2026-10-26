@@ -121,6 +121,7 @@ function applyHarness({ version = '0.2.0', git = fakeGit(), auto = true, feature
     version, git, features, now: () => clock,
     spawnHelper: (plan) => { spawned.push(plan); },
     requestExit: () => { exits += 1; },
+    httpPort: () => 4321,
   });
   if (!auto) h.updater.setAuto(false);
   return { ...h, spawned, exits: () => exits, advance: (ms) => { clock += ms; }, clock: () => clock };
@@ -136,7 +137,8 @@ test('an update is applied once Lumen has been idle for 2 minutes: the plan is w
   h.advance(2 * 60 * 1000);
   await h.updater.evaluate();
   assert.equal(h.spawned.length, 1);
-  assert.deepEqual(h.spawned[0], { from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0' });
+  assert.deepEqual(h.spawned[0], { from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0', fromVersion: '0.2.0', pid: process.pid, port: 4321 },
+    'the helper waits for this process and this port, and knows which version to go back to');
   const plan = h.data.readJson('update/state.json', null);
   assert.equal(plan.phase, 'applying');
   assert.equal(plan.to, 'v0.3.0');
@@ -146,11 +148,13 @@ test('an update is applied once Lumen has been idle for 2 minutes: the plan is w
   assert.equal(h.spawned.length, 1, 'only once');
 });
 
-test('in use (Lumen on the TV, a TV video, live video, incognito, an Ask Lumen run): it waits, and counts 2 minutes from when that ends', async () => {
-  for (const [key, value, idle] of [['tvscreen.on', true, false], ['tvscreen.video', 'playing', null], ['tvscreen.live', { state: 'playing' }, { state: 'off' }], ['browser.incognito', true, false]]) {
+test('in use (Lumen on the TV, a TV video, live video, incognito, a file cast to the TV from Lumen, an Ask Lumen run): it waits, and counts 2 minutes from when that ends', async () => {
+  for (const [key, value, idle] of [['tvscreen.on', true, false], ['tvscreen.video', 'playing', null], ['tvscreen.live', { state: 'playing' }, { state: 'off' }], ['browser.incognito', true, false],
+    ['cast.session', { kind: 'dlna', state: 'PAUSED_PLAYBACK' }, { kind: 'dlna', state: 'STOPPED' }]]) {
     const h = applyHarness();
     setKey(h, key, value);
     await h.updater.check();
+    await h.updater.evaluate(); // an idle Lumen would start counting here
     h.advance(10 * 60 * 1000);
     await h.updater.evaluate();
     assert.equal(h.spawned.length, 0, `${key} blocks`);
@@ -210,6 +214,32 @@ test('after the restart: updated, failed (not retried by itself, but by "Update 
   assert.match(stale.status().reason, /interrupted/);
   assert.equal(stale.data.readJson('update/state.json', null).phase, 'failed');
   for (const x of [done, bad, stale]) await x.updater.stop();
+});
+
+test('it checks again just before applying: local work begun while it waited, or a release withdrawn meanwhile, stops it', async () => {
+  let dirty = false;
+  const h = applyHarness({ git: fakeGit({ isDirty: async () => dirty }) });
+  await h.updater.check();
+  await h.updater.evaluate();
+  assert.equal(h.status().state, 'waiting');
+  dirty = true; // the owner starts editing while Lumen waits to be idle
+  h.advance(2 * 60 * 1000);
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 0, 'not applied over local changes');
+  assert.equal(h.status().state, 'left-alone');
+  assert.equal(h.status().reason, 'local changes');
+
+  let tags = [{ tag: 'v0.3.0', version: '0.3.0' }];
+  const bad = applyHarness({ git: fakeGit({ releaseTags: async () => tags }) });
+  bad.data.writeJson('update/state.json', { phase: 'failed', from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0', at: bad.clock(), error: 'x' });
+  bad.updater.start();
+  await bad.updater.check();
+  assert.equal(bad.status().state, 'failed');
+  tags = []; // withdrawn
+  await bad.updater.applyNow();
+  assert.equal(bad.spawned.length, 0, '"Try again" does not install a withdrawn release');
+  assert.equal(bad.status().state, 'up-to-date');
+  await bad.updater.stop();
 });
 
 test('hub: update.apply runs "Update now"', async () => {

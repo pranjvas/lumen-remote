@@ -125,7 +125,7 @@ export async function startServer(overrides = {}, seams = {}) {
     // Automatic updates from this copy's git origin (features/updater.js).
     // To apply an update Lumen shuts down as on Ctrl+C (server/index.js) and the update helper takes over.
     features.updater = createUpdater({
-      ...ctx, features, adapters, requestExit: () => process.emit('lumen:exit-for-update'),
+      ...ctx, features, adapters, requestExit: () => process.emit('lumen:exit-for-update'), httpPort: () => http?.port ?? config.http.port,
       ...(seams.updateGit && { git: seams.updateGit }),
     });
 

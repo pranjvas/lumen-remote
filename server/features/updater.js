@@ -22,8 +22,9 @@ const IDLE_MS = 2 * 60 * 1000; // idle this long before an update is applied
 const EVALUATE_EVERY_MS = 30_000;
 const STALE_APPLYING_MS = 10 * 60 * 1000; // an 'applying' older than this was interrupted
 const OUTCOME_POLL_MS = 5000; // while the helper still says 'applying' after Lumen came back
-const IDLE_KEYS = ['tvscreen.on', 'tvscreen.video', 'tvscreen.live', 'browser.incognito'];
+const IDLE_KEYS = ['tvscreen.on', 'tvscreen.video', 'tvscreen.live', 'browser.incognito', 'cast.session'];
 const PLAYER_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
+const DLNA_ACTIVE = new Set(['PLAYING', 'PAUSED_PLAYBACK', 'TRANSITIONING']); // a file Lumen serves to the TV
 
 /** Starts tools/update-apply.js detached and hidden: it outlives this server. */
 function spawnUpdateHelper(dataDir) {
@@ -36,6 +37,7 @@ function spawnUpdateHelper(dataDir) {
 export function createUpdater({
   config, data, log: rootLog, store, features = {}, adapters = {}, requestExit = () => {}, git = createGit({ cwd: REPO_ROOT }),
   version = VERSION, now = Date.now, spawnHelper = () => spawnUpdateHelper(data.dir), tvApps: tvAppsSeam = null,
+  httpPort = () => config.http?.port,
 }) {
   const log = rootLog.child('update');
   const opts = config.update ?? {};
@@ -49,12 +51,13 @@ export function createUpdater({
   let removeListener = null;
   // TV apps (update.tvApps = { updates, tooling, installing, lastResult }): this copy's agent and Eyes
   // against the TV's; installed when Lumen is idle where this PC has the Tizen tooling.
-  const tvApps = tvAppsSeam ?? {
+  const tvApps = {
     repoVersions: () => repoVersions(REPO_ROOT),
     connected: () => ({ agent: adapters.agent?.version?.() ?? null, eyes: adapters.eyes?.version?.() ?? null }),
     tooling: () => findTooling({ config }),
     install: (app, tooling) => installTvApp(app, tooling, { tvHost: config.tv?.host, log }),
     afterInstall: async (app) => { if (app === 'agent') await adapters.agent?.launch?.().catch(() => {}); },
+    ...tvAppsSeam,
   };
   let tvState = { updates: [], tooling: false, installing: null, lastResult: null };
   let tvShape = '';
@@ -101,10 +104,13 @@ export function createUpdater({
   }
 
   // Nobody is watching through Lumen: its browser is not on the TV, no video in the TV's player, no live
-  // video, no incognito browsing, no Ask Lumen run. A phone merely having Lumen open does not count.
+  // video, no file cast to the TV (Lumen serves it), no incognito browsing, no Ask Lumen run. A phone merely
+  // having Lumen open does not count.
   function inUse() {
     const v = (key) => store.get(key)?.v;
     if (v('tvscreen.on') === true || PLAYER_ACTIVE.has(v('tvscreen.video')) || v('browser.incognito') === true) return true;
+    const cast = v('cast.session');
+    if (cast?.kind === 'dlna' && DLNA_ACTIVE.has(cast.state)) return true;
     const live = v('tvscreen.live');
     if (live && typeof live === 'object' && live.state && live.state !== 'off') return true;
     return features.ai?.busy?.() === true;
@@ -167,11 +173,20 @@ export function createUpdater({
     refreshTvApps();
   }
 
-  async function apply() {
-    if (applying || !status.tag) return status;
+  // Applies the newest release, checking again first: local work begun while it waited, another branch or a
+  // release withdrawn meanwhile stops it. `retry` ("Try again") also applies a release that failed here.
+  async function apply({ retry = false } = {}) {
+    if (applying) return status;
     applying = true;
     try {
-      const plan = { from: await git.head(), to: status.tag, toVersion: status.latest };
+      await check();
+      const ready = status.state === 'available' || (retry && status.state === 'failed');
+      if (!ready || !status.tag) {
+        applying = false;
+        return status;
+      }
+      // The helper waits for this process and port to go, and goes back to `fromVersion` on a failure.
+      const plan = { from: await git.head(), to: status.tag, toVersion: status.latest, fromVersion: version, pid: process.pid, port: httpPort() };
       data.writeJson(STATE_FILE, { phase: 'applying', ...plan, at: now() });
       log.info('applying update', { from: version, to: plan.toVersion });
       publish({ state: 'applying', reason: null });
@@ -188,7 +203,7 @@ export function createUpdater({
   async function applyNow() {
     if (!['available', 'waiting', 'failed'].includes(status.state) || !status.tag) await check();
     if (!['available', 'waiting', 'failed'].includes(status.state) || !status.tag) return status;
-    return apply();
+    return apply({ retry: true });
   }
 
   // What the helper left in data/update/state.json (read at start, and while it still says 'applying').
