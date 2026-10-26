@@ -55,6 +55,11 @@ test('a release bumps the version (lockfile too, a dependency\'s own version unt
   assert.equal(sh(repo, 'rev-parse', 'origin/master'), sh(repo, 'rev-parse', 'HEAD'), 'master pushed');
 });
 
+test('a release alone changes no dependencies: the update helper does not reinstall for it', async () => {
+  const { createGit } = await import('../server/update/git.js');
+  assert.equal(await createGit({ cwd: repo }).depsChanged('HEAD~1', 'v0.2.0'), false);
+});
+
 test('refuses (and changes nothing) when the copy is not ready or the version is wrong', () => {
   const head = sh(repo, 'rev-parse', 'HEAD');
   for (const [args, why] of [[['0.2.0'], /higher/], [['0.1.9'], /higher/], [['1.2'], /X\.Y\.Z/]]) {

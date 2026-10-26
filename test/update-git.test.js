@@ -90,11 +90,10 @@ test('dirty tree, branch, ancestry and fast-forward', async () => {
   const head = await git.head();
   const tagCommit = await git.commitOf('v0.4.0');
   assert.equal(await git.isAncestor(head, tagCommit), true);
-  assert.equal(await git.changed(head, tagCommit, 'package.json'), true);
-  assert.equal(await git.changed(head, tagCommit, 'package-lock.json'), false);
+  assert.equal(await git.depsChanged(head, tagCommit), false, 'no package-lock.json on either side');
   await git.fastForward('v0.4.0');
   assert.equal(await git.head(), tagCommit);
-  await git.resetHard(head);
+  await git.resetKeep(head);
   assert.equal(await git.head(), head);
 
   // This copy with its own commit is not an ancestor of the release.
@@ -119,4 +118,64 @@ test('not a git copy, and a fetch that fails, are reported rather than thrown aw
   sh(root, 'clone', '-q', origin, lost);
   sh(lost, 'remote', 'set-url', 'origin', path.join(root, 'no-such-origin.git'));
   await assert.rejects(createGit({ cwd: lost }).fetchTags(), (err) => /origin|repository|not found|does not appear/i.test(err.message));
+});
+
+function scratchRepo(name) {
+  const dir = path.join(root, name);
+  sh(root, 'init', '-q', '-b', 'master', dir);
+  sh(dir, 'config', 'user.email', 'test@example.invalid');
+  sh(dir, 'config', 'user.name', 'Test');
+  const commit = (files, message) => {
+    for (const [file, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, file), text);
+    sh(dir, 'add', '-A');
+    sh(dir, 'commit', '-q', '-m', message);
+    return sh(dir, 'rev-parse', 'HEAD');
+  };
+  return { dir, commit };
+}
+
+test('dependencies changed: package-lock.json compared without its own version, so a release bump alone is no change', async () => {
+  const { dir, commit } = scratchRepo('deps');
+  const lock = (v, ws) => JSON.stringify({ name: 'lumen-remote', version: v, lockfileVersion: 3, requires: true, packages: {
+    '': { name: 'lumen-remote', version: v, dependencies: { ws: `^${ws}` } }, 'node_modules/ws': { version: ws } } }, null, 2);
+  const none = commit({ 'README.md': 'x' }, 'no lockfile yet');
+  const a = commit({ 'package-lock.json': lock('0.1.0', '8.0.0') }, 'lock');
+  const b = commit({ 'package-lock.json': lock('0.2.0', '8.0.0') }, 'Release v0.2.0');
+  const c = commit({ 'package-lock.json': lock('0.2.0', '8.1.0') }, 'ws 8.1.0');
+  const git = createGit({ cwd: dir });
+  assert.equal(await git.depsChanged(a, b), false, 'only the version bump');
+  assert.equal(await git.depsChanged(b, c), true, 'a dependency changed');
+  assert.equal(await git.depsChanged(a, c), true);
+  assert.equal(await git.depsChanged(none, a), true, 'a lockfile appeared');
+  assert.equal(await git.depsChanged(none, none), false);
+});
+
+test('going back keeps local edits: a file the move does not touch stays edited, and an edited file it would overwrite stops it', async () => {
+  const { dir, commit } = scratchRepo('keep');
+  const c1 = commit({ 'a.txt': '1', 'b.txt': '1' }, 'one');
+  const c2 = commit({ 'a.txt': '2' }, 'two');
+  const git = createGit({ cwd: dir });
+  const read = (f) => fs.readFileSync(path.join(dir, f), 'utf8');
+  fs.writeFileSync(path.join(dir, 'b.txt'), 'edited');
+  await git.resetKeep(c1);
+  assert.equal(await git.head(), c1);
+  assert.equal(read('a.txt'), '1');
+  assert.equal(read('b.txt'), 'edited', 'the edit survives going back');
+  sh(dir, 'reset', '-q', '--keep', c2);
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'mine');
+  await assert.rejects(git.resetKeep(c1));
+  assert.equal(read('a.txt'), 'mine', 'never overwritten');
+  assert.equal(await git.head(), c2);
+});
+
+test('what a failed move left in the working tree is set aside (git stash), not deleted', async () => {
+  const { dir, commit } = scratchRepo('aside');
+  commit({ 'a.txt': '1' }, 'one');
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'half-written');
+  const git = createGit({ cwd: dir });
+  await git.setAside('Lumen update: left by a failed move');
+  assert.equal(await git.isDirty(), false);
+  assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), '1');
+  assert.match(sh(dir, 'stash', 'list'), /Lumen update: left by a failed move/);
+  assert.match(sh(dir, 'stash', 'show', '-p'), /half-written/);
 });

@@ -73,12 +73,27 @@ export function createGit({ cwd, run = (args) => runGit(cwd, args) }) {
       const r = await run(['merge-base', '--is-ancestor', a, b]);
       return r.code === 0;
     },
-    /** Whether `file` differs between commits a and b. */
-    async changed(a, b, file) {
-      const r = await run(['diff', '--quiet', a, b, '--', file]);
-      return r.code !== 0;
+    /** Whether the dependencies differ between commits a and b: package-lock.json without its own version
+     *  (which every release bumps), so only a real dependency change needs `npm ci`. */
+    async depsChanged(a, b) {
+      const deps = async (commit) => {
+        const r = await run(['show', `${commit}:package-lock.json`]);
+        if (r.code !== 0) return null;
+        try {
+          const lock = JSON.parse(r.stdout);
+          delete lock.version;
+          if (lock.packages?.['']) delete lock.packages[''].version;
+          return JSON.stringify(lock);
+        } catch {
+          return r.stdout;
+        }
+      };
+      return (await deps(a)) !== (await deps(b));
     },
     fastForward: (tag) => ok(['merge', '--ff-only', '--quiet', tag]),
-    resetHard: (sha) => ok(['reset', '--hard', '--quiet', sha]),
+    /** Back to `sha` keeping local edits; refuses (throws) rather than overwrite an edited file. */
+    resetKeep: (sha) => ok(['reset', '--keep', '--quiet', sha]),
+    /** Puts the working tree's changes in a stash named `message` (recoverable, never deleted). */
+    setAside: (message) => ok(['stash', 'push', '--quiet', '-m', message]),
   };
 }
