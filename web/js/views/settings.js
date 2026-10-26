@@ -634,7 +634,26 @@ function updateRows(ctx, { watch }) {
     fill(actions, ['available', 'waiting'].includes(s.state) ? updateNow : null, s.state === 'failed' ? tryAgain : null, s.state === 'applying' ? null : checkNow);
     sw.setAttribute('aria-checked', s.auto === false ? 'false' : 'true');
   });
-  return [version, auto];
+  // TV apps (update.tvApps): a newer agent or Eyes in this copy than on the TV.
+  const tvText = h('span', { class: 'row-text' });
+  const tvRow = h('div', { class: 'row row-readonly', hidden: true },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'TV apps' }), h('span', { class: 'hint', text: 'The Lumen agent and Lumen Eyes on the TV' })),
+    h('div', { class: 'row-control' }, tvText), h('div', { class: 'row-badge' }));
+  const NAMES = { agent: 'Agent', eyes: 'Eyes' };
+  watch(['update.tvApps'], () => {
+    const t = ctx.state.value('update.tvApps', null);
+    const updates = Array.isArray(t?.updates) ? t.updates : [];
+    const last = t?.lastResult;
+    tvRow.hidden = !updates.length && !t?.installing && !(last && !last.ok);
+    if (tvRow.hidden) return;
+    const list = updates.map((u) => `${NAMES[u.app] || u.app} ${u.from} → ${u.to}`).join(' · ');
+    if (t.installing) fill(tvText, statusDot('warn'), `Installing ${NAMES[t.installing] || t.installing} on the TV…`);
+    else if (last && !last.ok) fill(tvText, statusDot('bad'), `Could not install ${NAMES[last.app] || last.app} ${last.version}: ${last.error}`);
+    else fill(tvText, statusDot('warn'), `Update available: ${list}`, h('span', { class: 'muted', text: t.tooling
+      ? ' · installs by itself when Lumen is not in use'
+      : ' · install it with Apps2Samsung or the Tizen tools on this PC (docs/SETUP.md, “Install the TV agent”)' }));
+  });
+  return [version, auto, tvRow];
 }
 
 function phoneRows() {

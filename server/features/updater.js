@@ -11,11 +11,13 @@ import { spawn } from 'node:child_process';
 import { REPO_ROOT, VERSION } from '../config.js';
 import { createGit } from '../update/git.js';
 import { compareVersions } from '../update/versions.js';
+import { findTooling, installTvApp, repoVersions, tvAppUpdates } from '../update/tvapps.js';
 
 const FIRST_CHECK_MS = 60_000;
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
 const SETTINGS_FILE = 'update/settings.json';
 const STATE_FILE = 'update/state.json';
+const TV_APPS_FILE = 'update/tvapps.json'; // { attempted: { 'agent@0.9.5': true } }: one try per version
 const IDLE_MS = 2 * 60 * 1000; // idle this long before an update is applied
 const EVALUATE_EVERY_MS = 30_000;
 const STALE_APPLYING_MS = 10 * 60 * 1000; // an 'applying' older than this was interrupted
@@ -32,8 +34,8 @@ function spawnUpdateHelper(dataDir) {
 }
 
 export function createUpdater({
-  config, data, log: rootLog, store, features = {}, requestExit = () => {}, git = createGit({ cwd: REPO_ROOT }),
-  version = VERSION, now = Date.now, spawnHelper = () => spawnUpdateHelper(data.dir),
+  config, data, log: rootLog, store, features = {}, adapters = {}, requestExit = () => {}, git = createGit({ cwd: REPO_ROOT }),
+  version = VERSION, now = Date.now, spawnHelper = () => spawnUpdateHelper(data.dir), tvApps: tvAppsSeam = null,
 }) {
   const log = rootLog.child('update');
   const opts = config.update ?? {};
@@ -45,6 +47,17 @@ export function createUpdater({
   let applying = false;
   let failedVersion = null; // a release whose update failed here: not tried again by itself
   let removeListener = null;
+  // TV apps (update.tvApps = { updates, tooling, installing, lastResult }): this copy's agent and Eyes
+  // against the TV's; installed when Lumen is idle where this PC has the Tizen tooling.
+  const tvApps = tvAppsSeam ?? {
+    repoVersions: () => repoVersions(REPO_ROOT),
+    connected: () => ({ agent: adapters.agent?.version?.() ?? null, eyes: adapters.eyes?.version?.() ?? null }),
+    tooling: () => findTooling({ config }),
+    install: (app, tooling) => installTvApp(app, tooling, { tvHost: config.tv?.host, log }),
+    afterInstall: async (app) => { if (app === 'agent') await adapters.agent?.launch?.().catch(() => {}); },
+  };
+  let tvState = { updates: [], tooling: false, installing: null, lastResult: null };
+  let tvShape = '';
 
   function readAuto() {
     const saved = data.readJson(SETTINGS_FILE, {});
@@ -97,20 +110,61 @@ export function createUpdater({
     return features.ai?.busy?.() === true;
   }
 
-  /** The idle gate: applies an available update once Lumen has been idle for 2 minutes (→ the apply, if it starts one). */
+  /** The idle gate: applies an available update once Lumen has been idle for 2 minutes, else installs a newer
+   *  TV app where the tooling is here (→ the apply or install, if it starts one). */
   function evaluate() {
-    if (applying || !status.auto || !['available', 'waiting'].includes(status.state)) return;
-    if (inUse()) {
-      idleSince = null;
-      if (status.state !== 'waiting') publish({ state: 'waiting', reason: 'Lumen is in use' });
-      return;
+    const busy = inUse();
+    if (busy) idleSince = null;
+    else idleSince ??= now();
+    const idleLong = !busy && now() - idleSince >= (opts.idleMs ?? IDLE_MS);
+    refreshTvApps();
+    if (applying || !status.auto) return undefined;
+    if (['available', 'waiting'].includes(status.state)) {
+      if (!idleLong) {
+        const reason = busy ? 'Lumen is in use' : 'until Lumen is not in use';
+        if (status.state !== 'waiting' || status.reason !== reason) publish({ state: 'waiting', reason });
+        return undefined;
+      }
+      return apply().catch((err) => log.warn('could not start the update', { message: err.message }));
     }
-    idleSince ??= now();
-    if (now() - idleSince < (opts.idleMs ?? IDLE_MS)) {
-      if (status.state !== 'waiting') publish({ state: 'waiting', reason: 'until Lumen is not in use' });
-      return;
+    return idleLong ? installTvApps() : undefined;
+  }
+
+  function publishTv(patch = {}) {
+    tvState = { ...tvState, ...patch };
+    const shape = JSON.stringify(tvState);
+    if (shape === tvShape) return;
+    tvShape = shape;
+    store.set('update.tvApps', tvState, meta);
+  }
+
+  function refreshTvApps() {
+    try {
+      publishTv({ updates: tvAppUpdates({ repo: tvApps.repoVersions(), connected: tvApps.connected() }), tooling: Boolean(tvApps.tooling()) });
+    } catch (err) {
+      log.debug('TV app versions unreadable', { message: err.message });
     }
-    return apply().catch((err) => log.warn('could not start the update', { message: err.message }));
+  }
+
+  // One newer TV app at a time, once per version (a failed try is shown, not repeated).
+  async function installTvApps() {
+    if (tvState.installing) return;
+    const attempted = data.readJson(TV_APPS_FILE, {})?.attempted ?? {};
+    const next = tvState.updates.find((u) => !attempted[`${u.app}@${u.to}`]);
+    const tooling = next ? tvApps.tooling() : null;
+    if (!next || !tooling) return;
+    log.info('installing TV app update', next);
+    publishTv({ installing: next.app });
+    data.writeJson(TV_APPS_FILE, { attempted: { ...attempted, [`${next.app}@${next.to}`]: true } });
+    let result;
+    try {
+      result = await tvApps.install(next.app, tooling);
+    } catch (err) {
+      result = { ok: false, error: err.message };
+    }
+    if (result.ok) await tvApps.afterInstall(next.app);
+    publishTv({ installing: null, lastResult: { app: next.app, version: next.to, ok: result.ok === true, error: result.error ?? null, at: now() } });
+    refreshTvApps();
   }
 
   async function apply() {
@@ -186,12 +240,13 @@ export function createUpdater({
     start() {
       publish({ auto: readAuto() });
       readOutcome();
+      refreshTvApps();
       if (opts.enabled === false) return;
       timers.push(setTimeout(() => check(), opts.firstCheckMs ?? FIRST_CHECK_MS));
       timers.push(setInterval(() => check(), opts.checkEveryMs ?? CHECK_EVERY_MS));
       timers.push(setInterval(() => evaluate(), EVALUATE_EVERY_MS));
       for (const t of timers) t.unref?.();
-      removeListener = store.on('patch', (patch) => { if (IDLE_KEYS.some((k) => k in patch)) evaluate(); });
+      removeListener = store.on('patch', (patch) => { if (IDLE_KEYS.some((k) => k in patch) || 'conn.agent' in patch || 'conn.eyes' in patch) evaluate(); });
     },
     async stop() {
       removeListener?.();

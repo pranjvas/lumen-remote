@@ -540,6 +540,8 @@ export function createEyes({ config, data, log: rootLog, store, lan, agent }) {
   // ---- lifecycle ----
 
   return {
+    /** Eyes' version while connected (null otherwise). */
+    version: () => version,
     start() {
       if (started) return;
       started = true;

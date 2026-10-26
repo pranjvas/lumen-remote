@@ -416,6 +416,7 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
   }
   /** Bytes of live video sent but not yet taken by the TV (or waiting in the socket). */
   const bufferedAmount = () => videoBacklog().bytes;
+  let agentVersion = null; // the version the agent last said it is (its hello), for the updater
 
   async function onHello(msg) {
     // The agent's black box: what happened on the TV before it was last cut off.
@@ -423,6 +424,7 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
     streamed.clear();
     clearTimeout(launchTimer);
     const version = str(msg.agent, 40);
+    agentVersion = version || agentVersion;
     const pcHost = str(msg.pcHost, 64);
     setConn('online');
     log.info('agent connected', { version, pcHost });
@@ -770,6 +772,8 @@ export function createAgent({ config, data, log: rootLog, store, lan, rest }) {
 
   return {
     start,
+    /** The agent's version as it last reported it (null before it ever connected). */
+    version: () => agentVersion,
     async stop() {
       unpatch?.();
       return stop();
