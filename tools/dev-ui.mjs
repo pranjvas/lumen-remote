@@ -365,6 +365,23 @@ const BROWSER_COMMANDS = {
     patch([['tvscreen.on', false, { src: 'derived', via: 'tvscreen' }]]);
     return { value: { on: false } };
   },
+  // Automatic updates (server/features/updater.js): the fake status moves as the real one would.
+  'update.check': () => {
+    const s = { ...(records.get('update.status')?.v ?? { current: '0.2.0', latest: null, state: 'up-to-date', auto: true }), checkedAt: Date.now() };
+    patch([['update.status', s, { src: 'derived', via: 'update' }]]);
+    return { value: s };
+  },
+  'update.setAuto': ({ on }) => {
+    if (typeof on !== 'boolean') throw Object.assign(new Error('on must be true or false'), { code: 'INVALID' });
+    const s = { ...(records.get('update.status')?.v ?? {}), auto: on };
+    patch([['update.status', s, { src: 'derived', via: 'update' }]]);
+    return { value: s };
+  },
+  'update.apply': () => {
+    const s = { ...(records.get('update.status')?.v ?? {}), state: 'applying' };
+    patch([['update.status', s, { src: 'derived', via: 'update' }]]);
+    return { value: s };
+  },
   // The phone's controls for the video on the TV (server/features/tvscreen.js control()): the fake
   // TV player's clock (tvscreen.playback, set through POST /dev/state) moves, else the page's video.
   'tvscreen.control': ({ action, position, by }) => {
