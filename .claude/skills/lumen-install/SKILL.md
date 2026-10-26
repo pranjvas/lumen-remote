@@ -81,6 +81,16 @@ git push -u origin master               # the repo's main branch is master
 
 Retry a failed push up to 4 times with backoff (2, 4, 8, 16 s) when the failure is a network error.
 
+A push ships nothing to other copies. To deliver it, publish a release (after the change is verified on the TV):
+
+```powershell
+npm run release -- 0.3.0 --notes "What changed, in a line or two"   # bump, commit, tag v0.3.0, push, GitHub Release
+npm run release -- 0.3.0 --dry-run                                  # what it would do
+npm run release -- --withdraw 0.3.0                                 # take a bad release back (fix forward with a newer one)
+```
+
+Every copy (Settings → Updates) installs it when idle, restarts and rolls back by itself if it doesn't start; a newer TV agent or Eyes in the release installs on PCs with the Tizen tools.
+
 ## Troubleshooting
 
 See the table in `docs/BUILD-AND-DEPLOY.md` §7. The most common:
