@@ -23,6 +23,7 @@ const GROUPS = [
   { id: 'bluetooth', title: 'Bluetooth', short: 'Bluetooth', note: 'Through Lumen Eyes (the native helper app on the TV): pair new headphones, speakers or controllers, and connect ones paired before. Remove devices in the TV menu.' },
   { id: 'device', title: 'Device', short: 'Device' },
   { id: 'connection', title: 'Connection', short: 'Connection' },
+  { id: 'updates', title: 'Updates', short: 'Updates', note: 'New versions come from releases on GitHub and install by themselves when Lumen is not in use.' },
   { id: 'phone', title: 'This phone', short: 'Phone', note: 'Put Lumen, or just its browser, on your Home Screen: one tap opens it full screen, like an app.' },
 ];
 
@@ -101,6 +102,7 @@ export function mountSettings(root, ctx) {
       else if (g.id === 'network') rows = networkRows(ctx, scope);
       else if (g.id === 'bluetooth') rows = bluetoothRows(ctx, scope);
       else if (g.id === 'phone') rows = phoneRows();
+      else if (g.id === 'updates') rows = updateRows(ctx, scope);
       // Sound Output (Internal / External) is the Sound output row's job (soundExtras), with names.
       else rows = (byGroup.get(g.id) || []).filter((s) => s.key !== 'audio.speaker').map((s) => settingRow(ctx, s, scope));
       if (g.id === 'sound') rows.unshift(...soundExtras(ctx, scope));
@@ -585,6 +587,73 @@ function latencyOf(ctx, which) {
   if (Number.isFinite(direct)) return direct;
   const all = ctx.state.value('conn.latency', null);
   return all && Number.isFinite(all[which]) ? all[which] : null;
+}
+
+// update.status (server/features/updater.js) in words, and how it looks.
+const UPDATE_STATES = {
+  idle: { tone: 'warn', text: () => 'Not checked yet' },
+  checking: { tone: 'warn', text: () => 'Checking…' },
+  'up-to-date': { tone: 'good', text: () => 'Up to date' },
+  available: { tone: 'warn', text: (s) => `${s.latest} available` },
+  waiting: { tone: 'warn', text: (s) => `${s.latest} available · installs when Lumen is not in use` },
+  applying: { tone: 'warn', text: (s) => `Updating to ${s.latest}…` },
+  updated: { tone: 'good', text: (s) => `Updated to ${s.latest}` },
+  failed: { tone: 'bad', text: (s) => `Could not update to ${s.latest}: ${s.reason}` },
+  'left-alone': { tone: 'bad', text: (s) => `${s.latest ? `${s.latest} available, but this copy is ` : ''}left alone: ${s.reason}` },
+  unreachable: { tone: 'bad', text: (s) => `Could not check: ${s.reason}` },
+};
+
+function updateRows(ctx, { watch }) {
+  const button = (label, cmd, timeoutMs) => {
+    const b = h('button', { class: 'btn ghost sm', type: 'button', text: label });
+    b.addEventListener('click', async () => {
+      b.classList.add('is-busy');
+      await ctx.cmd(cmd, {}, { el: b, timeoutMs });
+      b.classList.remove('is-busy');
+    });
+    return b;
+  };
+  const checkNow = button('Check now', 'update.check', 90000);
+  const updateNow = button('Update now', 'update.apply', 90000);
+  const tryAgain = button('Try again', 'update.apply', 90000);
+  const text = h('span', { class: 'row-text' });
+  const actions = h('div', { class: 'row-actions' });
+  const version = h('div', { class: 'row row-readonly' },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Lumen' }), h('span', { class: 'hint', text: 'This copy and the newest release' })),
+    h('div', { class: 'row-control' }, h('div', { class: 'conn-control' }, text, actions)), h('div', { class: 'row-badge' }));
+  const sw = h('button', { class: 'switch', type: 'button', role: 'switch', 'aria-label': 'Automatic updates', 'aria-checked': 'true' });
+  sw.addEventListener('click', () => ctx.cmd('update.setAuto', { on: sw.getAttribute('aria-checked') !== 'true' }, { el: sw }));
+  const auto = h('div', { class: 'row row-toggle' },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'Automatic updates' }), h('span', { class: 'hint', text: 'When off, Lumen still checks, and installs only when you tap Update now' })),
+    h('div', { class: 'row-control' }, sw), h('div', { class: 'row-badge' }));
+  watch(['update.status'], () => {
+    const s = ctx.state.value('update.status', null) || { state: 'idle' };
+    const look = UPDATE_STATES[s.state] || UPDATE_STATES.idle;
+    const checked = s.checkedAt ? ` · checked ${new Date(s.checkedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '';
+    fill(text, statusDot(look.tone), s.current ? h('b', { class: 'mono', text: `v${s.current}` }) : null, ' · ', look.text(s), h('span', { class: 'muted', text: checked }));
+    fill(actions, ['available', 'waiting'].includes(s.state) ? updateNow : null, s.state === 'failed' ? tryAgain : null, s.state === 'applying' ? null : checkNow);
+    sw.setAttribute('aria-checked', s.auto === false ? 'false' : 'true');
+  });
+  // TV apps (update.tvApps): a newer agent or Eyes in this copy than on the TV.
+  const tvText = h('span', { class: 'row-text' });
+  const tvRow = h('div', { class: 'row row-readonly', hidden: true },
+    h('div', { class: 'row-label' }, h('span', { class: 'label', text: 'TV apps' }), h('span', { class: 'hint', text: 'The Lumen agent and Lumen Eyes on the TV' })),
+    h('div', { class: 'row-control' }, tvText), h('div', { class: 'row-badge' }));
+  const NAMES = { agent: 'Agent', eyes: 'Eyes' };
+  watch(['update.tvApps'], () => {
+    const t = ctx.state.value('update.tvApps', null);
+    const updates = Array.isArray(t?.updates) ? t.updates : [];
+    const last = t?.lastResult;
+    tvRow.hidden = !updates.length && !t?.installing && !(last && !last.ok);
+    if (tvRow.hidden) return;
+    const list = updates.map((u) => `${NAMES[u.app] || u.app} ${u.from} → ${u.to}`).join(' · ');
+    if (t.installing) fill(tvText, statusDot('warn'), `Installing ${NAMES[t.installing] || t.installing} on the TV…`);
+    else if (last && !last.ok) fill(tvText, statusDot('bad'), `Could not install ${NAMES[last.app] || last.app} ${last.version}: ${last.error}`);
+    else fill(tvText, statusDot('warn'), `Update available: ${list}`, h('span', { class: 'muted', text: t.tooling
+      ? ' · installs by itself when Lumen is not in use'
+      : ' · install it with Apps2Samsung or the Tizen tools on this PC (docs/SETUP.md, “Install the TV agent”)' }));
+  });
+  return [version, auto, tvRow];
 }
 
 function phoneRows() {

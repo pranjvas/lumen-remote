@@ -536,6 +536,23 @@ export function createCast({ config, data, log, store, lan, avtransport, dial, r
       cleanupTimer = null;
     },
 
+    /** Whether a DLNA cast is still playing, asked of the TV: the session is polled only while a phone shows
+     *  Lumen, so it can say PLAYING long after the video ended. One the TV no longer plays (or a TV that does not
+     *  answer) is marked STOPPED. */
+    async refreshDlna() {
+      if (session?.kind !== 'dlna' || !BUSY_STATES.has(session.state)) return false;
+      const gen = generation;
+      let state = null;
+      try {
+        state = (await avtransport.getTransportInfo('poll')).value?.state ?? null;
+      } catch (err) {
+        logger.debug('cast check failed', { code: err.code, error: err.message });
+      }
+      if (BUSY_STATES.has(state)) return true;
+      if (gen === generation && session?.kind === 'dlna') publish({ ...session, state: state ?? 'STOPPED' });
+      return false;
+    },
+
     setDemand({ visible: anyVisible } = {}) {
       visible = Boolean(anyVisible);
       if (visible) schedulePoll();

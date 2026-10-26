@@ -30,6 +30,7 @@ import { createLiveVideo } from './features/livevideo.js';
 import { createMemory } from './features/memory.js';
 import { createHistory } from './features/history.js';
 import { createIncognito } from './features/incognito.js';
+import { createUpdater } from './features/updater.js';
 import { createAi } from './ai/index.js';
 import { APPS } from './catalog/apps.js';
 
@@ -48,7 +49,8 @@ async function within(work, ms, onLate) {
   }
 }
 
-// `seams` is for tests and tools/dev-stack.mjs only: { aiBackends } replaces the AI backends.
+// `seams` is for tests and tools/dev-stack.mjs only: { aiBackends } replaces the AI backends, { updateGit }
+// the updater's git layer.
 export async function startServer(overrides = {}, seams = {}) {
   const config = loadConfig(overrides);
   const data = createDataStore(config.dataDir);
@@ -120,6 +122,12 @@ export async function startServer(overrides = {}, seams = {}) {
     features.history = createHistory({ ...ctx, features });
     // Incognito (hub browser.incognito): the browser on a throwaway profile, and no record of its pages.
     features.incognito = createIncognito({ ...ctx, features });
+    // Automatic updates from this copy's git origin (features/updater.js).
+    // To apply an update Lumen shuts down as on Ctrl+C (server/index.js) and the update helper takes over.
+    features.updater = createUpdater({
+      ...ctx, features, adapters, requestExit: () => process.emit('lumen:exit-for-update'), httpPort: () => http?.port ?? config.http.port,
+      ...(seams.updateGit && { git: seams.updateGit }),
+    });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);
@@ -139,6 +147,7 @@ export async function startServer(overrides = {}, seams = {}) {
       }
     }
     log.info('Lumen ready', { httpPort: http.port, lanPort: lan.port });
+    http.markReady();
 
     let stopping = null;
     return {

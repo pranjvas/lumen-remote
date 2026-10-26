@@ -61,6 +61,8 @@ async function main() {
 
   // SIGBREAK is Ctrl+Break and SIGHUP is the console window closing on Windows.
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(signal, () => shutdown(signal));
+  // An update (features/updater.js): the same graceful stop; tools/update-apply.js starts Lumen again.
+  process.on('lumen:exit-for-update', () => shutdown('update'));
 
   // A remote control should keep working after one bad callback: log it and carry on.
   process.on('unhandledRejection', (reason) => log.error('unhandled rejection', reason));

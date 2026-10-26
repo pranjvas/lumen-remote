@@ -244,5 +244,7 @@ export function createAi({ config, data, log, store, hub, adapters, browser, lan
       for (const run of runs.values()) run.abort();
     },
     setDemand() {},
+    /** An Ask Lumen run is in progress (the updater waits for it). */
+    busy: () => runs.size > 0,
   };
 }

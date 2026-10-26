@@ -10,6 +10,14 @@ const LOG_DIR = path.join(ROOT, 'data', 'logs');
 const OUT = path.join(LOG_DIR, 'stdout.log');
 const MAX_OUT_BYTES = 5 * 1024 * 1024;
 
+// An update interrupted between setting the previous node_modules aside and putting the new one in place
+// (tools/update-apply.js) leaves none: put the previous one back so Lumen can start.
+const MODULES = path.join(ROOT, 'node_modules');
+const KEPT_MODULES = path.join(ROOT, 'node_modules.lumen-prev');
+if (!fs.existsSync(MODULES) && fs.existsSync(KEPT_MODULES)) {
+  try { fs.renameSync(KEPT_MODULES, MODULES); } catch { /* Lumen will say what is missing */ }
+}
+
 fs.mkdirSync(LOG_DIR, { recursive: true });
 try {
   if (fs.statSync(OUT).size > MAX_OUT_BYTES) fs.renameSync(OUT, `${OUT}.1`);

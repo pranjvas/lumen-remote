@@ -487,6 +487,20 @@ describe('cast: through the server and the mock TV', { skip }, () => {
     assert.equal(mock.state.dial.launches.length, dialBefore + 1);
   });
 
+  test('a file cast that ended while no phone watched: asked, the TV says it stopped, and the session says so', async () => {
+    await castFile('end.mkv', ascii(1024));
+    await b.waitForState('cast.session', (r) => r?.v?.kind === 'dlna' && r.v.state === 'PLAYING', { timeout: 8000 });
+    await b.send('view', { name: 'cast', visible: false }); // nobody watching: no polling
+    await sleep(300);
+    const cast = stack.server.features.cast;
+    assert.equal(await cast.refreshDlna(), true, 'still playing on the TV');
+    mock.state.avtransport.state = 'STOPPED'; // the video ended on the TV
+    assert.equal(stack.server.store.get('cast.session')?.v?.state, 'PLAYING', 'unpolled, the session still says PLAYING');
+    assert.equal(await cast.refreshDlna(), false);
+    assert.equal(stack.server.store.get('cast.session')?.v?.state, 'STOPPED');
+    await b.send('view', { name: 'cast', visible: true });
+  });
+
   test('the mock saw nothing a correct client must never do', () => {
     assert.deepEqual(mock.state.violations, []);
     assert.deepEqual(mock.state.errors, []);

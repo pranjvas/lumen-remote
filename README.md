@@ -31,6 +31,7 @@ First run: Settings → Connection → **Pair** (press **Allow** on the TV), the
 - **Setting up from scratch** (a development setup with no TV, then connecting a real one): [docs/SETUP.md](docs/SETUP.md).
 - **Building and deploying changes:** [docs/BUILD-AND-DEPLOY.md](docs/BUILD-AND-DEPLOY.md).
 - **Claude Code skills in this repo:** `lumen-setup` (first-time setup) and `lumen-install` (deploying changes).
+- **Updates:** every copy installs new releases by itself (Settings → Updates). Maintainers publish one with `npm run release -- <version>`; see [docs/SETUP.md](docs/SETUP.md) B6.
 
 Only one copy runs at a time. Logs go to `data/logs/` (`lumen.log`, `stdout.log`).
 
