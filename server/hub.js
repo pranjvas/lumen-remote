@@ -756,6 +756,10 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     },
     'macro.delete': async (cmd) => feature('macros', 'remove', text(subject(cmd), 'target', { max: 64, pattern: ITEM_ID })),
 
+    // Automatic updates (features/updater.js): check now, apply now, and the automatic switch.
+    'update.check': async () => ({ value: await feature('updater', 'check') }),
+    'update.setAuto': async ({ on }) => ({ value: await feature('updater', 'setAuto', boolean(on, 'on')) }),
+
     'agent.connect': async () => {
       if (valueOf('conn.agent') === 'online') return { value: 'online' };
       requireTvOn();

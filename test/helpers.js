@@ -107,6 +107,7 @@ export function testConfig(mock, dataDir, overrides = {}) {
     ai: { backend: 'off' }, // never spend the user's API credit or Claude Code usage in tests
     browser: { allowLoopback: true }, // the browser tests serve their pages on 127.0.0.1
     tvscreen: { relabelHls: false }, // hand-off tests check the engine choice, not a remux by this PC's ffmpeg
+    update: { enabled: false }, // never run git against this repository or reach GitHub from a test
     log: { level: 'warn', console: false },
   }, overrides);
 }
