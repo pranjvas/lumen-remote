@@ -26,25 +26,67 @@ export function tvAppUpdates({ repo, connected }) {
     .map((app) => ({ app, from: connected[app], to: repo[app] }));
 }
 
-/** This PC's Tizen CLI and sdb: config.tvTooling, else the usual Tizen Studio folders → { tizenCli, sdb } | null. */
-export function findTooling({ config = {}, env = process.env, exists = fs.existsSync } = {}) {
-  const set = config.tvTooling;
-  if (set?.tizenCli && set?.sdb && exists(set.tizenCli) && exists(set.sdb)) return { tizenCli: set.tizenCli, sdb: set.sdb };
+// The signing profile the Tizen CLI would use: the active one in the Tizen Studio data folder (sdk.info's
+// TIZEN_SDK_DATA_PATH, else %USERPROFILE%\tizen-studio-data) → its name, or null when there is none.
+function activeProfile(root, home, readFile) {
+  const dataDirs = [];
+  try {
+    const m = /^TIZEN_SDK_DATA_PATH=(.+)$/m.exec(readFile(path.win32.join(root, 'sdk.info')));
+    if (m) dataDirs.push(m[1].trim());
+  } catch { /* no sdk.info */ }
+  if (home) dataDirs.push(path.win32.join(home, 'tizen-studio-data'));
+  for (const dir of dataDirs) {
+    try {
+      const xml = readFile(path.win32.join(dir, 'profile', 'profiles.xml'));
+      const active = /<profiles\b[^>]*\bactive="([^"]+)"/.exec(xml)?.[1];
+      if (active && xml.includes(`<profile name="${active}"`)) return active;
+    } catch { /* no profiles here */ }
+  }
+  return null;
+}
+
+// dotnet (to build Eyes) on PATH or in its usual folder.
+function hasDotnet(env, exists) {
+  const dirs = String(env.PATH ?? env.Path ?? '').split(';').filter(Boolean);
+  return [...dirs, 'C:\\Program Files\\dotnet'].some((dir) => exists(path.win32.join(dir, 'dotnet.exe')));
+}
+
+/** This PC's Tizen CLI, sdb and signing profile: config.tvTooling, else the usual Tizen Studio folders
+ *  → { tizenCli, sdb, profile, dotnet } | null (no tooling, or no certificate profile to sign with). */
+export function findTooling({ config = {}, env = process.env, exists = fs.existsSync, readFile = (f) => fs.readFileSync(f, 'utf8') } = {}) {
   const home = env.USERPROFILE ?? env.HOME ?? '';
+  const dotnet = hasDotnet(env, exists);
+  const set = config.tvTooling;
+  if (set?.tizenCli && set?.sdb && exists(set.tizenCli) && exists(set.sdb)) {
+    const profile = set.profile ?? activeProfile(path.win32.dirname(path.win32.dirname(path.win32.dirname(path.win32.dirname(set.tizenCli)))), home, readFile);
+    return profile ? { tizenCli: set.tizenCli, sdb: set.sdb, profile, dotnet } : null;
+  }
   const roots = ['C:\\tizen-studio', ...(home ? [path.win32.join(home, 'tizen-studio'), path.win32.join(home, 'Documents', 'Codex', 'Tools', 'TizenStudio10')] : [])];
   for (const root of roots) {
     const tizenCli = path.win32.join(root, 'tools', 'ide', 'bin', 'tizen.bat');
     const sdb = path.win32.join(root, 'tools', 'sdb.exe');
-    if (exists(tizenCli) && exists(sdb)) return { tizenCli, sdb };
+    if (!exists(tizenCli) || !exists(sdb)) continue;
+    const profile = activeProfile(root, home, readFile);
+    if (profile) return { tizenCli, sdb, profile, dotnet };
   }
   return null;
+}
+
+/** Whether this tooling can build `app` (Eyes is a .NET app). */
+export function canInstall(app, tooling) {
+  return Boolean(tooling) && (app !== 'eyes' || tooling.dotnet === true);
+}
+
+/** The PowerShell command line for tools/tvapp-install.ps1. */
+export function installArgs(app, tooling, { tvHost, repo = REPO_ROOT } = {}) {
+  return ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(repo, 'tools', 'tvapp-install.ps1'),
+    '-App', app, '-TizenCli', tooling.tizenCli, '-Sdb', tooling.sdb, '-TvHost', tvHost, ...(tooling.profile ? ['-SigningProfile', tooling.profile] : [])];
 }
 
 /** Builds, signs and installs `app` on the TV with tools/tvapp-install.ps1 → { ok, error? }. */
 export function installTvApp(app, tooling, { tvHost, repo = REPO_ROOT, log } = {}) {
   return new Promise((resolve) => {
-    const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(repo, 'tools', 'tvapp-install.ps1'),
-      '-App', app, '-TizenCli', tooling.tizenCli, '-Sdb', tooling.sdb, '-TvHost', tvHost], { cwd: repo, windowsHide: true });
+    const child = spawn('powershell', installArgs(app, tooling, { tvHost, repo }), { cwd: repo, windowsHide: true });
     let out = '';
     const keep = (d) => { out = (out + d).slice(-4000); };
     child.stdout.on('data', keep);

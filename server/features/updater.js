@@ -10,8 +10,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { REPO_ROOT, VERSION } from '../config.js';
 import { createGit } from '../update/git.js';
-import { compareVersions } from '../update/versions.js';
-import { findTooling, installTvApp, repoVersions, tvAppUpdates } from '../update/tvapps.js';
+import { compareVersions, tagFor } from '../update/versions.js';
+import { canInstall, findTooling, installTvApp, repoVersions, tvAppUpdates } from '../update/tvapps.js';
 
 const FIRST_CHECK_MS = 60_000;
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
@@ -21,7 +21,8 @@ const TV_APPS_FILE = 'update/tvapps.json'; // { attempted: { 'agent@0.9.5': true
 const IDLE_MS = 2 * 60 * 1000; // idle this long before an update is applied
 const EVALUATE_EVERY_MS = 30_000;
 const STALE_APPLYING_MS = 10 * 60 * 1000; // an 'applying' older than this was interrupted
-const OUTCOME_POLL_MS = 5000; // while the helper still says 'applying' after Lumen came back
+const OUTCOME_POLL_MS = 5000;
+const TOOLING_TTL_MS = 10 * 60 * 1000; // the Tizen tooling probe (files on disk) is redone this often // while the helper still says 'applying' after Lumen came back
 const IDLE_KEYS = ['tvscreen.on', 'tvscreen.video', 'tvscreen.live', 'browser.incognito', 'cast.session'];
 const PLAYER_ACTIVE = new Set(['loading', 'playing', 'paused', 'fallback']);
 const DLNA_ACTIVE = new Set(['PLAYING', 'PAUSED_PLAYBACK', 'TRANSITIONING']); // a file Lumen serves to the TV
@@ -49,18 +50,21 @@ export function createUpdater({
   let applying = false;
   let failedVersion = null; // a release whose update failed here: not tried again by itself
   let removeListener = null;
-  // TV apps (update.tvApps = { updates, tooling, installing, lastResult }): this copy's agent and Eyes
-  // against the TV's; installed when Lumen is idle where this PC has the Tizen tooling.
+  // TV apps (update.tvApps = { updates, tooling, installing, lastResult }): the agent and Eyes of a copy that sits
+  // exactly at its release (clean, on master) against the TV's; installed when Lumen is idle and the TV is on,
+  // where this PC has the Tizen tooling. An installed agent is not started here: it comes back through its own
+  // auto-start, which never covers another app on the TV.
   const tvApps = {
     repoVersions: () => repoVersions(REPO_ROOT),
     connected: () => ({ agent: adapters.agent?.version?.() ?? null, eyes: adapters.eyes?.version?.() ?? null }),
     tooling: () => findTooling({ config }),
     install: (app, tooling) => installTvApp(app, tooling, { tvHost: config.tv?.host, log }),
-    afterInstall: async (app) => { if (app === 'agent') await adapters.agent?.launch?.().catch(() => {}); },
     ...tvAppsSeam,
   };
   let tvState = { updates: [], tooling: false, installing: null, lastResult: null };
   let tvShape = '';
+  let releaseCopy = false; // this copy is clean on master at its own release tag (set by each check)
+  let tooling = { value: null, at: -Infinity };
 
   function readAuto() {
     const saved = data.readJson(SETTINGS_FILE, {});
@@ -83,8 +87,21 @@ export function createUpdater({
     return null;
   }
 
+  // Whether this copy is exactly its release: what it carries for the TV is then what was released, not work in
+  // progress.
+  async function atRelease() {
+    try {
+      if (!(await git.isRepo()) || (await git.branch()) !== 'master' || (await git.isDirty())) return false;
+      return (await git.head()) === (await git.commitOf(tagFor(version)));
+    } catch {
+      return false;
+    }
+  }
+
   async function runCheck() {
     publish({ state: 'checking', reason: null });
+    releaseCopy = await atRelease();
+    refreshTvApps();
     if (!(await git.isRepo())) return publish({ state: 'left-alone', reason: 'not a git copy', checkedAt: now() });
     try {
       await git.fetchTags();
@@ -144,31 +161,39 @@ export function createUpdater({
     store.set('update.tvApps', tvState, meta);
   }
 
+  function currentTooling() {
+    if (now() - tooling.at >= TOOLING_TTL_MS) tooling = { value: tvApps.tooling() ?? null, at: now() };
+    return tooling.value;
+  }
+
   function refreshTvApps() {
     try {
-      publishTv({ updates: tvAppUpdates({ repo: tvApps.repoVersions(), connected: tvApps.connected() }), tooling: Boolean(tvApps.tooling()) });
+      const updates = releaseCopy ? tvAppUpdates({ repo: tvApps.repoVersions(), connected: tvApps.connected() }) : [];
+      const found = currentTooling();
+      // tooling: every update shown installs by itself here (else Settings gives the manual steps).
+      publishTv({ updates, tooling: updates.length ? updates.every((u) => canInstall(u.app, found)) : Boolean(found) });
     } catch (err) {
       log.debug('TV app versions unreadable', { message: err.message });
     }
   }
 
-  // One newer TV app at a time, once per version (a failed try is shown, not repeated).
+  // One newer TV app at a time, once per version (a failed try is shown, not repeated), only while the TV is on
+  // (a TV asleep would waste the try).
   async function installTvApps() {
-    if (tvState.installing) return;
+    if (tvState.installing || store.get('conn.tv')?.v !== 'on') return;
     const attempted = data.readJson(TV_APPS_FILE, {})?.attempted ?? {};
-    const next = tvState.updates.find((u) => !attempted[`${u.app}@${u.to}`]);
-    const tooling = next ? tvApps.tooling() : null;
-    if (!next || !tooling) return;
+    const found = currentTooling();
+    const next = tvState.updates.find((u) => !attempted[`${u.app}@${u.to}`] && canInstall(u.app, found));
+    if (!next || !(await atRelease())) return;
     log.info('installing TV app update', next);
     publishTv({ installing: next.app });
     data.writeJson(TV_APPS_FILE, { attempted: { ...attempted, [`${next.app}@${next.to}`]: true } });
     let result;
     try {
-      result = await tvApps.install(next.app, tooling);
+      result = await tvApps.install(next.app, found);
     } catch (err) {
       result = { ok: false, error: err.message };
     }
-    if (result.ok) await tvApps.afterInstall(next.app);
     publishTv({ installing: null, lastResult: { app: next.app, version: next.to, ok: result.ok === true, error: result.error ?? null, at: now() } });
     refreshTvApps();
   }
