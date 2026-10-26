@@ -110,3 +110,117 @@ test('hub: update.check returns the status; update.setAuto takes a boolean only'
     await stack.stop();
   }
 });
+
+// ---- applying: the idle gate, the hand-off to the helper, and the outcome after the restart ----
+
+function applyHarness({ version = '0.2.0', git = fakeGit(), auto = true, features = {} } = {}) {
+  let clock = 1_000_000;
+  const spawned = [];
+  let exits = 0;
+  const h = updaterHarness({
+    version, git, features, now: () => clock,
+    spawnHelper: (plan) => { spawned.push(plan); },
+    requestExit: () => { exits += 1; },
+  });
+  if (!auto) h.updater.setAuto(false);
+  return { ...h, spawned, exits: () => exits, advance: (ms) => { clock += ms; }, clock: () => clock };
+}
+const setKey = (h, key, v) => h.store.set(key, v, { src: 'derived', via: 'test' });
+
+test('an update is applied once Lumen has been idle for 2 minutes: the plan is written, the helper started, Lumen exits', async () => {
+  const h = applyHarness();
+  await h.updater.check();
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 0, 'not before 2 minutes of idle');
+  assert.equal(h.status().state, 'waiting');
+  h.advance(2 * 60 * 1000);
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 1);
+  assert.deepEqual(h.spawned[0], { from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0' });
+  const plan = h.data.readJson('update/state.json', null);
+  assert.equal(plan.phase, 'applying');
+  assert.equal(plan.to, 'v0.3.0');
+  assert.equal(h.exits(), 1, 'Lumen shuts down for the helper');
+  assert.equal(h.status().state, 'applying');
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 1, 'only once');
+});
+
+test('in use (Lumen on the TV, a TV video, live video, incognito, an Ask Lumen run): it waits, and counts 2 minutes from when that ends', async () => {
+  for (const [key, value, idle] of [['tvscreen.on', true, false], ['tvscreen.video', 'playing', null], ['tvscreen.live', { state: 'playing' }, { state: 'off' }], ['browser.incognito', true, false]]) {
+    const h = applyHarness();
+    setKey(h, key, value);
+    await h.updater.check();
+    h.advance(10 * 60 * 1000);
+    await h.updater.evaluate();
+    assert.equal(h.spawned.length, 0, `${key} blocks`);
+    assert.equal(h.status().state, 'waiting');
+    setKey(h, key, idle);
+    await h.updater.evaluate();
+    h.advance(60 * 1000);
+    await h.updater.evaluate();
+    assert.equal(h.spawned.length, 0, `${key}: only one idle minute so far`);
+    h.advance(61 * 1000);
+    await h.updater.evaluate();
+    assert.equal(h.spawned.length, 1, `${key}: applied after 2 idle minutes`);
+  }
+  const busy = applyHarness({ features: { ai: { busy: () => true } } });
+  await busy.updater.check();
+  busy.advance(10 * 60 * 1000);
+  await busy.updater.evaluate();
+  assert.equal(busy.spawned.length, 0, 'an Ask Lumen run blocks');
+});
+
+test('automatic updates off: it waits for "Update now", which applies at once even while in use', async () => {
+  const h = applyHarness({ auto: false });
+  await h.updater.check();
+  h.advance(10 * 60 * 1000);
+  await h.updater.evaluate();
+  assert.equal(h.spawned.length, 0);
+  assert.equal(h.status().state, 'available');
+  setKey(h, 'tvscreen.on', true);
+  await h.updater.applyNow();
+  assert.equal(h.spawned.length, 1);
+});
+
+test('after the restart: updated, failed (not retried by itself, but by "Update now"), and an interrupted update', async () => {
+  const done = applyHarness({ version: '0.3.0' });
+  done.data.writeJson('update/state.json', { phase: 'updated', from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0', at: done.clock() });
+  done.updater.start();
+  assert.equal(done.status().state, 'updated');
+  assert.equal(done.status().latest, '0.3.0');
+
+  const bad = applyHarness();
+  bad.data.writeJson('update/state.json', { phase: 'failed', from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0', at: bad.clock(), error: 'Lumen did not answer within 60 s' });
+  bad.updater.start();
+  assert.equal(bad.status().state, 'failed');
+  assert.match(bad.status().reason, /did not answer/);
+  await bad.updater.check();
+  bad.advance(10 * 60 * 1000);
+  await bad.updater.evaluate();
+  assert.equal(bad.spawned.length, 0, 'the failed release is not tried again by itself');
+  assert.equal(bad.status().state, 'failed');
+  await bad.updater.applyNow();
+  assert.equal(bad.spawned.length, 1, '"Update now" (Try again) does');
+
+  const stale = applyHarness();
+  stale.data.writeJson('update/state.json', { phase: 'applying', from: 'aaa111', to: 'v0.3.0', toVersion: '0.3.0', at: stale.clock() - 11 * 60 * 1000 });
+  stale.updater.start();
+  assert.equal(stale.status().state, 'failed');
+  assert.match(stale.status().reason, /interrupted/);
+  assert.equal(stale.data.readJson('update/state.json', null).phase, 'failed');
+  for (const x of [done, bad, stale]) await x.updater.stop();
+});
+
+test('hub: update.apply runs "Update now"', async () => {
+  const stack = await startStack({ seams: { updateGit: fakeGit({ releaseTags: async () => [] }) } });
+  try {
+    const b = stack.browser();
+    await b.hello;
+    const ack = await b.send('update.apply', {});
+    assert.equal(ack.ok, true, JSON.stringify(ack.error));
+    assert.equal(ack.value.state, 'up-to-date', 'nothing to apply: it checked and says so');
+  } finally {
+    await stack.stop();
+  }
+});

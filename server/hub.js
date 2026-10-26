@@ -759,6 +759,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     // Automatic updates (features/updater.js): check now, apply now, and the automatic switch.
     'update.check': async () => ({ value: await feature('updater', 'check') }),
     'update.setAuto': async ({ on }) => ({ value: await feature('updater', 'setAuto', boolean(on, 'on')) }),
+    'update.apply': async () => ({ value: await feature('updater', 'applyNow') }),
 
     'agent.connect': async () => {
       if (valueOf('conn.agent') === 'online') return { value: 'online' };

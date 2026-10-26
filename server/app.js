@@ -123,7 +123,11 @@ export async function startServer(overrides = {}, seams = {}) {
     // Incognito (hub browser.incognito): the browser on a throwaway profile, and no record of its pages.
     features.incognito = createIncognito({ ...ctx, features });
     // Automatic updates from this copy's git origin (features/updater.js).
-    features.updater = createUpdater({ ...ctx, features, ...(seams.updateGit && { git: seams.updateGit }) });
+    // To apply an update Lumen shuts down as on Ctrl+C (server/index.js) and the update helper takes over.
+    features.updater = createUpdater({
+      ...ctx, features, requestExit: () => process.emit('lumen:exit-for-update'),
+      ...(seams.updateGit && { git: seams.updateGit }),
+    });
 
     const startable = [...Object.entries(adapters), ...Object.entries(features)];
     for (const [name, part] of startable) parts.push([name, () => part.stop?.()]);
