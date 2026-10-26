@@ -13,7 +13,8 @@
     "agent:build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/agent/build.ps1",
     "agent:package:a2s": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/agent/package-apps2samsung.ps1",
     "screenshot": "node tools/screenshot.mjs",
-    "dev:stack": "node tools/dev-stack.mjs"
+    "dev:stack": "node tools/dev-stack.mjs",
+    "release": "node tools/release.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.306",
