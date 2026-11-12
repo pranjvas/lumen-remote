@@ -45,17 +45,7 @@ jobs:
           ls ipad/build/NodeMobile.xcframework
 
       - name: Server files for the app
-        run: |
-          P=ipad/build/nodejs-project
-          mkdir -p "$P"
-          cp -R server web package.json package-lock.json "$P/"
-          (cd "$P" && npm ci --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund)
-          rm -f "$P/package-lock.json"
-          # Not needed at run time, and broken links would stop the app from being signed.
-          find "$P/node_modules" -name .bin -type d -prune -exec rm -rf {} +
-          find "$P/node_modules" -type f \( -name '*.map' -o -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' \) -delete
-          find "$P" -type l -delete
-          du -sh "$P" | tee -a out/toolchain.txt
+        run: sh ipad/ci/make-node-project.sh ipad/build/nodejs-project | tee -a out/toolchain.txt
 
       - name: Dependencies for the check
         run: npm ci --omit=optional --no-audit --no-fund

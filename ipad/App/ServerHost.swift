@@ -127,7 +127,12 @@ final class ServerHost: ObservableObject {
 
     private func nodeExited(_ code: Int32) {
         logTail = recentLog()
-        phase = .failed("The server stopped (code \(code)).")
+        // A start that failed leaves its reason in the status file; Node then simply runs out of work.
+        if let status = readStatus(), status["state"] as? String == "failed" {
+            phase = .failed(explain(status))
+        } else {
+            phase = .failed("The server stopped (code \(code)).")
+        }
     }
 
     private func readStatus() -> [String: Any]? {

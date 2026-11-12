@@ -1,0 +1,10 @@
+{
+  "name": "@anthropic-ai/claude-agent-sdk",
+  "version": "0.0.0-lumen-ipad-stub",
+  "description": "Stand-in for the agent SDK inside the iPad app (see index.mjs)",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  }
+}
