@@ -1,0 +1,39 @@
+# Builds the iPad app (ipad/) and its unsigned .ipa. See ipad/README.md.
+name: iPad app
+
+on:
+  push:
+    branches: [claude/ipad-app]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          mkdir -p out
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            ls /Applications | grep -i xcode
+            node --version
+            which xcodegen || echo "no xcodegen"
+            xcrun simctl list devices available | grep -iE "ipad|iphone" | head -40
+            xcrun simctl list runtimes
+          } 2>&1 | tee out/toolchain.txt
+      - name: Publish output branch
+        if: always()
+        run: |
+          cd out
+          git init -q -b ci/ipad-output
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "CI output for ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" ci/ipad-output
