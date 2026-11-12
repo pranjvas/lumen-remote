@@ -5,6 +5,9 @@ import UIKit
 // Owns the Lumen server that runs inside this app: prepares the data folder, starts Node,
 // waits for the server to report that it is up, and applies the two settings from the
 // Settings app (keep the screen on, keep running in the background).
+//
+// Node is started once and never again. When iPadOS suspends the app, Node rebuilds the server
+// by itself on return (server/embedded-host.js); this side waits for that and reloads the page.
 @MainActor
 final class ServerHost: ObservableObject {
     enum Phase: Equatable {
@@ -16,15 +19,19 @@ final class ServerHost: ObservableObject {
     @Published private(set) var phase: Phase = .starting
     @Published private(set) var message = "Starting Lumen"
     @Published private(set) var logTail = ""
+    /// Goes up when the page should be loaded again, because the server behind it was rebuilt.
+    @Published private(set) var reloadToken = 0
 
     private var started = false
     private var checkingServer = false
+    private var pageGeneration = 0
     private let keepAlive = BackgroundKeepAlive()
     private let defaults = UserDefaults.standard
 
     private let dataDir: URL
     private let logsDir: URL
     private let statusFile: URL
+    private let controlFile: URL
     private let consoleLog: URL
 
     init() {
@@ -32,8 +39,9 @@ final class ServerHost: ObservableObject {
         dataDir = documents.appendingPathComponent("data", isDirectory: true)
         logsDir = dataDir.appendingPathComponent("logs", isDirectory: true)
         statusFile = dataDir.appendingPathComponent("host-status.json")
+        controlFile = dataDir.appendingPathComponent("host-control.json")
         consoleLog = logsDir.appendingPathComponent("node-console.log")
-        defaults.register(defaults: ["run_in_background": true, "keep_awake": true])
+        defaults.register(defaults: ["run_in_background": false, "keep_awake": true])
     }
 
     func start() {
@@ -82,37 +90,64 @@ final class ServerHost: ObservableObject {
     }
 
     // Called when the app comes back on screen. The settings may have changed meanwhile, and if
-    // iPadOS suspended the app it may have taken the server's sockets away: Node cannot be started
-    // a second time in one process, so all that is left then is to say so.
+    // iPadOS suspended the app, Node is rebuilding the server right now or is about to.
     func becameActive() {
         applySettings()
         guard case .ready(let url) = phase, !checkingServer else { return }
         checkingServer = true
         Task {
-            let alive = await serverAnswers(url)
+            let alive = await recover(url)
             checkingServer = false
-            if !alive, case .ready = phase {
+            guard case .ready = phase else { return }
+            if alive {
+                let generation = readStatus()?["generation"] as? Int ?? pageGeneration
+                if generation != pageGeneration {
+                    pageGeneration = generation
+                    reloadToken += 1
+                }
+            } else {
                 logTail = recentLog()
-                phase = .failed("iPadOS paused Lumen while it was in the background, and its server stopped answering.")
+                phase = .failed("Lumen's server did not come back after iPadOS paused the app.")
             }
         }
     }
 
-    private func serverAnswers(_ base: URL) async -> Bool {
-        let url = base.appendingPathComponent("api/health")
-        for attempt in 0..<4 {
-            if attempt > 0 {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+    // Waits until the server answers twice in a row, so that a restart which is only just
+    // beginning is not mistaken for a healthy server. If nothing answers for a while, asks Node
+    // for a restart through host-control.json (server/embedded-host.js reads it).
+    private func recover(_ base: URL) async -> Bool {
+        let began = Date()
+        var asked = false
+        var steady = 0
+        while Date().timeIntervalSince(began) < 45 {
+            let ready = (readStatus()?["state"] as? String) == "ready"
+            let answered = ready ? await serverAnswers(base) : false
+            if answered {
+                steady += 1
+                if steady >= 2 { return true }
+            } else {
+                steady = 0
+                if !asked && Date().timeIntervalSince(began) > 8 {
+                    asked = true
+                    askForRestart()
+                }
             }
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 3
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            if let result = try? await URLSession.shared.data(for: request),
-               (result.1 as? HTTPURLResponse)?.statusCode == 200 {
-                return true
-            }
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
         }
         return false
+    }
+
+    private func serverAnswers(_ base: URL) async -> Bool {
+        var request = URLRequest(url: base.appendingPathComponent("api/health"))
+        request.timeoutInterval = 2
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        guard let result = try? await URLSession.shared.data(for: request) else { return false }
+        return (result.1 as? HTTPURLResponse)?.statusCode == 200
+    }
+
+    private func askForRestart() {
+        let text = "{\"restart\":\"" + UUID().uuidString + "\"}"
+        try? text.write(to: controlFile, atomically: true, encoding: .utf8)
     }
 
     private func applySettings() {
@@ -132,6 +167,7 @@ final class ServerHost: ObservableObject {
             if let status = readStatus() {
                 let state = status["state"] as? String ?? ""
                 if state == "ready", let port = status["httpPort"] as? Int, let url = URL(string: "http://127.0.0.1:\(port)/") {
+                    pageGeneration = status["generation"] as? Int ?? 1
                     phase = .ready(url)
                     return
                 }

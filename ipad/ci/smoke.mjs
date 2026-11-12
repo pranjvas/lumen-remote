@@ -173,6 +173,55 @@ if (up && args.page) {
   });
 }
 
+// ---------- the server is rebuilt in place (what happens after iPadOS pauses the app) ----------
+
+if (up) {
+  const statusNow = () => JSON.parse(fs.readFileSync(path.join(dataDir, 'host-status.json'), 'utf8'));
+  const pageLines = () => {
+    try {
+      return fs.readFileSync(path.join(dataDir, 'logs', 'lumen.log'), 'utf8').split('phone screen').length - 1;
+    } catch {
+      return 0;
+    }
+  };
+  const pagesBefore = pageLines();
+  let restarted = false;
+
+  await check('the server restarts inside the same Node when asked (host-control.json)', async () => {
+    const before = statusNow().generation;
+    fs.writeFileSync(path.join(dataDir, 'host-control.json'), JSON.stringify({ restart: `smoke-${Date.now()}` }));
+    const began = Date.now();
+    await waitFor(() => {
+      const s = statusNow();
+      return s.state === 'ready' && s.generation === before + 1;
+    }, { timeout: 90000, interval: 300, message: 'host-status.json never showed the next generation' });
+    const h = await health();
+    expect(h.ready === true, JSON.stringify(h));
+    restarted = true;
+    return `after ${Math.round((Date.now() - began) / 100) / 10} s`;
+  });
+
+  if (restarted) {
+    await check('the restarted server drives the TV again', async () => {
+      browser?.close();
+      browser = connectBrowser(port);
+      await browser.hello;
+      await browser.waitForState('conn.tv', (r) => r?.v === 'on', { timeout: 30000 });
+      const ack = await browser.send('volume.set', { value: 9 }, { timeout: 30000 });
+      expect(ack.ok === true, JSON.stringify(ack.error));
+      expect(mock.state.volume === 9, `the mock TV is at ${mock.state.volume}`);
+    });
+
+    if (args.page) {
+      await check("the app's own page reconnects after the restart", async () => {
+        const began = Date.now();
+        await waitFor(() => pageLines() > pagesBefore, { timeout: 90000, interval: 500, message: 'the page did not connect again' });
+        return `after ${Math.round((Date.now() - began) / 1000)} s`;
+      });
+    }
+  }
+}
+
 // ---------- results ----------
 
 if (args.screenshot) {

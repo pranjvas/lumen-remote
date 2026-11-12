@@ -5,9 +5,11 @@ import WebKit
 // The Lumen web UI, loaded from the server inside this app (http://127.0.0.1:<port>).
 struct RemoteWebView: UIViewRepresentable {
     let url: URL
+    /// The page is loaded again whenever this changes (ServerHost.reloadToken).
+    let reloadToken: Int
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(home: url)
+        Coordinator(home: url, reloadToken: reloadToken)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -32,14 +34,32 @@ struct RemoteWebView: UIViewRepresentable {
         return webView
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {}
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        let coordinator = context.coordinator
+        if coordinator.reloadToken == reloadToken { return }
+        coordinator.reloadToken = reloadToken
+        coordinator.loadAgain(webView)
+    }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         private let home: URL
         private var retries = 0
+        var reloadToken: Int
 
-        init(home: URL) {
+        init(home: URL, reloadToken: Int) {
             self.home = home
+            self.reloadToken = reloadToken
+        }
+
+        // The server behind the page was rebuilt: load the page again, on the view it was showing
+        // (the view is in the address, after the #).
+        func loadAgain(_ webView: WKWebView) {
+            note("loading the page again")
+            if webView.url == nil {
+                webView.load(URLRequest(url: home))
+            } else {
+                webView.reload()
+            }
         }
 
         private func isLumen(_ target: URL) -> Bool {

@@ -17,7 +17,9 @@ It also runs on an iPhone.
 | Updates | Not available: there is no git. Install a newer `.ipa` instead |
 | Phones on the same Wi-Fi | Work with `http.lanAccess` on, while the app is running |
 
-**The server lives only while the app does.** iPadOS suspends an app soon after it leaves the screen. With *Keep running in the background* on (the default), the app plays silence so iPadOS lets it keep running. That holds in normal use; iPadOS can still end the app when memory is short, and a restart of the iPad ends it too. Open Lumen again and it starts by itself.
+**The server lives only while the app is on screen**, unless you say otherwise. iPadOS suspends an app soon after it leaves the screen, and can take its network connections away while it is suspended. When you come back, the server rebuilds itself inside the app (a few seconds, see *How the server survives a pause*) and the page reconnects. While Lumen is off screen the sleep timer does not fire, the TV apps are disconnected, and phones cannot reach the remote.
+
+Turn on *Keep running in the background* (iPad Settings → Lumen) if you need those: the app then plays silence so iPadOS lets it keep running. That holds in normal use; iPadOS can still end the app when memory is short.
 
 ## Install
 
@@ -56,11 +58,22 @@ Reserve the iPad's address in the router either way, so it does not change.
 
 iPad Settings → Lumen:
 
-- **Keep running in the background** (on): see above.
+- **Keep running in the background** (off): see above.
 - **Keep the screen on** (on): no auto-lock while Lumen is in front.
 - **API key**: for Ask Lumen. Close and reopen Lumen after changing it.
 
 Logs are in **On My iPad → Lumen → data → logs** (`lumen.log`, and `node-console.log` for anything Node printed).
+
+## How the server survives a pause
+
+Node can be started only once per launch of the app, so the app never restarts Node. `server/embedded-host.js` restarts the *server* inside the running Node instead (stop, then start, exactly what the tests do between cases):
+
+- after a long pause (30 s or more), always, so every connection is new;
+- after a short pause, if one of its listeners no longer accepts connections;
+- when a listening socket reports an error;
+- when the app asks, by writing `data/host-control.json`. The app does that if the server has not answered a few seconds after it came back on screen.
+
+It notices a pause because its 2-second timer skipped: timers do not run while the app is suspended. Each start is recorded in `data/host-status.json` (`generation` counts them), and the app reloads the page when the generation changed. If the server cannot be brought back within 45 seconds, the app says so and shows the log.
 
 ## Building
 
@@ -69,7 +82,7 @@ Logs are in **On My iPad → Lumen → data → logs** (`lumen.log`, and `node-c
 1. downloads `NodeMobile.xcframework` (nodejs-mobile `v18.20.4`);
 2. copies `server/`, `web/` and the production `node_modules` into the app as `nodejs-project/`;
 3. generates the Xcode project from `project.yml` (XcodeGen) and builds for the simulator;
-4. runs `ci/smoke.mjs`: the app in an iPad simulator against the mock TV (a key press, the volume, a picture setting over IP Control, the TV agent calling in), plus a screenshot;
+4. runs `ci/smoke.mjs`: the app in an iPad simulator against the mock TV (a key press, the volume, a picture setting over IP Control, the TV agent calling in, a restart of the server in place), plus a screenshot;
 5. builds for iPad without signing, packs `Lumen.ipa`, and replaces the `ipad-latest` release.
 
 Logs, the check's results and the screenshot go to the `ci/ipad-output` branch.

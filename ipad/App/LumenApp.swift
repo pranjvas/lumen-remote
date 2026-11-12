@@ -48,7 +48,7 @@ struct RootView: View {
             // The page sits below the status bar, as it does when Safari runs it from the Home
             // Screen (its tablet layout has no room for the status bar), and handles the other
             // edges and the keyboard itself.
-            RemoteWebView(url: url)
+            RemoteWebView(url: url, reloadToken: host.reloadToken)
                 .ignoresSafeArea(.container, edges: [.horizontal, .bottom])
                 .ignoresSafeArea(.keyboard)
         case .starting:
