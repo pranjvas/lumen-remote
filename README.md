@@ -4,6 +4,8 @@ A remote control, live dashboard and AI assistant for a Samsung QA55Q95T (2020, 
 
 Build, install and deploy steps for every part (server, TV agent, Lumen Eyes, VPN core) are in **[docs/BUILD-AND-DEPLOY.md](docs/BUILD-AND-DEPLOY.md)**.
 
+No PC to run it on? **[ipad/README.md](ipad/README.md)** covers Lumen as an iPad app, with the server inside (no Browser, VPN or live video there).
+
 ## What it does
 
 | Area | What you get |

@@ -38,6 +38,7 @@ The build is unsigned. [Sideloadly](https://sideloadly.io) signs it with your Ap
    - `secrets.json`: the key the TV apps use
    - `tv.json` and `ipcontrol.json`: the pairings
    - `config.json`: your settings (`tv.host` is the TV's address)
+   - optionally `scenes.json`, `macros.json`, `tracked.json` and the `skills` folder: your scenes, macros, tracked values and learned app skills
 3. Close Lumen from the app switcher and open it again.
 
 Without those files Lumen still starts: set the TV's address in `data/config.json` (`{ "tv": { "host": "192.168.1.2" } }`), reopen, and pair from Settings → Connection.
