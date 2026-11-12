@@ -514,6 +514,10 @@ img { display: block; }
 }
 .nav-item[aria-current="page"]::before { opacity: 1; transform: none; }
 .nav-item[data-rank="2"] { display: none; }
+/* An embedded host (the iPad app) has no desktop browser and no updater. */
+[data-embedded] .nav-item[data-view="browser"],
+[data-embedded] #set-updates,
+[data-embedded] .chip[data-section="set-updates"] { display: none; }
 
 /* ---------- Tablet / desktop console ---------- */
 

@@ -92,6 +92,12 @@ state.watch('device.name', () => {
   $('#tv-name').textContent = name ? String(name).replace(/^\[TV\]\s*/, '') : 'Samsung Q95T';
 });
 
+// An embedded host (the iPad app, server/embedded.js) has no desktop browser and no updater: their
+// entries are hidden by web/css/base.css ([data-embedded]).
+state.watch('host.embedded', () => {
+  document.documentElement.toggleAttribute('data-embedded', state.value('host.embedded', false) === true);
+});
+
 /* ---------- views ---------- */
 
 mountRemote($('#instrument'), ctx);
