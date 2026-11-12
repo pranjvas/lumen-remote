@@ -1,0 +1,5 @@
+2026-11-12 19:53:14.203 appintentsmetadataprocessor[9195:31261] warning: Metadata extraction skipped. No AppIntents.framework dependency found.
+
+CopySwiftLibs /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app (in target 'Lumen' from project 'Lumen')
+** BUILD SUCCEEDED **
+

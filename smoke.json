@@ -1,0 +1,76 @@
+{
+  "passed": 14,
+  "failed": 0,
+  "results": [
+    {
+      "name": "the server inside the app answers",
+      "ok": true,
+      "detail": "version 0.2.0, after 7 s"
+    },
+    {
+      "name": "host-status.json says ready",
+      "ok": true,
+      "detail": "lan port 8791"
+    },
+    {
+      "name": "the web UI is served",
+      "ok": true,
+      "detail": "15288 bytes"
+    },
+    {
+      "name": "a browser client connects and sees an embedded host",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "the TV shows as on",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "a key press reaches the TV (remote channel, wss)",
+      "ok": true,
+      "detail": "5 ms"
+    },
+    {
+      "name": "volume.set changes the TV volume (UPnP)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "a picture setting changes (IP Control, old TLS with 1024-bit DH)",
+      "ok": true,
+      "detail": "source live"
+    },
+    {
+      "name": "the TV agent can call in (port from host-status.json)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "the Browser says why it is unavailable",
+      "ok": true,
+      "detail": "The Browser drives Microsoft Edge on a PC, so it is not available when Lumen runs on an iPad"
+    },
+    {
+      "name": "the app's own page loads and connects (web view)",
+      "ok": true,
+      "detail": "after 19 s"
+    },
+    {
+      "name": "the server restarts inside the same Node when asked (host-control.json)",
+      "ok": true,
+      "detail": "after 1.9 s"
+    },
+    {
+      "name": "the restarted server drives the TV again",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "the app's own page reconnects after the restart",
+      "ok": true,
+      "detail": "after 0 s"
+    }
+  ]
+}

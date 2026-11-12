@@ -1,0 +1,19 @@
+mock TV on 127.0.0.1 (rest 51734, wss 51735, dmr 51736, ipc 51737); data folder seeded: /Users/runner/Library/Developer/CoreSimulator/Devices/9F9B4A17-4195-40F0-8B46-728F6A6AA8EB/data/Containers/Data/Application/B1471258-72E3-41FA-9A7A-3E97A550FC6F/Documents/data
+waiting up to 240 s for Lumen on http://127.0.0.1:8790 ...
+PASS  the server inside the app answers  (version 0.2.0, after 7 s)
+PASS  host-status.json says ready  (lan port 8791)
+PASS  the web UI is served  (15288 bytes)
+PASS  a browser client connects and sees an embedded host
+PASS  the TV shows as on
+PASS  a key press reaches the TV (remote channel, wss)  (5 ms)
+PASS  volume.set changes the TV volume (UPnP)
+PASS  a picture setting changes (IP Control, old TLS with 1024-bit DH)  (source live)
+PASS  the TV agent can call in (port from host-status.json)
+PASS  the Browser says why it is unavailable  (The Browser drives Microsoft Edge on a PC, so it is not available when Lumen runs on an iPad)
+PASS  the app's own page loads and connects (web view)  (after 19 s)
+PASS  the server restarts inside the same Node when asked (host-control.json)  (after 1.9 s)
+PASS  the restarted server drives the TV again
+PASS  the app's own page reconnects after the restart  (after 0 s)
+screenshot saved: out/ipad.png
+
+14 passed, 0 failed

@@ -1,0 +1,25 @@
+2026-11-12T19:54:05.746Z INFO  [lan] TV-facing listener on 127.0.0.1:8791
+2026-11-12T19:54:05.793Z INFO  [http] listening on http://127.0.0.1:8790
+2026-11-12T19:54:05.818Z INFO  [scenes] created the default scenes
+2026-11-12T19:54:05.822Z INFO  Lumen ready {"httpPort":8790,"lanPort":8791}
+2026-11-12T19:54:06.154Z INFO  [rest] TV power unknown -> on
+2026-11-12T19:54:07.028Z INFO  [upnp] GENA subscribed for 1800 s
+2026-11-12T19:54:07.249Z INFO  [upnp] GENA push is live
+2026-11-12T19:54:07.409Z INFO  [ipc] IP Control paired
+2026-11-12T19:54:08.132Z INFO  [agent] agent connected {"version":"0.3.0","pcHost":"127.0.0.1"}
+2026-11-12T19:54:08.135Z INFO  [agent] agent app list {"reported":4,"launchable":4}
+2026-11-12T19:54:08.229Z WARN  [browser] browser start failed {"message":"The Browser drives Microsoft Edge on a PC, so it is not available when Lumen runs on an iPad"}
+2026-11-12T19:54:26.583Z INFO  [hub] phone screen {"inner":[1032,1344],"screen":[1032,1376],"client":[1032,1344],"vv":[1032,1344],"safe":[0,0,20,0],"app":[0,1344],"navBottom":1344,"appH":null,"dpr":2,"standalone":false,"displayStandalone":false,"ios":null}
+2026-11-12T19:54:27.850Z WARN  embedded host: restarting the server (the app asked)
+2026-11-12T19:54:28.203Z INFO  [lan] TV-facing listener on 127.0.0.1:8791
+2026-11-12T19:54:28.263Z INFO  [http] listening on http://127.0.0.1:8790
+2026-11-12T19:54:28.277Z INFO  Lumen ready {"httpPort":8790,"lanPort":8791}
+2026-11-12T19:54:28.278Z INFO  embedded host: the server was restarted (the app asked)
+2026-11-12T19:54:28.279Z INFO  [rest] TV power unknown -> on
+2026-11-12T19:54:28.657Z INFO  [upnp] GENA subscribed for 1800 s
+2026-11-12T19:54:28.861Z INFO  [ipc] IP Control paired
+2026-11-12T19:54:28.901Z INFO  [upnp] GENA push is live
+2026-11-12T19:54:29.297Z INFO  [hub] phone screen {"inner":[1032,1344],"screen":[1032,1376],"client":[1032,1344],"vv":[1032,1344],"safe":[0,0,20,0],"app":[0,1344],"navBottom":1344,"appH":null,"dpr":2,"standalone":false,"displayStandalone":false,"ios":null}
+2026-11-12T19:54:41.152Z INFO  [ipc] IP Control down
+2026-11-12T19:54:42.007Z INFO  [remote] remote channel closed (dead)
+2026-11-12T19:54:49.330Z INFO  [rest] TV power on -> standby

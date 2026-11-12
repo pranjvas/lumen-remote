@@ -1,0 +1,12 @@
+ProductName:		macOS
+ProductVersion:		26.7.2
+BuildVersion:		25G332
+Xcode 26.6
+Build version 17F113
+v24.22.2
+Version: 2.46.0
+simulator: 9F9B4A17-4195-40F0-8B46-728F6A6AA8EB
+
+added 10 packages in 2m
+ 20M	ipad/build/nodejs-project
+-rw-r--r--  1 runner  staff    20M Nov 12 19:56 ipad/build/ipa/Lumen.ipa

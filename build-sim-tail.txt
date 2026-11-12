@@ -1,0 +1,40 @@
+    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsnltrainingprocessor --infoplist-path /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/Info.plist --temp-dir-path /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Intermediates.noindex/Lumen.build/Debug-iphonesimulator/Lumen.build/ssu --bundle-id com.pranjvas.lumen --product-path /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app --extracted-metadata-path /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/Metadata.appintents --metadata-file-list /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Intermediates.noindex/Lumen.build/Debug-iphonesimulator/Lumen.build/Lumen.DependencyMetadataFileList --source-file /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/Info.plist --archive-ssu-assets
+2026-11-12 19:53:14.429 appintentsnltrainingprocessor[9235:31365] Parsing options for appintentsnltrainingprocessor
+2026-11-12 19:53:14.432 appintentsnltrainingprocessor[9235:31365] Starting AppIntents SSU YAML Generation
+2026-11-12 19:53:14.454 appintentsnltrainingprocessor[9235:31365] No AppShortcuts found - Skipping.
+
+CodeSign /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/Lumen.debug.dylib (in target 'Lumen' from project 'Lumen')
+    cd /Users/runner/work/lumen-remote/lumen-remote/ipad
+    
+    Signing Identity:     "Sign to Run Locally"
+    
+    /usr/bin/codesign --force --sign - --timestamp\=none --generate-entitlement-der /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/Lumen.debug.dylib
+
+CodeSign /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/__preview.dylib (in target 'Lumen' from project 'Lumen')
+    cd /Users/runner/work/lumen-remote/lumen-remote/ipad
+    
+    Signing Identity:     "Sign to Run Locally"
+    
+    /usr/bin/codesign --force --sign - --timestamp\=none --generate-entitlement-der /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app/__preview.dylib
+
+CodeSign /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app (in target 'Lumen' from project 'Lumen')
+    cd /Users/runner/work/lumen-remote/lumen-remote/ipad
+    
+    Signing Identity:     "Sign to Run Locally"
+    
+    /usr/bin/codesign --force --sign - --timestamp\=none --generate-entitlement-der /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app
+
+RegisterExecutionPolicyException /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app (in target 'Lumen' from project 'Lumen')
+    cd /Users/runner/work/lumen-remote/lumen-remote/ipad
+    builtin-RegisterExecutionPolicyException /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app
+
+Validate /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app (in target 'Lumen' from project 'Lumen')
+    cd /Users/runner/work/lumen-remote/lumen-remote/ipad
+    builtin-validationUtility /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app -shallow-bundle -infoplist-subpath Info.plist
+
+Touch /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app (in target 'Lumen' from project 'Lumen')
+    cd /Users/runner/work/lumen-remote/lumen-remote/ipad
+    /usr/bin/touch -c /Users/runner/work/lumen-remote/lumen-remote/ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app
+
+** BUILD SUCCEEDED **
+
