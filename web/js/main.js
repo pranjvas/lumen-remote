@@ -28,7 +28,7 @@ import { mountScreen } from './views/screen.js';
 import { createAsk } from './views/ask.js';
 import { watchIme } from './views/text.js';
 import { mountShortcuts, openHelp } from './views/shortcuts.js';
-import { mountInstallHint } from './ui/install-hint.js';
+import { inApp, mountInstallHint } from './ui/install-hint.js';
 
 const DESKTOP = matchMedia('(min-width: 980px)');
 
@@ -97,6 +97,8 @@ state.watch('device.name', () => {
 state.watch('host.embedded', () => {
   document.documentElement.toggleAttribute('data-embedded', state.value('host.embedded', false) === true);
 });
+// Inside the iPad app's own web view, Settings has no "This phone" (Home Screen) section either.
+if (inApp()) document.documentElement.setAttribute('data-in-app', '');
 
 /* ---------- views ---------- */
 

@@ -18,6 +18,7 @@ final class ServerHost: ObservableObject {
     @Published private(set) var logTail = ""
 
     private var started = false
+    private var checkingServer = false
     private let keepAlive = BackgroundKeepAlive()
     private let defaults = UserDefaults.standard
 
@@ -80,9 +81,38 @@ final class ServerHost: ObservableObject {
         }
     }
 
-    // Called when the app comes back on screen: the settings may have changed meanwhile.
+    // Called when the app comes back on screen. The settings may have changed meanwhile, and if
+    // iPadOS suspended the app it may have taken the server's sockets away: Node cannot be started
+    // a second time in one process, so all that is left then is to say so.
     func becameActive() {
         applySettings()
+        guard case .ready(let url) = phase, !checkingServer else { return }
+        checkingServer = true
+        Task {
+            let alive = await serverAnswers(url)
+            checkingServer = false
+            if !alive, case .ready = phase {
+                logTail = recentLog()
+                phase = .failed("iPadOS paused Lumen while it was in the background, and its server stopped answering.")
+            }
+        }
+    }
+
+    private func serverAnswers(_ base: URL) async -> Bool {
+        let url = base.appendingPathComponent("api/health")
+        for attempt in 0..<4 {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 3
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            if let result = try? await URLSession.shared.data(for: request),
+               (result.1 as? HTTPURLResponse)?.statusCode == 200 {
+                return true
+            }
+        }
+        return false
     }
 
     private func applySettings() {

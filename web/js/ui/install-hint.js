@@ -13,7 +13,10 @@ const APPS = {
 
 export const isIos = () => /iPhone|iPad|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS reports a Mac
-export const standalone = () => navigator.standalone === true || !!window.matchMedia?.('(display-mode: standalone)').matches;
+// The iPad app (ipad/) shows this page in its own web view and adds "LumenApp" to the user agent:
+// there is nothing to put on the Home Screen from in there.
+export const inApp = () => /\bLumenApp\b/.test(navigator.userAgent);
+export const standalone = () => inApp() || navigator.standalone === true || !!window.matchMedia?.('(display-mode: standalone)').matches;
 const currentApp = () => (location.pathname === '/browser' ? 'browser' : 'app');
 
 function seen() {

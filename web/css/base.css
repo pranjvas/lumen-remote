@@ -518,6 +518,9 @@ img { display: block; }
 [data-embedded] .nav-item[data-view="browser"],
 [data-embedded] #set-updates,
 [data-embedded] .chip[data-section="set-updates"] { display: none; }
+/* Inside the iPad app's web view there is nothing to add to the Home Screen. */
+[data-in-app] #set-phone,
+[data-in-app] .chip[data-section="set-phone"] { display: none; }
 
 /* ---------- Tablet / desktop console ---------- */
 
