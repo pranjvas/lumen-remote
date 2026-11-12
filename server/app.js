@@ -80,6 +80,9 @@ export async function startServer(overrides = {}, seams = {}) {
     await lan.ready;
     const ctx = { config, data, log, store, lan };
 
+    // The web UI hides what an embedded host (the iPad app) cannot do: the Browser and the updater.
+    store.set('host.embedded', config.embedded === true, { src: 'derived', via: 'config' });
+
     // Curated apps until the TV agent reports the real list (a list cached from the agent is kept:
     // it is the TV's own, shown as stale until the agent says hello again).
     if (!store.get('app.installed')) {

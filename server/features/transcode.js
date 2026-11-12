@@ -45,6 +45,7 @@ export function findFfmpeg({ config } = {}) {
     config?.dataDir && path.join(config.dataDir, 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
   ].filter(Boolean);
   for (const p of list) if (fs.existsSync(p)) return p;
+  if (config?.embedded) return null; // no child processes inside an app (server/embedded.js)
   const which = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['ffmpeg'], { encoding: 'utf8', windowsHide: true });
   const onPath = which.status === 0 ? which.stdout.split(/\r?\n/).find(Boolean) : null;
   if (onPath) return onPath.trim();

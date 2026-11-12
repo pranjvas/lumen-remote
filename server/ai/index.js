@@ -14,6 +14,8 @@ import { discoverLanAddress } from '../lan.js';
 const MAX_CONCURRENT = 2;
 const MAX_TEXT = 1000;
 const API_SETUP = 'Set ANTHROPIC_API_KEY or run `ant auth login`';
+// The iPad app passes the key from its page in the iPad's Settings app (ipad/README.md).
+const API_SETUP_EMBEDDED = 'Add your Anthropic API key in the Settings app, under Lumen, then close and reopen Lumen';
 const NO_BACKEND = `${SIGN_IN}, or set ANTHROPIC_API_KEY`;
 const SDK_NOTE = 'Uses your Claude Code login (personal use)';
 
@@ -119,7 +121,7 @@ export function createAi({ config, data, log, store, hub, adapters, browser, lan
   function status() {
     const current = mode();
     if (current === 'off') return { backend: 'off', ready: false, reason: 'AI is turned off (ai.backend is "off")' };
-    if (current === 'api') return api.isConfigured() ? { backend: 'api', ready: true, reason: null } : { backend: 'api', ready: false, reason: API_SETUP };
+    if (current === 'api') return api.isConfigured() ? { backend: 'api', ready: true, reason: null } : { backend: 'api', ready: false, reason: config.embedded ? API_SETUP_EMBEDDED : API_SETUP };
     if (current !== 'auto' && current !== 'agent-sdk') return { backend: 'off', ready: false, reason: `Unknown ai.backend "${current}"` };
     if (current === 'auto' && api.isConfigured()) return { backend: 'api', ready: true, reason: null };
 

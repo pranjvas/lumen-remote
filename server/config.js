@@ -11,6 +11,9 @@ export const VERSION = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.
 
 export const DEFAULTS = deepFreeze({
   dataDir: path.join(REPO_ROOT, 'data'),
+  // true when Node runs inside an app (server/embedded.js, the iPad app in ipad/): there are no child
+  // processes there, so the Browser, the video converter and the updater are off.
+  embedded: false,
   tv: {
     host: '192.168.1.2',
     ports: { rest: 8001, wss: 8002, dmr: 9197, ipc: 1516, dial: 8080 },

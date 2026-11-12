@@ -1,4 +1,9 @@
-# Builds the iPad app (ipad/) and its unsigned .ipa. See ipad/README.md.
+# Builds Lumen for iPad (ipad/README.md): the app with Node and the server inside, checked in an
+# iOS simulator against the mock TV, then packaged as an unsigned .ipa for sideloading.
+#
+# Results that do not need a GitHub login to read:
+#   - the .ipa: release "ipad-latest" (replaced by every successful build)
+#   - logs, the check's results and a screenshot: branch ci/ipad-output (replaced by every build)
 name: iPad app
 
 on:
@@ -9,25 +14,120 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ipad-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_MOBILE_VERSION: v18.20.4
+  BUNDLE_ID: com.pranjvas.lumen
+
 jobs:
-  probe:
+  build:
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
+
+      - name: Tools
         run: |
           mkdir -p out
-          {
-            sw_vers
-            uname -m
-            xcodebuild -version
-            ls /Applications | grep -i xcode
-            node --version
-            which xcodegen || echo "no xcodegen"
-            xcrun simctl list devices available | grep -iE "ipad|iphone" | head -40
-            xcrun simctl list runtimes
-          } 2>&1 | tee out/toolchain.txt
-      - name: Publish output branch
+          brew install xcodegen
+          { sw_vers; xcodebuild -version; node --version; xcodegen --version; } 2>&1 | tee out/toolchain.txt
+
+      - name: Node for iOS
+        run: |
+          mkdir -p ipad/build
+          curl -fsSL -o ipad/build/node-ios.zip \
+            "https://github.com/nodejs-mobile/nodejs-mobile/releases/download/${NODE_MOBILE_VERSION}/nodejs-mobile-${NODE_MOBILE_VERSION}-ios.zip"
+          unzip -q ipad/build/node-ios.zip 'NodeMobile.xcframework/*' -d ipad/build
+          rm ipad/build/node-ios.zip
+          ls ipad/build/NodeMobile.xcframework
+
+      - name: Server files for the app
+        run: |
+          P=ipad/build/nodejs-project
+          mkdir -p "$P"
+          cp -R server web package.json package-lock.json "$P/"
+          (cd "$P" && npm ci --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund)
+          rm -f "$P/package-lock.json"
+          # Not needed at run time, and broken links would stop the app from being signed.
+          find "$P/node_modules" -name .bin -type d -prune -exec rm -rf {} +
+          find "$P/node_modules" -type f \( -name '*.map' -o -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' \) -delete
+          find "$P" -type l -delete
+          du -sh "$P" | tee -a out/toolchain.txt
+
+      - name: Dependencies for the check
+        run: npm ci --omit=optional --no-audit --no-fund
+
+      - name: Generate the Xcode project
+        run: cd ipad && xcodegen generate
+
+      - name: Build for the simulator
+        run: |
+          STATUS=0
+          xcodebuild -project ipad/Lumen.xcodeproj -scheme Lumen -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath ipad/build/dd ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build \
+            > out/build-sim-full.log 2>&1 || STATUS=$?
+          grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)|\*\* " -A2 out/build-sim-full.log | grep -v "^--$" | head -300 > out/build-sim.txt || true
+          tail -40 out/build-sim-full.log > out/build-sim-tail.txt
+          rm out/build-sim-full.log
+          cat out/build-sim.txt
+          exit $STATUS
+
+      - name: Check in the simulator
+        run: |
+          APP=ipad/build/dd/Build/Products/Debug-iphonesimulator/Lumen.app
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          devices = json.load(sys.stdin)['devices']
+          ipads = [d for runtime in sorted(devices, reverse=True) if 'iOS' in runtime for d in devices[runtime] if 'iPad' in d['name']]
+          print(ipads[0]['udid'])")
+          echo "simulator: $DEVICE" | tee -a out/toolchain.txt
+          xcrun simctl boot "$DEVICE"
+          xcrun simctl bootstatus "$DEVICE" -b
+          xcrun simctl install "$DEVICE" "$APP"
+          DATA="$(xcrun simctl get_app_container "$DEVICE" "$BUNDLE_ID" data)/Documents/data"
+          node ipad/ci/smoke.mjs --data "$DATA" --out out --screenshot out/ipad.png --wait 240 > out/smoke.txt 2>&1 &
+          SMOKE=$!
+          for i in $(seq 1 60); do [ -f "$DATA/.seeded" ] && break; sleep 1; done
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID"
+          CODE=0
+          wait $SMOKE || CODE=$?
+          cat out/smoke.txt
+          mkdir -p out/app-logs
+          cp -R "$DATA/logs/." out/app-logs/ 2>/dev/null || true
+          cp "$DATA/host-status.json" out/ 2>/dev/null || true
+          exit $CODE
+
+      - name: Build for iPad (unsigned)
+        run: |
+          STATUS=0
+          xcodebuild -project ipad/Lumen.xcodeproj -scheme Lumen -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath ipad/build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build \
+            > out/build-device-full.log 2>&1 || STATUS=$?
+          grep -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* " -A2 out/build-device-full.log | grep -v "^--$" | head -200 > out/build-device.txt || true
+          tail -40 out/build-device-full.log > out/build-device-tail.txt
+          rm out/build-device-full.log
+          cat out/build-device.txt
+          [ "$STATUS" = 0 ] || exit $STATUS
+          mkdir -p ipad/build/ipa/Payload
+          cp -R ipad/build/dd/Build/Products/Release-iphoneos/Lumen.app ipad/build/ipa/Payload/
+          (cd ipad/build/ipa && zip -qry Lumen.ipa Payload)
+          ls -lh ipad/build/ipa/Lumen.ipa | tee -a out/toolchain.txt
+
+      - name: Publish the .ipa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete ipad-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create ipad-latest ipad/build/ipa/Lumen.ipa --prerelease --target "$GITHUB_SHA" \
+            --title "Lumen for iPad (latest build)" \
+            --notes "Unsigned build of the iPad app from ${GITHUB_SHA}. Install it with Sideloadly; see ipad/README.md. Replaced by every successful build of the claude/ipad-app branch."
+
+      - name: Publish logs and screenshot
         if: always()
         run: |
           cd out
@@ -35,5 +135,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -q -m "CI output for ${GITHUB_SHA}"
+          git commit -q -m "iPad build output for ${GITHUB_SHA}"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" ci/ipad-output

@@ -1604,6 +1604,7 @@ export function createBrowser({ config, log: rootLog, store, hub, vpn = () => nu
 
   async function launch() {
     if (stopped) throw new LumenError('UNAVAILABLE', 'Lumen is stopping');
+    if (config.embedded) throw new LumenError('UNAVAILABLE', 'The Browser drives Microsoft Edge on a PC, so it is not available when Lumen runs on an iPad');
     if (!edgePath || !fs.existsSync(edgePath)) {
       throw new LumenError('UNAVAILABLE', `Microsoft Edge was not found at ${edgePath ?? '(no browser.edgePath)'}`);
     }
