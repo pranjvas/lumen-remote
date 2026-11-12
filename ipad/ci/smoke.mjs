@@ -3,7 +3,10 @@
 // in the iOS simulator pointed at it, and a browser-like client that drives the app's server.
 //
 //   node ipad/ci/smoke.mjs --data <the app's Documents/data folder> [--port 8790]
-//                          [--out <folder for results>] [--screenshot <png>] [--wait <seconds>]
+//                          [--out <folder for results>] [--wait <seconds>]
+//                          [--page] [--screenshot <png>]
+//
+// --page also expects the app's own web view to load the UI and connect (not for a bare server).
 //
 // It seeds the data folder (config, pairing tokens, secrets), writes <data>/.seeded, then waits for
 // the app to be launched and its server to answer. Exit code 0 means every check passed.
@@ -151,6 +154,23 @@ if (up) {
       return ack.error?.message ?? '';
     });
   }
+}
+
+// The page in the app's web view reports its screen size once its connection is open; the server
+// logs that as "phone screen" (the smoke test's own client never sends it).
+if (up && args.page) {
+  await check("the app's own page loads and connects (web view)", async () => {
+    const logFile = path.join(dataDir, 'logs', 'lumen.log');
+    const began = Date.now();
+    await waitFor(() => {
+      try {
+        return fs.readFileSync(logFile, 'utf8').includes('phone screen');
+      } catch {
+        return false;
+      }
+    }, { timeout: 120000, interval: 500, message: 'no "phone screen" line in lumen.log' });
+    return `after ${Math.round((Date.now() - began) / 1000)} s`;
+  });
 }
 
 // ---------- results ----------

@@ -78,10 +78,21 @@ struct RemoteWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             retries = 0
+            note("page loaded")
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            note("page failed: " + error.localizedDescription)
+        }
+
+        // Standard error goes to data/logs/node-console.log (ServerHost.redirectConsole).
+        private func note(_ text: String) {
+            fputs("[app] " + text + "\n", stderr)
         }
 
         // The page can be asked for a moment before the server accepts connections: try again.
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            note("page did not load (try \(retries + 1)): " + error.localizedDescription)
             guard retries < 20 else { return }
             retries += 1
             let request = URLRequest(url: home)
@@ -92,6 +103,7 @@ struct RemoteWebView: UIViewRepresentable {
 
         // iPadOS can end the page's process to free memory; load the page again.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            note("the page's process ended; loading it again")
             webView.load(URLRequest(url: home))
         }
 
