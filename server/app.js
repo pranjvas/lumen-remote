@@ -121,7 +121,7 @@ export async function startServer(overrides = {}, seams = {}) {
     // converter and the log files.
     features.history = createHistory({ ...ctx, features });
     // Incognito (hub browser.incognito): the browser on a throwaway profile, and no record of its pages.
-    features.incognito = createIncognito({ ...ctx, features });
+    features.incognito = createIncognito({ ...ctx, features, hub });
     // Automatic updates from this copy's git origin (features/updater.js).
     // To apply an update Lumen shuts down as on Ctrl+C (server/index.js) and the update helper takes over.
     features.updater = createUpdater({

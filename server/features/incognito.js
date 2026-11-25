@@ -11,7 +11,7 @@
 import { LumenError } from '../errors.js';
 import { incognitoLine } from './history.js';
 
-export function createIncognito({ log: rootLog, store, features }) {
+export function createIncognito({ log: rootLog, store, features, hub }) {
   const log = rootLog.child('incognito');
   const browser = () => features.browser;
   const isOn = () => browser()?.incognito?.() === true;
@@ -23,7 +23,8 @@ export function createIncognito({ log: rootLog, store, features }) {
     const streams = features.relay?.forget?.() ?? 0;
     const conversions = features.transcode?.clearSaved?.() ?? 0;
     const exchanges = features.ai?.forgetPrivate?.() ?? 0;
-    log.info('incognito session forgotten', { streams, conversions, exchanges });
+    const replies = hub?.forgetPrivateAiRuns?.() ?? 0; // kept so a reconnecting page could resume them
+    log.info('incognito session forgotten', { streams, conversions, exchanges, replies });
   }
 
   // Subscribed at once (not in start()): the browser's start can already report a session a killed

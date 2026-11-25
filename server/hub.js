@@ -24,6 +24,11 @@ const MAX_VOLUME_KEY_STEPS = 25;
 const SCREEN_DEFAULT_EVERY_MS = 1000;
 const SCREEN_MIN_EVERY_MS = 500;
 const AI_STATUS_TIMEOUT_MS = 1500;
+// Ask Lumen runs are kept after they end so a page that reconnects or reloads (a phone that left the
+// app mid-run) can still get the reply: ai.resume replays the run's events.
+const AI_RUN_KEEP_MS = 60 * 60 * 1000;
+const AI_RUNS_KEPT = 20;
+const AI_RUN_MAX_EVENTS = 400;
 const OPEN_ON_TV_TIMEOUT_MS = 10_000;
 const MAX_URL_LENGTH = 2048;
 
@@ -180,6 +185,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
   const clients = new Map(); // attached browser client → { view, visible }
   const detached = new WeakSet();
   const holds = new Map(); // client → Map(key → hold session)
+  const aiRuns = new Map(); // run id → { events, seq, done, subscribers: Set(client), timer }
   const touched = new Map(); // state key → when a command last touched it
   const seen = new Map(); // watched state key → last record seen in a patch
   const pendingChanges = new Map(); // watched state key → { from, timer }
@@ -590,7 +596,19 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     const question = text(cmd.text?.trim?.(), 'text', { max: 2000 });
     const id = typeof cmd.id === 'string' && cmd.id ? cmd.id : randomUUID();
     const thread = cmd.thread === undefined ? undefined : text(cmd.thread, 'thread', { max: 64, pattern: /^[A-Za-z0-9_-]+$/ });
-    const emit = (event) => send(client, { ...event, t: 'ai', id });
+    // A second ask with a live run's id keeps that run's record (ai.ask answers it BUSY).
+    const run = aiRuns.get(id)?.done === false ? null : keepAiRun(id, client);
+    const emit = (event) => {
+      if (!run) return send(client, { ...event, t: 'ai', id });
+      // Each event carries its place in the run (seq) so a resumed page can skip what it already has.
+      const msg = { ...event, t: 'ai', id, seq: run.seq++ };
+      // Made while Lumen's browser is incognito (it can quote private pages): dropped when incognito ends.
+      if (features.browser?.incognito?.() === true) run.private = true;
+      const terminal = msg.kind === 'result' || msg.kind === 'error' || msg.kind === 'done';
+      if (run.events.length < AI_RUN_MAX_EVENTS || terminal) run.events.push(msg);
+      for (const subscriber of run.subscribers) send(subscriber, msg);
+      if (msg.kind === 'done') endAiRun(id, run);
+    };
     Promise.resolve()
       .then(() => ai.ask(question, { id, emit, thread }))
       .catch((err) => {
@@ -599,6 +617,51 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
         emit({ kind: 'done' });
       });
     return { value: { id } };
+  }
+
+  function keepAiRun(id, client) {
+    const previous = aiRuns.get(id);
+    if (previous) { clearTimeout(previous.timer); aiRuns.delete(id); }
+    const run = { events: [], seq: 0, done: false, private: features.browser?.incognito?.() === true, subscribers: new Set([client]), timer: null };
+    aiRuns.set(id, run);
+    // Oldest finished runs go first; runs still going are never dropped.
+    for (const [oldId, old] of aiRuns) {
+      if (aiRuns.size <= AI_RUNS_KEPT) break;
+      if (old.done) { clearTimeout(old.timer); aiRuns.delete(oldId); }
+    }
+    return run;
+  }
+
+  function endAiRun(id, run) {
+    run.done = true;
+    run.timer = setTimeout(() => { if (aiRuns.get(id) === run) aiRuns.delete(id); }, AI_RUN_KEEP_MS);
+    run.timer.unref?.();
+  }
+
+  // A page that lost its connection mid-run asks for the run again: it gets the events after `after`
+  // (the last seq it applied, -1 for all) and the rest as they come. → { found, done }
+  function aiResume(cmd, client) {
+    const id = text(cmd.target, 'target', { max: 128 });
+    const after = cmd.after === undefined ? -1 : integer(cmd.after, 'after', -1, Number.MAX_SAFE_INTEGER);
+    const run = aiRuns.get(id);
+    if (!run) return { value: { found: false, done: false } };
+    for (const msg of run.events) if (msg.seq > after) send(client, msg);
+    if (!run.done) run.subscribers.add(client);
+    return { value: { found: true, done: run.done } };
+  }
+
+  /** Incognito ended: the kept runs made during it are dropped (a run still going keeps streaming to
+   *  the pages that follow it, but can no longer be resumed). → how many went. */
+  function forgetPrivateAiRuns() {
+    let count = 0;
+    for (const [id, run] of [...aiRuns]) {
+      if (!run.private) continue;
+      clearTimeout(run.timer);
+      aiRuns.delete(id);
+      run.events = [];
+      count += 1;
+    }
+    return count;
   }
 
   async function aiCancel(cmd) {
@@ -931,6 +994,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
 
     'ai.ask': aiAsk,
     'ai.cancel': aiCancel,
+    'ai.resume': aiResume,
 
     // restore: true for Lumen's own reopen of a page (tools/restart.ps1 -KeepTvPage): it does not
     // count as someone's input, so a video the page starts by itself stays on the page.
@@ -1084,6 +1148,7 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     if (!clients.delete(client)) return;
     for (const session of [...(holds.get(client)?.values() ?? [])]) endHold(session);
     holds.delete(client);
+    for (const run of aiRuns.values()) run.subscribers.delete(client);
     features.macros?.discard?.(client);
     updateDemand();
   }
@@ -1132,8 +1197,10 @@ export function createHub({ config, log: rootLog, store, adapters = {}, features
     await Promise.allSettled(ending);
     volumeLane.clear();
     clients.clear();
+    for (const run of aiRuns.values()) clearTimeout(run.timer);
+    aiRuns.clear();
   }
 
-  const hub = { handle, attach, detach, broadcast, sendToView, stop };
+  const hub = { handle, attach, detach, broadcast, sendToView, forgetPrivateAiRuns, stop };
   return hub;
 }

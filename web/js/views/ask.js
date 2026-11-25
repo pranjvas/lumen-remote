@@ -101,9 +101,34 @@ export function createAsk(ctx) {
   const inputs = new Set();
   thread.append(empty, transcript);
 
-  // Runs left "running" by a reload never get their end: say so instead of spinning forever.
-  for (const saved of chat.runs) {
-    if (!saved.done) Object.assign(saved, { done: true, ok: false, error: 'This reply was lost when the page reloaded.' });
+  // Runs left "running" by a reload or a dropped connection (a phone that left the app mid-run) are
+  // asked for again on every hello: Lumen keeps each run's events for a while and replays the ones
+  // this page has not seen. Only a run Lumen no longer has is given up on.
+  function lose(record, error) {
+    Object.assign(record, { done: true, ok: false, status: '', error });
+    const run = runs.get(record.id);
+    if (run) paint(run);
+    save();
+  }
+
+  async function resumeRun(record) {
+    if (record.done) return;
+    // A record without seq (saved by an older page) is replayed from the start: clear what the replay
+    // rebuilds so its steps are not shown twice.
+    if (!Number.isInteger(record.seq) && record.steps.length) {
+      Object.assign(record, { steps: [], status: '', answer: undefined, error: undefined });
+      const run = runs.get(record.id);
+      if (run) { fill(run.stepsList); paint(run); }
+    }
+    const ack = await ctx.live.send('ai.resume', { target: record.id, after: Number.isInteger(record.seq) ? record.seq : -1 }, { timeoutMs: 8000 });
+    if (record.done) return;
+    if (ack.ok && ack.value?.found === false) lose(record, 'Lumen no longer has this reply (it may have restarted, or never got the request). Ask again.');
+    else if (!ack.ok && ack.error?.code === 'INVALID') lose(record, 'This reply was lost when the page reloaded.');
+    // OFFLINE or TIMEOUT: the next hello asks again.
+  }
+
+  async function resume() {
+    for (const record of chat.runs) await resumeRun(record);
   }
 
   function save() {
@@ -207,6 +232,11 @@ export function createAsk(ctx) {
     const run = runs.get(msg.id);
     if (!run) return;
     const { record } = run;
+    // A resumed run can replay events this page already applied; seq says which.
+    if (Number.isInteger(msg.seq)) {
+      if (Number.isInteger(record.seq) && msg.seq <= record.seq) return;
+      record.seq = msg.seq;
+    }
     switch (msg.kind) {
       case 'status':
         record.status = msg.text || 'Working…';
@@ -256,7 +286,14 @@ export function createAsk(ctx) {
     append(record);
     paintStatus();
     requestAnimationFrame(() => scrollToEnd(true));
+    const sent = ctx.live.status === 'open';
     const ack = await ctx.live.send('ai.ask', { text: clean, thread: chat.thread }, { id: record.id, timeoutMs: 15000 });
+    // Sent but unanswered (the connection dropped, or the page was frozen): Lumen may well be running
+    // it, so ask for the run instead of calling it failed. A dropped connection resumes on its hello.
+    if (!ack.ok && sent && (ack.error?.code === 'OFFLINE' || ack.error?.code === 'TIMEOUT')) {
+      if (ack.error.code === 'TIMEOUT') resumeRun(record);
+      return;
+    }
     if (!ack.ok) {
       Object.assign(record, { done: true, ok: false, error: ack.error?.message || 'Ask Lumen is not available' });
       paint(runs.get(record.id));
@@ -409,6 +446,7 @@ export function createAsk(ctx) {
     for (const run of runs.values()) if (!run.record.done && !run.eye.hidden) showEye(run);
   });
   ctx.on('hello', paintStatus);
+  ctx.on('hello', resume);
   paintStatus();
 
   return { submit, composer, mountView, inputs };
